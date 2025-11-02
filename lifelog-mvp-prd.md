@@ -27,6 +27,12 @@ Build an AI-powered personal memory assistant that ingests multimodal data from 
 - **Response time:** < 3s for chat responses
 - **User satisfaction:** 4/5 rating from pilot users (n=20)
 
+**Measurement & Instrumentation**
+- Supabase event tables + Prometheus counters for ingestion success/failure, latency, and queue depth
+- Frontend feedback modal with structured thumbs-up/down + free-form notes logged per chat turn
+- OpenTelemetry traces stitched across upload → processing → retrieval for p95 latency tracking
+- Weekly metric review dashboard (Metabase) covering completeness, accuracy, retention, and cost per user
+
 ---
 
 ## 3. MVP Feature Scope
@@ -37,26 +43,27 @@ Build an AI-powered personal memory assistant that ingests multimodal data from 
 - Manual upload interface for photos, videos, audio files (batch upload support)
 - 3rd-party integrations:
   - Google Photos (OAuth + full historical sync)
-  - Apple Photos / iCloud (via API or export import)
+  - Apple Photos / iCloud (app-specific password via Private iCloud API + resumable download worker; fallback guided export uploader)
   - Notion (OAuth + page/database sync)
 - One-time full historical data ingestion, then incremental daily syncs
 - Metadata extraction: timestamp, location, file type, source
-- Deduplication logic (hash-based)
+- Deduplication logic (combine SHA256 + perceptual hash + EXIF heuristics to catch resized/edited duplicates)
 
 **3.2 Processing Pipeline**
-- Image: OCR (text extraction), captioning (BLIP/GPT-4V), CLIP embeddings
-- Video: Keyframe extraction, scene detection, captioning per frame, audio transcription
-- Audio: Speech-to-text (Whisper), speaker diarization
+- Image: OCR (text extraction), captioning (BLIP/GPT-4V), CLIP embeddings, throughput target 2 img/s/worker
+- Video: Keyframe extraction (ffmpeg every 3s), scene boundary detection, multimodal captioning per scene, audio transcription, thumbnail generation
+- Audio: Speech-to-text (Whisper), speaker diarization, silence trimming
 - Documents (Notion): Text extraction, embedding generation
 - Entity extraction: People, places, objects, events (using LLM)
 - Temporal clustering: Group items into "events" by time proximity
+- Processing SLA: ingest + process 10k mixed assets within 60 minutes via horizontal worker scaling
 
 **3.3 Memory Layer**
 - **Vector Store (Qdrant/Pinecone):** Semantic embeddings for all content
 - **Structured DB (Postgres):** Timeline data, metadata, entity relationships
 - **Memory Graph (Postgres graph tables):** Entity nodes (person/place/event) and relationships
-- **Daily Summaries:** Automated job that synthesizes activities across all data sources per day
-- **Hybrid Retrieval:** Combine vector similarity + temporal proximity + entity overlap
+- **Daily Summaries:** Nightly Celery job aggregates previous day’s events + entities, prompts LLM with canonical template, stores to `daily_summaries` table, surfaced in dashboard + chat preamble
+- **Hybrid Retrieval:** Weighted score = 0.5 * vector similarity + 0.3 * temporal proximity decay + 0.2 * entity overlap, with minimum freshness threshold and reranking before chat response
 
 **3.4 Model Layer**
 - LLM API integration: GPT-4o, Claude 3.5/4, or Gemini for chat and summarization
@@ -78,6 +85,7 @@ Build an AI-powered personal memory assistant that ingests multimodal data from 
 - **Task Queue:** Celery + Redis for async processing
 - **Web Frontend:** Next.js (App Router) deployed on Vercel
 - **Cloud:** Start with managed services (Supabase, Vercel, Railway/Render for API)
+- **Security Baseline:** Encrypt at rest/in transit, store OAuth tokens with AES-256 + rotation, implement user data deletion workflow within 24h, document GDPR-compliant privacy policy
 
 ### OUT OF SCOPE (Post-MVP) ❌
 - Mobile apps (iOS/Android)
@@ -126,6 +134,15 @@ Incremental Sync (Daily):
 3. Process only new/updated items
 4. Update last_sync_timestamp
 ```
+
+#### Apple Photos / iCloud Strategy
+
+- **Auth:** Collect app-specific password from user, store encrypted; leverage `pyicloud` (or equivalent CloudKit client) with 2FA device trust bootstrap flow.
+- **Data fetch:** Enumerate user albums + assets via CloudKit, request original assets + Live Photo motion components; stream download to temporary storage with resumable chunks (5 MB).
+- **Backfill:** Kick off Celery batch jobs that paginate through all asset batches (default 200 items) while respecting Apple throttling (max 5 req/s per session); persist `icloud_asset_id` for idempotency.
+- **Delta sync:** Use asset `modifiedDate` to pull changes every 6 hours; mark deletions and propagate tombstones to Supabase + Qdrant.
+- **Resilience:** Retry with exponential backoff on 421 throttling; rotate session tokens weekly; alert on repeated auth failures.
+- **Fallback:** Provide guided manual exporter (macOS shortcut + uploader) for users unable to provide app-specific password; processed via same batch ingestion path.
 
 **Storage Strategy:**
 - **Metadata only:** Store photo URLs, IDs, timestamps in your DB
@@ -455,6 +472,46 @@ memory_system = HybridMemoryRetriever([
 ])
 
 results = memory_system.retrieve("What did I do last Tuesday?", user_id)
+```
+
+**5. Daily Summary Generation**
+
+```python
+@celery.task
+def generate_daily_summary(user_id: str, date: datetime.date):
+    # Gather events, entities, and highlight media
+    events = fetch_events(user_id, date)
+    top_entities = fetch_top_entities(user_id, date)
+    highlights = fetch_media_highlights(user_id, date)
+    
+    prompt = DAILY_SUMMARY_PROMPT.format(
+        date=date.strftime("%B %d, %Y"),
+        events=json.dumps(events, default=str),
+        entities=json.dumps(top_entities),
+        highlights=json.dumps(highlights)
+    )
+    
+    summary = call_llm(prompt, response_format="markdown")
+    
+    db.insert(daily_summaries, {
+        "user_id": user_id,
+        "summary_date": date,
+        "content_markdown": summary,
+        "source_event_ids": [event["id"] for event in events],
+        "created_at": datetime.utcnow()
+    })
+```
+
+**Prompt Template**
+
+```
+You are the user's personal memory curator.
+Summarize the following day in 3 sections:
+1. Headline (1 sentence)
+2. Key Moments (3-5 bullet points referencing event IDs)
+3. People & Places (bullet list of notable entities)
+
+Use friendly tone, reference timestamps, and avoid inventing details. Return Markdown.
 ```
 
 #### Using mem0 for MVP
@@ -804,7 +861,7 @@ GET    /api/v1/events/:id               # Get event details
 ### Phase 3: Expansion (Weeks 19-26)
 - Mobile apps (iOS, Android)
 - Desktop capture agent
-- Additional integrations (Apple Photos, Twitter, Instagram)
+- Additional integrations (Instagram, X/Twitter, TikTok)
 - Shareable memory capsules
 - Multi-user sharing and collaboration
 
@@ -827,13 +884,16 @@ GET    /api/v1/events/:id               # Get event details
 | Poor retrieval quality | Continuous evaluation with test queries, A/B test retrieval strategies |
 | LLM costs | Cache responses, use cheaper models for batch tasks, implement usage quotas |
 | Data privacy concerns | Clear privacy policy, offer local processing option, comply with GDPR |
+| Apple iCloud auth fragility | Collect app-specific passwords with secure storage, proactive session refresh + manual export fallback |
+| Video/audio compute expense | Batch inference on GPU workers, prioritize local/managed Whisper & BLIP variants, enforce per-user quotas |
+| Daily summary hallucinations | Ground prompt with event IDs, include confidence thresholds, capture user feedback for corrections |
 
 ---
 
 ## 10. Success Criteria for MVP
 
 **Must-Have:**
-- ✅ User can connect Google Photos and Notion
+- ✅ User can connect Google Photos, Apple Photos, and Notion
 - ✅ User can upload 500+ photos in a single batch
 - ✅ All uploaded data is processed within 1 hour
 - ✅ User can ask temporal queries ("What did I do last week?") and get accurate answers

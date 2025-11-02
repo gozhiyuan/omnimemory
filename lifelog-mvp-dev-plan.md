@@ -42,6 +42,7 @@
   - [ ] Configure CORS for local development
 - [ ] Create Qdrant Cloud instance (1GB cluster for dev)
 - [ ] Set up GitHub repository and enable GitHub Actions
+- [ ] Provision staging environment (Supabase + Qdrant) with seeded demo data for onboarding tests
 
 **Database Setup**
 - [ ] Create database schema in Supabase:
@@ -59,6 +60,7 @@
 - [ ] Enable `pgvector` extension in Supabase
 - [ ] Set up Row-Level Security (RLS) policies for all tables
 - [ ] Create database migration scripts
+- [ ] Store encryption keys in Supabase `vault.secrets` or KMS for OAuth/app-specific tokens
 
 **Backend API (FastAPI)**
 - [ ] Initialize FastAPI project with poetry/pipenv:
@@ -80,7 +82,8 @@
 - [ ] Create JWT authentication middleware
 - [ ] Implement health check endpoint (`/health`)
 - [ ] Add CORS middleware for frontend
-- [ ] Set up logging with structlog
+- [ ] Set up logging with structlog + OpenTelemetry traces piped to Prometheus/Tempo
+- [ ] Implement token encryption helper (AES-256-GCM with key rotation schedule)
 
 **Task Queue (Celery)**
 - [ ] Set up Redis locally (Docker)
@@ -93,6 +96,7 @@
       return {"status": "success"}
   ```
 - [ ] Verify task execution with Flower (Celery monitoring)
+- [ ] Configure Celery beat / Supabase cron for scheduled jobs (daily summaries, delta sync)
 
 **Frontend (Next.js)**
 - [ ] Initialize Next.js 14 project with App Router
@@ -108,6 +112,7 @@
   - [ ] `/auth/login` - Email + Google OAuth
   - [ ] `/auth/signup` - Email signup
   - [ ] Protected route middleware
+- [ ] Add analytics helpers (PostHog or Supabase events) for uploads, connections, chat feedback
 
 **Docker Compose for Local Development**
 - [ ] Create `docker-compose.yml`:
@@ -210,7 +215,7 @@
 - [ ] Implement EXIF metadata extraction (timestamp, location, camera info)
 - [ ] Create Supabase Storage upload helper with presigned URLs
 - [ ] Add file type validation (images, videos, audio only)
-- [ ] Implement deduplication using file hashes (SHA256)
+- [ ] Implement deduplication using SHA256 + perceptual hash + EXIF heuristics
 
 **Manual Upload (Frontend)**
 - [ ] Create `/upload` page with drag-and-drop UI
@@ -263,61 +268,91 @@
 - [ ] Implement pagination handling (Google Photos API returns 50 items/page)
 - [ ] Add sync status tracking in UI
 
+**Apple Photos / iCloud Integration**
+- [ ] Build onboarding UI to collect app-specific password + device trust instructions
+- [ ] Integrate `pyicloud` client (2FA + session refresh) for asset enumeration
+- [ ] Implement asset pagination (200 items) with resumable downloads + Live Photo components
+- [ ] Store `icloud_asset_id`, checksums, and `last_modified` to guarantee idempotent upserts
+- [ ] Queue backfill workers with throttling (max 5 req/s) and exponential backoff on 421 errors
+- [ ] Schedule 6-hour delta sync via Celery beat, including delete/tombstone propagation
+- [ ] Implement auth failure alerts and user-facing reconnect flow
+- [ ] Provide guided manual export fallback (macOS Shortcut + uploader) merging into same pipeline
+
 **Image Processing Pipeline**
 - [ ] Create `process_item` Celery task:
-  ```python
-  @celery.task
-  def process_item(item_id: str):
-      item = db.get(source_items, item_id)
-      
-      # Download file from storage
-      file_data = storage.download(item.original_url)
-      
-      # Extract text with OCR
-      ocr_text = run_ocr(file_data)
-      if ocr_text:
-          db.insert(processed_content, {
-              'source_item_id': item_id,
-              'content_type': 'ocr',
-              'content_text': ocr_text
-          })
-      
-      # Generate caption with vision model
-      caption = generate_caption(file_data)
-      caption_id = db.insert(processed_content, {
-          'source_item_id': item_id,
-          'content_type': 'caption',
-          'content_text': caption
-      })
-      
-      # Generate embedding
-      embedding = get_embedding(f"{caption} {ocr_text}")
-      
-      # Store in Qdrant
-      qdrant.upsert(
-          collection_name=f"user_{item.user_id}",
-          points=[{
-              'id': item_id,
-              'vector': embedding,
-              'payload': {
-                  'item_id': item_id,
-                  'user_id': item.user_id,
-                  'caption': caption,
-                  'ocr_text': ocr_text,
-                  'timestamp': item.captured_at,
-                  'location': item.location,
-                  'item_type': item.item_type
-              }
-          }]
-      )
-      
-      # Update status
-      db.update(source_items, item_id, {
-          'processing_status': 'completed'
-      })
-  ```
+```python
+@celery.task
+def process_item(item_id: str):
+    item = db.get(source_items, item_id)
+    file_path = storage.download_to_tmp(item.original_url)
+    
+    caption = ""
+    ocr_text = ""
+    transcript = ""
+    
+    if item.item_type == "photo":
+        ocr_text = run_ocr(file_path)
+        caption = generate_caption(load_bytes(file_path))
+    
+    elif item.item_type == "video":
+        keyframes = extract_keyframes(file_path, interval_sec=3)
+        scenes = detect_scenes(keyframes)
+        caption = summarize_scenes(scenes)
+        transcript = transcribe_audio(file_path)
+        generate_video_thumbnails(keyframes)
+    
+    elif item.item_type == "audio":
+        transcript, speakers = transcribe_and_diarize(file_path)
+    
+    content_records = []
+    if caption:
+        content_records.append({"content_type": "caption", "content_text": caption})
+    if ocr_text:
+        content_records.append({"content_type": "ocr", "content_text": ocr_text})
+    if transcript:
+        content_records.append({"content_type": "transcript", "content_text": transcript})
+    
+    for record in content_records:
+        db.insert(processed_content, {
+            "source_item_id": item_id,
+            "user_id": item.user_id,
+            **record
+        })
+    
+    embedding_payload = " ".join([r["content_text"] for r in content_records])
+    embedding = get_embedding(embedding_payload)
+    
+    qdrant.upsert(
+        collection_name=f"user_{item.user_id}",
+        points=[{
+            "id": item_id,
+            "vector": embedding,
+            "payload": {
+                "item_id": item_id,
+                "user_id": item.user_id,
+                "caption": caption,
+                "ocr_text": ocr_text,
+                "transcript": transcript,
+                "timestamp": item.captured_at,
+                "location": item.location,
+                "item_type": item.item_type
+            }
+        }]
+    )
+    
+    db.update(source_items, item_id, {"processing_status": "completed"})
+    emit_processing_metrics(item_id, item.item_type, duration_ms)
+```
+
+- [ ] Implement ffmpeg-based `extract_keyframes` + PySceneDetect integration
+- [ ] Use Whisper large-v3 or faster alternative on GPU-backed worker (RunPod or Modal)
+- [ ] Cache embeddings + captions to avoid recomputation on reprocess
+- [ ] Enforce processing SLA dashboards (queue depth, items/minute)
 
 **AI Model Integration**
+- [ ] Document model decision matrix (cost per 1k tokens/min, throughput, latency) for GPT-4V vs BLIP, Whisper vs Faster-Whisper
+- [ ] Implement caching layer (Redis) for identical caption/transcript requests and chunk batching
+- [ ] Set monthly budget guardrails + alerts for model spend; failover to cheaper models when threshold hit
 - [ ] Integrate OCR service (Tesseract or cloud OCR):
   ```python
   import pytesseract
@@ -386,11 +421,11 @@
 - [ ] Show progress during sync
 
 ### Deliverables
-- ✅ User can upload 100+ photos at once
-- ✅ User can connect Google Photos account
-- ✅ All uploaded photos are processed (OCR + caption + embedding)
-- ✅ Processed data is stored in Qdrant
-- ✅ Sync status is visible in UI
+- ✅ User can upload 100+ mixed media items (photos/videos/audio) at once
+- ✅ Users can connect Google Photos and Apple Photos accounts with automated backfill + delta sync
+- ✅ Video keyframes/transcripts and audio diarization are generated and searchable
+- ✅ Processed data (captions, transcripts, embeddings) is stored in Qdrant + Supabase
+- ✅ Sync + processing status, throughput, and cost telemetry are visible in monitoring dashboard
 
 ---
 
@@ -463,6 +498,9 @@
       return json.loads(response.choices[0].message.content)
   ```
 - [ ] Add entity extraction to processing pipeline
+- [ ] Batch LLM requests with caching to cap cost (<$0.15 per 100 items)
+- [ ] Create evaluation set (50 items) to score precision/recall of extracted entities monthly
+- [ ] Emit entity extraction metrics (latency, token usage, error rate)
 
 **Memory Graph Implementation**
 - [ ] Create helper functions for graph operations:
@@ -616,6 +654,14 @@
       clusters.append(current_cluster)
       return clusters
   ```
+
+**Daily Summaries**
+- [ ] Implement Celery beat job to trigger `generate_daily_summary` for each active user at 02:00 local time
+- [ ] Define prompt templates + guardrails (Markdown format, event ID references, hallucination checks)
+- [ ] Persist summaries to `daily_summaries` table with traceable source event IDs
+- [ ] Surface summaries in dashboard + inject into chat context (preprompt hook)
+- [ ] Collect user feedback (thumbs up/down + comment) and log for quality tuning
+- [ ] Monitor summary generation latency + error rate with Prometheus counters
 - [ ] Set up Celery Beat for daily scheduling:
   ```python
   from celery.schedules import crontab
@@ -734,6 +780,7 @@
 - ✅ Memory graph contains people, places, objects, events
 - ✅ Daily events are automatically generated
 - ✅ Hybrid retrieval combines vector + temporal + entity signals
+- ✅ End-to-end ingest → process → retrieve smoke test passes with seed dataset
 
 ---
 
@@ -772,12 +819,19 @@
           limit=5
       )
       
+      # Fetch recent daily summaries to ground responses
+      daily_summaries = get_recent_daily_summaries(
+          user_id=user.id,
+          days=7
+      )
+      
       # Build prompt
       context_text = format_context(context_hits)
       prompt = build_chat_prompt(
           query=request.message,
           context=context_text,
-          conversation_history=conversation_history
+          conversation_history=conversation_history,
+          daily_summaries=daily_summaries
       )
       
       # Call LLM
@@ -812,6 +866,9 @@
           'session_id': request.session_id
       }
   ```
+- [ ] Enforce response time budget (<3s p95) and log latency to Prometheus histogram
+- [ ] Record per-turn feedback + thumbs UI to feed accuracy metric
+- [ ] Add guardrails for token usage (truncate context beyond 8k tokens, fallback to cheaper model on overflow)
 
 **Prompt Engineering**
 - [ ] Design system prompt:
@@ -845,27 +902,32 @@
       return '\n'.join(context_items)
   ```
 - [ ] Build full prompt:
-  ```python
-  def build_chat_prompt(query, context, conversation_history):
-      messages = [
-          {"role": "system", "content": SYSTEM_PROMPT}
-      ]
-      
-      # Add conversation history
-      for turn in conversation_history:
-          messages.append({"role": turn['role'], "content": turn['content']})
-      
-      # Add current query with context
-      user_message = f"""Here are relevant memories:
+```python
+def build_chat_prompt(query, context, conversation_history, daily_summaries):
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    
+    if daily_summaries:
+        summary_block = "\n".join(
+            f"{s['summary_date']}: {s['content_markdown']}"
+            for s in daily_summaries
+        )
+        messages.append({
+            "role": "system",
+            "content": f"Recent daily summaries:\n{summary_block}"
+        })
+    
+    for turn in conversation_history or []:
+        messages.append({"role": turn['role'], "content": turn['content']})
+    
+    user_message = f"""Here are relevant memories:
 
-  {context}
+{context}
 
-  User question: {query}"""
-      
-      messages.append({"role": "user", "content": user_message})
-      
-      return messages
-  ```
+User question: {query}"""
+    
+    messages.append({"role": "user", "content": user_message})
+    return messages
+```
 
 **Chat Frontend**
 - [ ] Create `/chat` page with chat interface
@@ -966,6 +1028,8 @@
     );
   };
   ```
+- [ ] Show recent daily summaries sidebar with toggle + ability to pin summary into prompt
+- [ ] Add feedback controls (👍/👎 + optional comment) on assistant messages and send to `/feedback` API
 - [ ] Add sources section to assistant messages:
   ```typescript
   const AssistantMessage = ({ message }) => {
@@ -1021,10 +1085,10 @@
   ```
 
 ### Deliverables
-- ✅ User can send messages and receive contextual responses
-- ✅ Responses include source citations with thumbnails
-- ✅ Conversation history is maintained across page reloads
-- ✅ Users can create multiple chat sessions
+- ✅ User can chat with <3s p95 response time backed by hybrid retrieval
+- ✅ Responses include source citations + recent daily summary context
+- ✅ Conversation history persists across sessions with mem0 integration
+- ✅ Users can provide per-turn feedback captured in analytics
 
 ---
 
@@ -1290,12 +1354,19 @@
 - [ ] Optimize Qdrant queries with filters
 - [ ] Add CDN for static assets
 
+**Instrumentation & QA**
+- [ ] Wire Prometheus/Grafana dashboards for ingestion throughput, processing SLA, chat latency, and model spend
+- [ ] Schedule nightly synthetic end-to-end test (seed user) covering upload → processing → retrieval → chat
+- [ ] Automate weekly metric export to Metabase for success metric review
+- [ ] Run load test (Locust/k6) to validate chat p95 < 3s at target concurrency
+- [ ] Validate security + privacy requirements (encryption, token rotation, data deletion) and document checklist
+
 ### Deliverables
-- ✅ Timeline view shows user's activity by day
-- ✅ Dashboard displays key statistics
-- ✅ Notion integration is functional
-- ✅ All pages have proper loading and error states
-- ✅ UI is polished and responsive
+- ✅ Timeline view shows user's activity by day with high-performance pagination
+- ✅ Dashboard surfaces ingestion, storage, and activity metrics with caching
+- ✅ Notion integration syncs pages incrementally into memory system
+- ✅ Monitoring dashboards + synthetic tests cover ingest → chat pipeline
+- ✅ UI is polished, accessible, and resilient with loading/error states
 
 ---
 
@@ -1373,6 +1444,7 @@
              '--region', 'us-central1']
   ```
 - [ ] Deploy Celery workers as separate service
+- [ ] Provision GPU-backed media processing workers (RunPod/Modal) for Whisper + captioning
 - [ ] Set up Redis on Cloud Memorystore (or Upstash)
 - [ ] Deploy Next.js to Vercel:
   ```bash
@@ -1399,6 +1471,7 @@
   processing_duration = Histogram('processing_duration_seconds', 'Processing time')
   ```
 - [ ] Set up Grafana dashboard for key metrics
+- [ ] Stream model usage + spend to monitoring (per provider, per task)
 - [ ] Create alerts for:
   - High error rate (>5%)
   - Long processing queue (>100 items)
@@ -1414,6 +1487,7 @@
   4. Try first chat query
 - [ ] Add interactive tutorial tooltips
 - [ ] Create demo account with sample data
+- [ ] Publish Apple Photos setup guide (app-specific password + manual export fallback) in-app
 
 **Documentation**
 - [ ] Write README with setup instructions
@@ -1439,11 +1513,11 @@
 - [ ] Iterate based on feedback
 
 ### Deliverables
-- ✅ Production environment is live and stable
-- ✅ Monitoring and alerts are configured
-- ✅ 20 pilot users are onboarded
-- ✅ Feedback collection is active
-- ✅ MVP is feature-complete and ready to scale
+- ✅ Production stack (API, GPU workers, Celery, web) is live and stable
+- ✅ Monitoring, alerts, and cost dashboards are configured
+- ✅ 20 pilot users onboarded with at least one Google + Apple source connected
+- ✅ Feedback collection + support loops are active
+- ✅ Success metrics instrumentation confirms MVP readiness to scale
 
 ---
 
@@ -1456,9 +1530,9 @@
 4. Add most requested features
 
 ### Future Phases
-- **Phase 2:** Video processing, Apple Photos integration, advanced graph queries
-- **Phase 3:** Mobile apps, desktop agent, vlog generation
-- **Phase 4:** Sharing, collaboration, API for developers
+- **Phase 2:** Advanced graph analytics, face clustering, richer retrieval evaluation tooling
+- **Phase 3:** Mobile apps, desktop capture agent, automated story generation
+- **Phase 4:** Sharing/collaboration features, developer API, enterprise deployment options
 
 ---
 
@@ -1483,11 +1557,12 @@
 | Metric | Target | Measurement |
 |--------|--------|-------------|
 | User signups | 20 pilot users | Supabase Auth count |
-| Data sources connected | 2+ per user | `data_connections` table |
-| Photos processed | 10,000+ | `source_items` count |
-| Chat queries | 100+ total | API logs |
-| Query accuracy | 80%+ relevant | User feedback survey |
-| Response time | <3s p95 | Prometheus histogram |
+| Data sources connected | 80% of pilots connect both Google + Apple | `data_connections` table filtered by provider |
+| Media assets processed | 10,000+ mixed items | `source_items` count + processing metrics |
+| Chat queries | 100+ total | OpenTelemetry traces + API logs |
+| Query accuracy | 80%+ relevant | In-app thumbs feedback tagged per conversation turn |
+| Response time | <3s p95 | Prometheus histogram (`chat_latency_seconds`) |
+| Daily summary usefulness | 70% thumbs-up | Daily summary feedback table |
 | User retention | 40% D14 | Analytics |
 
 ---

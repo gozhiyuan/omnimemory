@@ -1,6 +1,23 @@
 version: "3.9"
 
 services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: lifelog-postgres
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-lifelog}
+      - POSTGRES_USER=${POSTGRES_USER:-lifelog}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-lifelog}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-lifelog}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   redis:
     image: redis:7-alpine
     container_name: lifelog-redis
@@ -96,5 +113,5 @@ services:
   #   command: celery -A app.tasks beat --loglevel=info
 
 volumes:
+  pg_data:
   qdrant_data:
-

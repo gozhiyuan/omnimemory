@@ -1,0 +1,31 @@
+# Environment & virtualenvs
+.env
+.env.dev
+.env.local
+.venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Packaging artifacts
+*.egg-info/
+build/
+dist/
+
+# IDE/editor files
+.DS_Store
+.vscode/
+*.swp
+
+# uv / pip caches
+.uv/
+pip-wheel-metadata/
+
+# Local data
+orchestration/prometheus-data/
+orchestration/grafana-data/
+qdrant_data/
+pg_data/
+

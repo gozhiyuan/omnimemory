@@ -1,11 +1,12 @@
 Local Orchestration (Docker Compose)
 
 Services included:
-- Redis (broker for Celery)
+- Postgres 15 (app database)
+- Redis (Celery broker/cache)
 - Qdrant (vector DB)
 - Flower (Celery monitoring)
 - Celery Exporter (Prometheus metrics for Celery)
-- Prometheus (metrics)
+- Prometheus (metrics collection)
 - Grafana (dashboards)
 
 Quick start
@@ -18,6 +19,7 @@ Quick start
 - Open Prometheus: http://localhost:9090
 - Open Flower: http://localhost:5555
 - Qdrant UI/API: http://localhost:6333
+- Postgres: localhost:5432 (user/pass from `.env.dev`)
 
 Notes
 - API/worker/beat services are stubbed (commented) until the backend exists at `services/api`.
@@ -26,4 +28,3 @@ Notes
 
 Production orchestration
 - Use managed services per the MVP plan (Supabase, Qdrant Cloud, Redis/Upstash, Vercel/Cloud Run). Terraform/IaC can be added later; start by configuring via provider dashboards.
-

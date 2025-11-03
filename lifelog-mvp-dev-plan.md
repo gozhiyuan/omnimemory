@@ -85,6 +85,46 @@
 - [ ] Set up logging with structlog + OpenTelemetry traces piped to Prometheus/Tempo
 - [ ] Implement token encryption helper (AES-256-GCM with key rotation schedule)
 
+**Storage Abstraction & Presigned URLs**
+- [ ] Implement storage provider interface and Supabase adapter
+  ```python
+  from typing import Protocol, Dict, Optional
+
+  class StorageProvider(Protocol):
+      def get_presigned_upload(self, key: str, content_type: str, expires_s: int = 900) -> Dict: ...
+      def get_presigned_download(self, key: str, expires_s: int = 900) -> Dict: ...
+      def delete(self, key: str) -> None: ...
+
+  class SupabaseStorageProvider:
+      def __init__(self, client, bucket: str):
+          self.client = client
+          self.bucket = bucket
+
+      def get_presigned_upload(self, key, content_type, expires_s=900):
+          # Use storage.from(bucket).create_signed_url for PUT or upload via signed POST
+          url = create_signed_put_url(self.client, self.bucket, key, content_type, expires_s)
+          return {"url": url, "headers": {"Content-Type": content_type}}
+
+      def get_presigned_download(self, key, expires_s=900):
+          url = self.client.storage.from_(self.bucket).create_signed_url(key, expires_s)["signedURL"]
+          return {"url": url}
+
+      def delete(self, key):
+          self.client.storage.from_(self.bucket).remove([key])
+  ```
+- [ ] Add API endpoints for presigned flows
+  ```python
+  @app.post("/api/v1/storage/upload-url")
+  async def create_upload_url(req: UploadUrlRequest, user: User = Depends(get_current_user)):
+      key = f"originals/{user.id}/{uuid4()}-{req.filename}"
+      return storage.get_presigned_upload(key, req.content_type)
+
+  @app.get("/api/v1/storage/download-url")
+  async def create_download_url(key: str, user: User = Depends(get_current_user)):
+      assert_user_owns_key(user.id, key)
+      return storage.get_presigned_download(key)
+  ```
+
 **Task Queue (Celery)**
 - [ ] Set up Redis locally (Docker)
 - [ ] Initialize Celery app with Redis broker
@@ -197,7 +237,7 @@
 ### Tasks
 
 **Manual Upload (Backend)**
-- [ ] Create upload endpoint:
+- [ ] Create upload endpoint (presigned preferred; keep batch POST for small files):
   ```python
   @app.post("/api/v1/upload/batch")
   async def batch_upload(
@@ -349,6 +389,24 @@ def process_item(item_id: str):
 - [ ] Cache embeddings + captions to avoid recomputation on reprocess
 - [ ] Enforce processing SLA dashboards (queue depth, items/minute)
 
+**Lifecycle & Retention Jobs**
+- [ ] Create `enforce_storage_lifecycle` Celery task:
+  ```python
+  @celery.task
+  def enforce_storage_lifecycle():
+      for user in get_active_users():
+          settings = get_user_storage_settings(user.id)  # keep_originals, retention_days
+          if settings.keep_originals:
+              continue
+          cutoff = datetime.utcnow() - timedelta(days=settings.retention_days or 30)
+          originals = list_originals_older_than(user.id, cutoff)
+          for key in originals:
+              storage.delete(key)
+              log_storage_deletion(user.id, key)
+  ```
+- [ ] Schedule nightly run via Celery beat and add metrics (deleted count, reclaimed bytes)
+- [ ] Add “Optimize storage” UI action to trigger a one-off lifecycle run per user
+
 **AI Model Integration**
 - [ ] Document model decision matrix (cost per 1k tokens/min, throughput, latency) for GPT-4V vs BLIP, Whisper vs Faster-Whisper
 - [ ] Implement caching layer (Redis) for identical caption/transcript requests and chunk batching
@@ -419,6 +477,10 @@ def process_item(item_id: str):
 - [ ] Display sync statistics (total items, last sync, status)
 - [ ] Add manual "Sync Now" button
 - [ ] Show progress during sync
+
+**Storage Monitoring**
+- [ ] Track per-user storage usage (bytes/originals/previews) and show in dashboard
+- [ ] Add alerts on high growth (>5 GB/day) and quota breaches
 
 ### Deliverables
 - ✅ User can upload 100+ mixed media items (photos/videos/audio) at once

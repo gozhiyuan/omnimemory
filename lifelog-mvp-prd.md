@@ -149,6 +149,33 @@ Incremental Sync (Daily):
 - **Processed artifacts:** Store captions, embeddings, OCR text in your DB
 - **Original files:** Keep in 3rd party (Google Photos) for display, or selectively cache thumbnails
 
+#### Storage Policy (MVP)
+
+Objectives: minimize storage cost, avoid duplicate originals, ensure fast UX with thumbnails/previews, and keep derived artifacts for retrieval.
+
+- Google Photos
+  - Do not mirror originals. Store metadata, IDs/URLs, small thumbnails you control, and all derived artifacts (captions/OCR/transcripts/embeddings).
+  - Fetch full-resolution only on explicit user request; optionally cache mid‑res previews.
+
+- Apple Photos
+  - Download originals for processing; by default delete originals after processing. Retain thumbnails, mid‑res previews, and derived artifacts.
+  - User toggle “Keep Originals” per account/workspace to persist originals; otherwise apply retention rules.
+
+- Manual Uploads
+  - Store originals in object storage with default 30‑day retention, keep thumbnails/previews + derived artifacts permanently.
+  - User toggle “Keep Originals” to disable auto‑deletion.
+
+- Derived Artifacts (always kept)
+  - Thumbnails and keyframes (compressed), captions/OCR/transcripts (text), embeddings in vector DB.
+
+- Lifecycle & Quotas
+  - Nightly job enforces retention (delete originals older than retention window if “Keep Originals” is off).
+  - Per‑user storage usage surfaced in dashboard with "Optimize storage" action (delete originals, keep artifacts).
+
+- Access & Security
+  - Serve media via short‑lived signed URLs; encrypt tokens/keys; enforce RLS on metadata.
+  - Bucket structure: `originals/{user_id}/{item_id}`, `previews/{user_id}/{item_id}`, `thumbnails/{user_id}/{item_id}`.
+
 **Data Schema:**
 
 ```sql

@@ -23,7 +23,16 @@ def configure_celery() -> None:
         accept_content=["json"],
         timezone="UTC",
         beat_scheduler="celery.beat:PersistentScheduler",
-        beat_schedule={},
+        beat_schedule={
+            "health-ping": {
+                "task": "health.ping",
+                "schedule": 60.0,
+            },
+            "lifecycle-cleanup": {
+                "task": "maintenance.cleanup",
+                "schedule": 3600.0,
+            },
+        },
         task_queues=(
             Queue("default", Exchange("default"), routing_key="default"),
         ),

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Dict, Protocol
 
 import httpx
@@ -23,10 +24,15 @@ class StorageProvider(Protocol):
     def delete(self, key: str) -> None:
         ...
 
+    def fetch(self, key: str) -> bytes:
+        ...
+
 
 @dataclass
 class MemoryStorageProvider(StorageProvider):
     """Fallback provider that stores objects in-process (dev/testing)."""
+
+    objects: Dict[str, bytes] = field(default_factory=dict)
 
     def get_presigned_upload(self, key: str, content_type: str, expires_s: int) -> Dict[str, str]:
         logger.warning("MemoryStorageProvider does not issue presigned URLs; returning key only")
@@ -38,6 +44,14 @@ class MemoryStorageProvider(StorageProvider):
 
     def delete(self, key: str) -> None:  # pragma: no cover - no-op
         logger.info("MemoryStorageProvider delete called for key={}", key)
+
+    def fetch(self, key: str) -> bytes:
+        logger.info("MemoryStorageProvider fetch called for key={}", key)
+        return self.objects.get(key, b"")
+
+    def store(self, key: str, data: bytes) -> None:
+        logger.info("MemoryStorageProvider store called for key={} size={}", key, len(data))
+        self.objects[key] = data
 
 
 @dataclass
@@ -101,7 +115,24 @@ class SupabaseStorageProvider(StorageProvider):
             json=payload,
         )
 
+    def fetch(self, key: str) -> bytes:
+        if not self.settings.supabase_url or not self.settings.supabase_service_role_key:
+            raise RuntimeError("Supabase credentials not configured")
 
+        url = (
+            f"{self.settings.supabase_url.rstrip('/')}/storage/v1/object/"
+            f"{self.settings.bucket_originals}/{key}"
+        )
+        headers = {
+            "apikey": self.settings.supabase_service_role_key,
+            "Authorization": f"Bearer {self.settings.supabase_service_role_key}",
+        }
+        resp = httpx.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        return resp.content
+
+
+@lru_cache(maxsize=1)
 def get_storage_provider() -> StorageProvider:
     settings = get_settings()
     if settings.storage_provider == "supabase":

@@ -44,7 +44,63 @@ async def run_migrations(engine: AsyncEngine | None = None) -> List[str]:
             if version in seen:
                 continue
             sql = path.read_text()
-            await conn.exec_driver_sql(sql)
+
+            def _split_statements(script: str) -> list[str]:
+                statements: list[str] = []
+                buffer: list[str] = []
+                in_single = False
+                in_double = False
+                dollar_tag: str | None = None
+                i = 0
+                while i < len(script):
+                    ch = script[i]
+                    if dollar_tag:
+                        if script.startswith(dollar_tag, i):
+                            buffer.append(dollar_tag)
+                            i += len(dollar_tag)
+                            dollar_tag = None
+                            continue
+                        buffer.append(ch)
+                        i += 1
+                        continue
+
+                    if ch == "'" and not in_double:
+                        in_single = not in_single
+                        buffer.append(ch)
+                        i += 1
+                        continue
+                    if ch == '"' and not in_single:
+                        in_double = not in_double
+                        buffer.append(ch)
+                        i += 1
+                        continue
+                    if ch == "$" and not in_single and not in_double:
+                        j = i + 1
+                        while j < len(script) and (script[j].isalnum() or script[j] == "_"):
+                            j += 1
+                        if j < len(script) and script[j] == "$":
+                            tag = script[i : j + 1]
+                            dollar_tag = tag
+                            buffer.append(tag)
+                            i = j + 1
+                            continue
+                    if ch == ";" and not in_single and not in_double:
+                        statement = "".join(buffer).strip()
+                        if statement:
+                            statements.append(statement)
+                        buffer = []
+                        i += 1
+                        continue
+                    buffer.append(ch)
+                    i += 1
+                if buffer:
+                    statement = "".join(buffer).strip()
+                    if statement:
+                        statements.append(statement)
+                return statements
+
+            for stmt in _split_statements(sql):
+                await conn.exec_driver_sql(stmt)
             await conn.execute(
                 text(
                     "INSERT INTO schema_migrations (version, name) VALUES (:version, :name)"

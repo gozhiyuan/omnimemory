@@ -29,3 +29,5 @@ dev = ["pytest~=8.2", "ruff~=0.5", "mypy~=1.10"]
 requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools]
+packages = ["app"]

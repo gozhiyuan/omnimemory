@@ -4,23 +4,45 @@ This service handles all synchronous requests, including uploads, authentication
 
 ## Prerequisites
 
-All commands below assume you are running from `services/api/` with the environment variables in
-`.env` populated for Postgres, Redis, Qdrant, and Supabase. Bootstrap the local virtual environment
-and install dependencies with:
+1. From the repo root, start the infrastructure containers and confirm they are healthy:
 
-```bash
-uv venv           # creates .venv using the settings from pyproject.toml
-uv sync           # installs runtime + dev dependencies into .venv
-```
+   ```bash
+   make dev-up    # launches postgres/redis/qdrant/flower/prom/grafana
+   make dev-ps    # optional: shows container status
+   ```
 
-Subsequent commands can be executed through `uv run <command>` which automatically reuses the
-virtual environment.
+   You can inspect the DB with
+   `docker compose -f orchestration/docker-compose.dev.yml exec postgres psql -U lifelog -d lifelog`
+   or watch Flower at http://localhost:5555 to ensure Celery can reach Redis.
+
+2. In `services/api/`, create the virtual environment and install dependencies:
+
+   ```bash
+   uv venv
+   uv sync
+   ```
+
+   _Tip:_ if your shell blocks uv’s default cache (permission errors under `~/.cache/uv`), set
+   `UV_CACHE_DIR=../.uv-cache` before running `uv sync`.
+
+3. Apply the SQL migrations once per database to create the schema:
+
+   ```bash
+   uv run python -m app.db.migrator
+   ```
+
+   The runner records applied versions in `schema_migrations`, so re-running it after future SQL
+   changes is safe. Verify the tables via `\dt` inside the Postgres container if needed.
+
+Subsequent commands can be executed through `uv run <command>` which automatically reuses the virtual
+environment.
 
 ## Key scripts & modules
 
 ### FastAPI application (`app/main.py`)
 
-Run the HTTP API locally with auto-reload:
+Run the HTTP API locally with auto-reload once `make dev-up`, `uv sync`, and the migrations have
+completed:
 
 ```bash
 uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
@@ -41,14 +63,15 @@ uv run celery -A app.celery_app.celery_app beat --loglevel=info
 
 ### Database migration runner (`app/db/migrator.py`)
 
-Migrations are expressed as SQL files in `migrations/`. Apply them against your local Postgres
-instance with:
+Already covered in the prerequisites section, but worth highlighting: migrations live under
+`services/api/migrations/` as raw SQL files. Whenever those change, rerun:
 
 ```bash
 uv run python -m app.db.migrator
 ```
 
-The runner stores applied versions in the `schema_migrations` table so it can be rerun safely.
+You can confirm the schema exists by opening `psql` via Docker and running `\dt` or checking
+`SELECT * FROM schema_migrations;`.
 
 ### Vector store helper (`app/vectorstore.py`)
 
@@ -79,8 +102,7 @@ uv run python -c "from app.tasks.process_item import process_item; process_item.
 ## Tests
 
 Run the FastAPI integration tests after the services in `orchestration/docker-compose.dev.yml` are
-up (Postgres, Redis, Qdrant). The first invocation installs the dev dependencies thanks to `uv sync`
-above:
+up and the database has been migrated:
 
 ```bash
 uv run pytest services/api/tests

@@ -9,7 +9,7 @@
 
 Build an AI-powered personal memory assistant that ingests multimodal data from 3rd-party sources and user uploads, processes and organizes it into a queryable knowledge base, and provides conversational access through a web-based chat interface.
 
-**MVP Scope (8-12 weeks):** Web app only, focusing on data ingestion pipeline, memory organization, and RAG-powered chat.
+**MVP Scope (8-12 weeks):** React + Vite single-page web app (tabs: Dashboard, Timeline, Chat, Ingest) backed by FastAPI + Celery, focusing on manual uploads, Google Photos sync, the ingestion pipeline, timeline/day summaries, and RAG-powered chat.
 
 ---
 
@@ -40,20 +40,16 @@ Build an AI-powered personal memory assistant that ingests multimodal data from 
 ### IN SCOPE ✅
 
 **3.1 Data Layer**
-- Manual upload interface for photos, videos, audio files (batch upload support)
-- 3rd-party integrations:
-  - Google Photos (OAuth + full historical sync)
-  - Apple Photos / iCloud (app-specific password via Private iCloud API + resumable download worker; fallback guided export uploader)
-  - Notion (OAuth + page/database sync)
-- One-time full historical data ingestion, then incremental daily syncs
-- Metadata extraction: timestamp, location, file type, source
-- Deduplication logic (combine SHA256 + perceptual hash + EXIF heuristics to catch resized/edited duplicates)
+- Manual upload (drag-and-drop or folder selection) for photos, videos, and audio files with batch support
+- Google Photos connector (OAuth) that performs a full historical backfill after the user authorizes, persists encrypted refresh tokens, and runs automated daily delta syncs through Celery beat
+- Background ingestion monitors (Celery workers) track last-sync timestamps per connection and enqueue new media for processing/embedding whenever Google Photos adds new assets
+- Metadata extraction: timestamp, EXIF, location, file type, source, album references
+- Deduplication logic (combine SHA256 + perceptual hash + EXIF heuristics to catch resized/edited duplicates) so manual uploads and Google imports do not create duplicate events
 
 **3.2 Processing Pipeline**
-- Image: OCR (text extraction), captioning (BLIP/GPT-4V), CLIP embeddings, throughput target 2 img/s/worker
+- Image (Google Photos + manual uploads): OCR (text extraction), captioning (Gemini Vision/BLIP), CLIP embeddings, throughput target 2 img/s/worker
 - Video: Keyframe extraction (ffmpeg every 3s), scene boundary detection, multimodal captioning per scene, audio transcription, thumbnail generation
-- Audio: Speech-to-text (Whisper), speaker diarization, silence trimming
-- Documents (Notion): Text extraction, embedding generation
+- Audio (if uploaded manually): Speech-to-text (Whisper), speaker diarization, silence trimming
 - Entity extraction: People, places, objects, events (using LLM)
 - Temporal clustering: Group items into "events" by time proximity
 - Processing SLA: ingest + process 10k mixed assets within 60 minutes via horizontal worker scaling
@@ -71,20 +67,20 @@ Build an AI-powered personal memory assistant that ingests multimodal data from 
 - Local embedding model: all-MiniLM-L6-v2 or OpenAI embeddings API
 
 **3.5 Application Layer (Web Only)**
-- User authentication (Supabase Auth: email/password + Google OAuth)
-- **Data Connections Page:** UI to connect and authorize 3rd-party apps, view sync status
-- **Upload Interface:** Drag-and-drop or folder selection for batch uploads, progress indicators
-- **Chat Interface:** Conversational UI with memory-powered responses, source citations
-- **Timeline View:** Calendar/timeline visualization of memories with thumbnails
-- **Dashboard:** Weekly/monthly summaries, activity heatmap, storage usage
+- User authentication (Supabase Auth: email/password + Google OAuth) gating a single React + Vite SPA shell (`Layout` + `App.tsx` view switcher)
+- **Ingest Tab:** Combined drag-and-drop upload interface and Google Photos connection card with OAuth popup, sync state, and manual retry controls
+- **Chat Tab:** Conversational UI with memory-powered responses, source citations, and daily summary context chips
+- **Timeline Tab:** Calendar/timeline visualization of per-day events; clicking a day opens a detail drawer with summaries, thumbnails, video clips, and external (Google Photos) deep links
+- **Dashboard Tab:** Weekly/monthly summaries, ingestion statistics, storage usage, and connected-source health indicators
 
 **3.6 Infrastructure**
 - **Auth/DB/Storage:** Supabase (Postgres + Auth + Object Storage)
 - **Vector DB:** Qdrant Cloud (start) → self-hosted Qdrant (scale)
 - **API Backend:** FastAPI (Python)
 - **Task Queue:** Celery + Redis for async processing
-- **Web Frontend:** Next.js (App Router) deployed on Vercel
-- **Cloud:** Start with managed services (Supabase, Vercel, Railway/Render for API)
+- **Web Frontend:** React 19 + TypeScript SPA bundled with Vite (local dev `npm run dev`, prod via Cloud Storage + Cloud CDN or Cloud Run static hosting)
+- **Local Tooling:** Make targets wrap `orchestration/docker-compose.dev.yml` to launch Postgres/Redis/Qdrant; backend uses `uv` for dependency management
+- **Cloud:** Start with Supabase + Qdrant Cloud + Cloud Run (FastAPI + Celery) while serving the SPA from Cloud Storage/Cloud CDN; migrate to more GCP-native services if commercialization requires
 - **Security Baseline:** Encrypt at rest/in transit, store OAuth tokens with AES-256 + rotation, implement user data deletion workflow within 24h, document GDPR-compliant privacy policy
 
 ### OUT OF SCOPE (Post-MVP) ❌
@@ -92,7 +88,7 @@ Build an AI-powered personal memory assistant that ingests multimodal data from 
 - Desktop capture agent
 - Automated screenshot/video capture
 - Vlog generation
-- Social media integrations (Twitter, Instagram, TikTok)
+- Additional connectors beyond Google Photos (Apple Photos, Notion, social media APIs)
 - Shareable mini-chatbots
 - Advanced graph visualizations
 - Multi-user collaboration
@@ -135,14 +131,7 @@ Incremental Sync (Daily):
 4. Update last_sync_timestamp
 ```
 
-#### Apple Photos / iCloud Strategy
-
-- **Auth:** Collect app-specific password from user, store encrypted; leverage `pyicloud` (or equivalent CloudKit client) with 2FA device trust bootstrap flow.
-- **Data fetch:** Enumerate user albums + assets via CloudKit, request original assets + Live Photo motion components; stream download to temporary storage with resumable chunks (5 MB).
-- **Backfill:** Kick off Celery batch jobs that paginate through all asset batches (default 200 items) while respecting Apple throttling (max 5 req/s per session); persist `icloud_asset_id` for idempotency.
-- **Delta sync:** Use asset `modifiedDate` to pull changes every 6 hours; mark deletions and propagate tombstones to Supabase + Qdrant.
-- **Resilience:** Retry with exponential backoff on 421 throttling; rotate session tokens weekly; alert on repeated auth failures.
-- **Fallback:** Provide guided manual exporter (macOS shortcut + uploader) for users unable to provide app-specific password; processed via same batch ingestion path.
+> **Note:** Additional connectors (Apple Photos, Notion, social feeds) will reuse this pattern post-MVP. Their auth/data handling is out of current scope but should mirror the Google Photos model (token storage, last-sync tracking, Celery-driven backfill + delta jobs).
 
 **Storage Strategy:**
 - **Metadata only:** Store photo URLs, IDs, timestamps in your DB
@@ -156,10 +145,7 @@ Objectives: minimize storage cost, avoid duplicate originals, ensure fast UX wit
 - Google Photos
   - Do not mirror originals. Store metadata, IDs/URLs, small thumbnails you control, and all derived artifacts (captions/OCR/transcripts/embeddings).
   - Fetch full-resolution only on explicit user request; optionally cache mid‑res previews.
-
-- Apple Photos
-  - Download originals for processing; by default delete originals after processing. Retain thumbnails, mid‑res previews, and derived artifacts.
-  - User toggle “Keep Originals” per account/workspace to persist originals; otherwise apply retention rules.
+- Future connectors (Apple Photos, Notion, others) follow the same rule set once implemented, but are deferred until after the MVP.
 
 - Manual Uploads
   - Store originals in object storage with default 30‑day retention, keep thumbnails/previews + derived artifacts permanently.

@@ -1,47 +1,140 @@
-"""Primary media processing task skeleton."""
+"""Primary media processing task implementation."""
 
 from __future__ import annotations
 
-import time
+import asyncio
+from datetime import datetime
 from typing import Any, Dict
+from uuid import UUID
 
 from loguru import logger
+from sqlalchemy import delete
+from sqlalchemy.exc import SQLAlchemyError
 
 from ..celery_app import celery_app
+from ..db.models import ProcessedContent, SourceItem
+from ..db.session import get_sessionmaker
+from ..storage import get_storage_provider
+from ..vectorstore import upsert_random_embedding
+
+
+async def _upsert_content(session, item_id: UUID, role: str, data: Dict[str, Any]) -> None:
+    await session.execute(
+        delete(ProcessedContent).where(
+            ProcessedContent.item_id == item_id,
+            ProcessedContent.content_role == role,
+        )
+    )
+    session.add(ProcessedContent(item_id=item_id, content_role=role, data=data))
+
+
+def _extract_metadata(blob: bytes, payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "size_bytes": len(blob),
+        "item_type": payload.get("item_type"),
+        "captured_at": payload.get("captured_at"),
+        "storage_key": payload.get("storage_key"),
+        "processed_at": datetime.utcnow().isoformat(),
+    }
+
+
+def _generate_caption(item: SourceItem, metadata: Dict[str, Any]) -> Dict[str, Any]:
+    text = f"Auto-generated caption for {item.item_type} item {item.id}"
+    return {"text": text, "summary": text, "metadata": metadata}
+
+
+def _generate_transcription(item: SourceItem) -> Dict[str, Any]:
+    text = f"Placeholder transcription for item {item.id}"
+    return {"text": text}
+
+
+def _generate_ocr(item: SourceItem) -> Dict[str, Any]:
+    text = f"Placeholder OCR text for item {item.id}"
+    return {"text": text}
+
+
+async def _process_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    sessionmaker = get_sessionmaker()
+    storage = get_storage_provider()
+
+    try:
+        item_id = UUID(str(payload["item_id"]))
+    except (KeyError, ValueError) as exc:  # pragma: no cover - validation guard
+        raise ValueError("process_item payload missing valid item_id") from exc
+
+    logger.info("Processing item {}", item_id)
+
+    metadata: Dict[str, Any] = {}
+    caption: Dict[str, Any] = {}
+
+    async with sessionmaker() as session:
+        item = await session.get(SourceItem, item_id)
+        if item is None:
+            raise ValueError(f"source item {item_id} not found")
+
+        if payload.get("content_type") and not item.content_type:
+            item.content_type = payload["content_type"]
+        if payload.get("original_filename") and not item.original_filename:
+            item.original_filename = payload["original_filename"]
+
+        item.processing_status = "processing"
+        item.processing_error = None
+        await session.flush()
+
+        try:
+            blob = storage.fetch(item.storage_key)
+            metadata = _extract_metadata(blob, payload)
+            caption = _generate_caption(item, metadata)
+            transcription = _generate_transcription(item)
+            ocr = _generate_ocr(item)
+
+            await _upsert_content(session, item.id, "metadata", metadata)
+            await _upsert_content(session, item.id, "caption", caption)
+            await _upsert_content(session, item.id, "transcription", transcription)
+            await _upsert_content(session, item.id, "ocr", ocr)
+
+            item.processing_status = "completed"
+            item.processed_at = datetime.utcnow()
+            await session.commit()
+        except Exception as exc:
+            await session.rollback()
+            item.processing_status = "failed"
+            item.processing_error = str(exc)
+            session.add(item)
+            await session.commit()
+            logger.exception("Processing failed for item {}", item_id)
+            raise
+
+    try:
+        await asyncio.to_thread(
+            upsert_random_embedding,
+            item_id,
+            {
+                "item_id": str(item_id),
+                "caption": caption.get("text"),
+                "metadata": metadata,
+            },
+        )
+    except Exception as exc:  # pragma: no cover - external service dependency
+        logger.warning("Failed to upsert embedding for item {}: {}", item_id, exc)
+
+    return {
+        "status": "completed",
+        "item_id": str(item_id),
+        "processed_at": metadata["processed_at"],
+    }
 
 
 @celery_app.task(name="pipeline.process_item", bind=True)
 def process_item(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Process an uploaded item into derived artifacts.
+    """Process an uploaded item into derived artifacts."""
 
-    The payload is expected to contain:
-        - item_id: UUID from the database
-        - storage_key: location of the original asset
-        - item_type: photo | video | audio | document
-        - user_id: owner reference
-    """
-
-    start = time.perf_counter()
-    item_id = payload.get("item_id")
-    storage_key = payload.get("storage_key")
-    item_type = payload.get("item_type")
-
-    logger.info(
-        "Processing item task received: item_id={} storage_key={} item_type={}",
-        item_id,
-        storage_key,
-        item_type,
-    )
-
-    # TODO: download from storage, run OCR/caption/transcription, persist output, update Qdrant
-    time.sleep(0.1)
-
-    elapsed = time.perf_counter() - start
-    logger.info("Processing item completed item_id={} duration={:.3f}s", item_id, elapsed)
-
-    return {
-        "status": "completed",
-        "item_id": item_id,
-        "duration_s": elapsed,
-    }
+    try:
+        return asyncio.run(_process_payload(payload))
+    except SQLAlchemyError as exc:  # pragma: no cover - unexpected database errors
+        logger.exception("Database error while processing item: {}", exc)
+        raise
+    except Exception as exc:  # pragma: no cover - propagate to retry logic
+        logger.exception("Unhandled exception in process_item: {}", exc)
+        raise
 

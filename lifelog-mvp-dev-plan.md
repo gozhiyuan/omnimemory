@@ -21,7 +21,7 @@
   ```
   lifelog-ai/
   ├── apps/
-  │   └── web/          # Next.js frontend
+  │   └── web/          # React + Vite SPA frontend
   ├── services/
   │   ├── api/          # FastAPI backend
   │   └── workers/      # Celery workers
@@ -138,21 +138,15 @@
 - [ ] Verify task execution with Flower (Celery monitoring)
 - [ ] Configure Celery beat / Supabase cron for scheduled jobs (daily summaries, delta sync)
 
-**Frontend (Next.js)**
-- [ ] Initialize Next.js 14 project with App Router
-- [ ] Install dependencies:
-  ```bash
-  pnpm add @supabase/supabase-js @tanstack/react-query zustand
-  pnpm add -D tailwindcss @shadcn/ui
-  ```
-- [ ] Set up Supabase client (client-side + server-side)
-- [ ] Configure TailwindCSS and shadcn/ui
-- [ ] Create basic layout with navigation
-- [ ] Implement authentication pages:
-  - [ ] `/auth/login` - Email + Google OAuth
-  - [ ] `/auth/signup` - Email signup
-  - [ ] Protected route middleware
-- [ ] Add analytics helpers (PostHog or Supabase events) for uploads, connections, chat feedback
+-**Frontend (React + Vite SPA)**
+- [ ] Maintain the existing `apps/web` stack of React 19 + TypeScript bundled with Vite 6 (`npm create vite@latest lifelog-ai -- --template react-ts` as reference)
+- [ ] Keep Tailwind via CDN config in `index.html` (custom `primary` palette + Inter font) so component classes in `App.tsx`, `Layout.tsx`, etc. render correctly without a Tailwind build step
+- [ ] Install/maintain runtime dependencies already present in `package.json`: `react`, `react-dom`, `lucide-react` for icons, `recharts` for dashboard charts, and `@google/genai` for assistant calls
+- [ ] Ensure `App.tsx` view switcher (dashboard/chat/timeline/upload/settings) remains the single source of truth after login so every tab can reuse shared layout + auth state
+- [ ] Flesh out the Ingest tab so manual uploads call the FastAPI `/upload/batch` endpoint and the Google Photos connector UI triggers OAuth, shows sync status, and surfaces retry/manage actions
+- [ ] Build chat + ingestion workflows against the Gemini API via `@google/genai` services, reusing hooks/utilities under `apps/web/services`
+- [ ] Drive the Timeline view from the `/timeline` API (daily activity heatmap + detail drawer per day showing photos, videos, summaries) and hydrate the Dashboard components with stats returned by `/stats`
+- [ ] Add lightweight routing or state persistence as needed (URL params or Zustand) instead of server-side routing, and gate authenticated data fetches through supabase/api clients once backend endpoints exist
 
 **Docker Compose for Local Development**
 - [ ] Create `docker-compose.yml`:
@@ -307,16 +301,8 @@
   ```
 - [ ] Implement pagination handling (Google Photos API returns 50 items/page)
 - [ ] Add sync status tracking in UI
-
-**Apple Photos / iCloud Integration**
-- [ ] Build onboarding UI to collect app-specific password + device trust instructions
-- [ ] Integrate `pyicloud` client (2FA + session refresh) for asset enumeration
-- [ ] Implement asset pagination (200 items) with resumable downloads + Live Photo components
-- [ ] Store `icloud_asset_id`, checksums, and `last_modified` to guarantee idempotent upserts
-- [ ] Queue backfill workers with throttling (max 5 req/s) and exponential backoff on 421 errors
-- [ ] Schedule 6-hour delta sync via Celery beat, including delete/tombstone propagation
-- [ ] Implement auth failure alerts and user-facing reconnect flow
-- [ ] Provide guided manual export fallback (macOS Shortcut + uploader) merging into same pipeline
+- [ ] Wire Celery Beat to enqueue `sync_google_photos` nightly (or more frequently) per connected account so new media land in the ingest queue without manual action
+- [ ] Persist Google media IDs + album references so timeline/day-summary queries can deep-link to original Google Photos items when the user opens details
 
 **Image Processing Pipeline**
 - [ ] Create `process_item` Celery task:
@@ -1229,7 +1215,7 @@ User question: {query}"""
     );
   };
   ```
-- [ ] Add day detail view with photo grid
+- [ ] Add a day-details panel that combines the selected day's timeline events, thumbnails, embedded videos, and Gemini-generated text summaries (include links back to Google Photos originals when available)
 - [ ] Implement infinite scroll for timeline
 
 **Dashboard**
@@ -1595,6 +1581,7 @@ User question: {query}"""
 - **Phase 2:** Advanced graph analytics, face clustering, richer retrieval evaluation tooling
 - **Phase 3:** Mobile apps, desktop capture agent, automated story generation
 - **Phase 4:** Sharing/collaboration features, developer API, enterprise deployment options
+- **Phase 5:** Integration with Google Cloud—centralized billing, IAM, managed HA services, regional compliance, etc. Gradually shift pieces: Cloud Run for containers, Cloud SQL + Memorystore, Cloud Storage, Identity Platform, Vertex AI, etc.
 
 ---
 

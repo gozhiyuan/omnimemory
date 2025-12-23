@@ -1,0 +1,5 @@
+{
+  "name": "Lifelog AI",
+  "description": "A personal memory assistant web app to connect data sources, upload files, and chat about your memories.",
+  "requestFramePermissions": []
+}

@@ -3,6 +3,7 @@
 from fastapi import APIRouter
 
 from ..celery_app import ping
+from ..db.session import database_healthcheck
 
 
 router = APIRouter()
@@ -25,3 +26,14 @@ def celery_health() -> dict[str, str]:
     except Exception:  # pragma: no cover - failure path
         return {"status": "unavailable"}
     return {"status": response}
+
+
+@router.get("/db", summary="Database health check")
+async def db_health() -> dict[str, str]:
+    """Verify the API can reach the database."""
+
+    try:
+        healthy = await database_healthcheck()
+    except Exception:  # pragma: no cover - unexpected connectivity failure
+        return {"status": "unavailable"}
+    return {"status": "ok" if healthy else "unavailable"}

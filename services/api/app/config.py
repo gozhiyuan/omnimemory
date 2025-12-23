@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     # Storage + data services
     redis_url: str = Field(..., description="Redis connection URL")
     qdrant_url: AnyUrl = Field(..., description="Qdrant HTTP endpoint")
+    qdrant_collection: str = "lifelog-items"
+    embedding_dimension: int = Field(default=1536, ge=1, description="Embedding vector size")
     postgres_host: str = "localhost"
     postgres_port: int = 5432
     postgres_db: str = "lifelog"

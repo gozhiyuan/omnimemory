@@ -18,6 +18,7 @@ dist/
 .DS_Store
 .vscode/
 *.swp
+node_modules/
 
 # uv / pip caches
 .uv/
@@ -28,4 +29,3 @@ orchestration/prometheus-data/
 orchestration/grafana-data/
 qdrant_data/
 pg_data/
-

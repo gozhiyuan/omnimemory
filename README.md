@@ -1,11 +1,11 @@
 ## OmniMemory / Lifelog MVP
 
-This repository houses the Lifelog AI MVP: a FastAPI + Celery backend, Qdrant for vector search, Supabase for auth/storage, and a Next.js frontend.
+This repository houses the Lifelog AI MVP: a FastAPI + Celery backend, Qdrant for vector search, Supabase for auth/storage, and a React + Vite frontend that exposes the Dashboard, Timeline, Chat, and Ingest tabs.
 
 ### Project Structure (current focus)
 
 - `services/api/` – FastAPI service (draft skeleton) + Celery tasks.
-- `apps/web/` – Next.js App Router client (to be implemented).
+- `apps/web/` – React 19 + Vite SPA client (current MVP UI).
 - `orchestration/` – Docker Compose stack (Postgres, Redis, Qdrant, Prometheus, Grafana, Flower).
 - `lifelog-mvp-prd.md` – Product requirements.
 - `lifelog-mvp-dev-plan.md` – Development roadmap.
@@ -16,7 +16,6 @@ This repository houses the Lifelog AI MVP: a FastAPI + Celery backend, Qdrant fo
 - Python 3.11+
   - [uv](https://github.com/astral-sh/uv) for dependency management (`pip install uv` or via homebrew: `brew install uv`).
 - Node.js 20+
-  - [pnpm](https://pnpm.io/installation).
 - Optional: `just` or `make` (Makefile provided).
 
 ### Local Environment Setup
@@ -33,18 +32,25 @@ This repository houses the Lifelog AI MVP: a FastAPI + Celery backend, Qdrant fo
    - Flower: `http://localhost:5555`
    - Prometheus: `http://localhost:9090`
    - Grafana: `http://localhost:3001`
-3. Install API dependencies:
+3. Install API dependencies and run migrations:
    ```bash
    cd services/api
    uv sync
-   uv run uvicorn app.main:app --reload
+   uv run python -m app.db.migrator
+   uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
    ```
-4. (Frontend) Once ready:
+   In another terminal, start the Celery worker (and optionally beat) so uploads and sync jobs process:
+   ```bash
+   uv run celery -A app.celery_app.celery_app worker --loglevel=info
+   # uv run celery -A app.celery_app.celery_app beat --loglevel=info
+   ```
+4. (Frontend) Once the API + Celery worker are running:
    ```bash
    cd apps/web
-   pnpm install
-   pnpm dev
+   npm install
+   npm run dev
    ```
+   Ensure `.env.local` contains `VITE_API_URL=http://localhost:8000` and your `GEMINI_API_KEY`. The UI runs on `http://localhost:5173` by default.
 
 ### Docker Compose Notes
 
@@ -54,4 +60,4 @@ This repository houses the Lifelog AI MVP: a FastAPI + Celery backend, Qdrant fo
 
 ### Next Steps
 
-Follow `lifelog-mvp-dev-plan.md` for implementation milestones: wire the API to Supabase/Postgres, flesh out processing pipelines, then connect the Next.js app.
+Follow `lifelog-mvp-dev-plan.md` for implementation milestones: wire the API to Supabase/Postgres, flesh out processing pipelines, then integrate the React + Vite web app.

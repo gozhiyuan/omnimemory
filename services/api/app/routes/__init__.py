@@ -2,14 +2,16 @@
 
 from fastapi import APIRouter
 
-from . import health, search, storage, upload
+from . import dashboard, health, search, storage, timeline, upload
 
 
 def get_api_router() -> APIRouter:
     router = APIRouter()
     router.include_router(health.router, prefix="/health", tags=["health"])
+    router.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"])
     router.include_router(search.router, prefix="/search", tags=["search"])
     router.include_router(storage.router, prefix="/storage", tags=["storage"])
+    router.include_router(timeline.router, prefix="/timeline", tags=["timeline"])
     router.include_router(upload.router, prefix="/upload", tags=["upload"])
     return router
 

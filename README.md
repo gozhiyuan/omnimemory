@@ -1,11 +1,11 @@
 ## OmniMemory / Lifelog MVP
 
-This repository houses the Lifelog AI MVP: a FastAPI + Celery backend, Qdrant for vector search, Supabase for auth/storage, and a React + Vite frontend that exposes the Dashboard, Timeline, Chat, and Ingest tabs.
+This repository houses the Lifelog AI MVP: a FastAPI + Celery backend (Postgres, Redis, Qdrant), optional Supabase storage for uploads, and a React + Vite frontend with Dashboard, Timeline, Chat, and Ingest views.
 
 ### Project Structure (current focus)
 
-- `services/api/` – FastAPI service (draft skeleton) + Celery tasks.
-- `apps/web/` – React 19 + Vite SPA client (current MVP UI).
+- `services/api/` – FastAPI service + Celery processing pipeline (upload/ingest, timeline, dashboard, search, seed script).
+- `apps/web/` – React 19 + Vite SPA (manual upload, timeline, dashboard; chat UI uses mock memory context).
 - `orchestration/` – Docker Compose stack (Postgres, Redis, Qdrant, Prometheus, Grafana, Flower).
 - `lifelog-mvp-prd.md` – Product requirements.
 - `lifelog-mvp-dev-plan.md` – Development roadmap.
@@ -20,7 +20,9 @@ This repository houses the Lifelog AI MVP: a FastAPI + Celery backend, Qdrant fo
 
 ### Local Environment Setup
 
-1. Copy `.env.dev.example` → `.env.dev` at the repo root and adjust values (Supabase keys optional initially). The API reads this root file automatically; no need to duplicate per service.
+1. Copy `.env.dev.example` → `.env.dev` at the repo root and adjust values. The API reads this root file automatically; no need to duplicate per service.
+   - If you want uploads to work from the web UI or seed script, set `STORAGE_PROVIDER=supabase` and provide `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`.
+   - If the frontend cannot reach the API due to CORS, add `CORS_ALLOW_ORIGINS=http://localhost:5173` (comma-separated for multiple origins).
 2. Start supporting services:
    ```bash
    make dev-up
@@ -52,12 +54,21 @@ This repository houses the Lifelog AI MVP: a FastAPI + Celery backend, Qdrant fo
    ```
    Ensure `.env.local` contains `VITE_API_URL=http://localhost:8000` and your `GEMINI_API_KEY`. The UI runs on `http://localhost:5173` by default.
 
+5. (Optional) Exercise the ingest pipeline end-to-end with a local file:
+   ```bash
+   cd services/api
+   uv run python scripts/seed_ingest_flow.py ./fixtures/sample.jpg \
+     --api-url http://localhost:8000 \
+     --postgres-dsn postgresql://lifelog:lifelog@localhost:5432/lifelog
+   ```
+   Use `--direct-upload` if you want the script to upload directly to Supabase without presigned URLs.
+
 ### Docker Compose Notes
 
 - `orchestration/docker-compose.dev.yml` is source of truth for local infra; `make dev-up` uses it.
-- API/worker/beat services are scaffolded in code but not yet wired into Compose; add them once the FastAPI service is containerised.
+- API/worker/beat services run locally for now and are not wired into Compose.
 - Prometheus scrape config lives in `orchestration/prometheus.yml` (uncomment API job when `/metrics` is active in Docker).
 
 ### Next Steps
 
-Follow `lifelog-mvp-dev-plan.md` for implementation milestones: wire the API to Supabase/Postgres, flesh out processing pipelines, then integrate the React + Vite web app.
+Follow `lifelog-mvp-dev-plan.md` for implementation milestones: connect OAuth data sources, add the backend chat endpoint, and continue hardening the processing pipeline and UI.

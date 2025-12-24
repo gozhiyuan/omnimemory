@@ -3,7 +3,7 @@
 from functools import lru_cache
 from typing import Literal, Optional
 
-from pydantic import AnyUrl, Field, model_validator
+from pydantic import AnyUrl, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     bucket_thumbnails: str = "thumbnails"
 
     presigned_url_ttl_seconds: int = 15 * 60
+    cors_allow_origins: list[str] = Field(
+        default_factory=lambda: ["http://localhost:3000", "http://127.0.0.1:3000"]
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -61,6 +64,20 @@ class Settings(BaseSettings):
             if values.get(key) == "":
                 values[key] = None
         return values
+
+    @field_validator("bucket_originals", "bucket_previews", "bucket_thumbnails", mode="before")
+    @classmethod
+    def _trim_bucket_names(cls, value: str) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @field_validator("cors_allow_origins", mode="before")
+    @classmethod
+    def _split_origins(cls, value):
+        if isinstance(value, str):
+            return [origin.strip() for origin in value.split(",") if origin.strip()]
+        return value
 
 
 @lru_cache(maxsize=1)

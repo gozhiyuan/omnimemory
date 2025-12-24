@@ -1,7 +1,8 @@
-import React from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts';
-import { MOCK_STATS, ACTIVITY_DATA, MOCK_MEMORIES } from '../constants';
 import { HardDrive, Image as ImageIcon, Link as LinkIcon, Activity, Calendar } from 'lucide-react';
+import { apiGet } from '../services/api';
+import { DashboardRecentItem, DashboardStatsResponse } from '../types';
 
 const StatCard = ({ title, value, icon, subtext }: { title: string, value: string | number, icon: React.ReactNode, subtext?: string }) => (
   <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100 flex items-start space-x-4 hover:shadow-md transition-shadow">
@@ -16,25 +17,89 @@ const StatCard = ({ title, value, icon, subtext }: { title: string, value: strin
   </div>
 );
 
-const RecentActivityItem: React.FC<{ memory: typeof MOCK_MEMORIES[0] }> = ({ memory }) => (
+const formatDate = (value?: string) => {
+  if (!value) return 'Unknown date';
+  return new Date(value).toLocaleDateString();
+};
+
+const buildLabel = (item: DashboardRecentItem) =>
+  item.caption || item.original_filename || `${item.item_type} upload`;
+
+const RecentActivityItem: React.FC<{ item: DashboardRecentItem }> = ({ item }) => (
   <div className="flex items-center space-x-4 p-3 hover:bg-slate-50 rounded-lg transition-colors cursor-pointer group">
-    <img src={memory.src} alt={memory.caption} className="w-12 h-12 rounded-lg object-cover shadow-sm group-hover:scale-105 transition-transform" />
+    {item.download_url ? (
+      <img
+        src={item.download_url}
+        alt={buildLabel(item)}
+        className="w-12 h-12 rounded-lg object-cover shadow-sm group-hover:scale-105 transition-transform"
+      />
+    ) : (
+      <div className="w-12 h-12 rounded-lg bg-slate-100 flex items-center justify-center text-slate-400">
+        <ImageIcon className="w-5 h-5" />
+      </div>
+    )}
     <div className="flex-1 min-w-0">
-      <p className="text-sm font-medium text-slate-900 truncate">{memory.caption}</p>
+      <p className="text-sm font-medium text-slate-900 truncate">{buildLabel(item)}</p>
       <div className="flex items-center text-xs text-slate-500 mt-0.5">
         <Calendar className="w-3 h-3 mr-1" />
-        <span>{new Date(memory.date).toLocaleDateString()}</span>
-        <span className="mx-1">•</span>
-        <span>{memory.location}</span>
+        <span>{formatDate(item.captured_at)}</span>
       </div>
     </div>
-    <div className="text-xs font-medium text-green-600 bg-green-50 px-2 py-1 rounded-full">
-      Processed
+    <div
+      className={`text-xs font-medium px-2 py-1 rounded-full ${
+        item.processed ? 'text-green-600 bg-green-50' : 'text-slate-600 bg-slate-100'
+      }`}
+    >
+      {item.processed ? 'Processed' : 'Processing'}
     </div>
   </div>
 );
 
 export const Dashboard: React.FC = () => {
+  const [stats, setStats] = useState<DashboardStatsResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    const load = async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const data = await apiGet<DashboardStatsResponse>('/dashboard/stats');
+        if (mounted) {
+          setStats(data);
+        }
+      } catch (err) {
+        if (mounted) {
+          setError(err instanceof Error ? err.message : 'Failed to load dashboard.');
+        }
+      } finally {
+        if (mounted) {
+          setLoading(false);
+        }
+      }
+    };
+    load();
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  const storageUsedGB = useMemo(() => {
+    if (!stats?.storage_used_bytes) return 0;
+    return stats.storage_used_bytes / (1024 * 1024 * 1024);
+  }, [stats?.storage_used_bytes]);
+
+  const activityData = useMemo(
+    () =>
+      (stats?.activity || []).map(point => ({
+        name: new Date(point.date).toLocaleDateString(undefined, { weekday: 'short' }),
+        count: point.count,
+      })),
+    [stats?.activity]
+  );
+
   return (
     <div className="p-8 space-y-8 animate-fade-in">
       <div>
@@ -42,31 +107,37 @@ export const Dashboard: React.FC = () => {
         <p className="text-slate-500 mt-1">Overview of your digital life log.</p>
       </div>
 
+      {error && (
+        <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg">
+          {error}
+        </div>
+      )}
+
       {/* Stats Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         <StatCard 
           title="Total Memories" 
-          value={MOCK_STATS.totalMemories.toLocaleString()} 
+          value={stats ? stats.total_items.toLocaleString() : '—'}
           icon={<ImageIcon size={24} />} 
-          subtext="+12 this week"
+          subtext={stats ? `${stats.processed_items} processed` : undefined}
         />
         <StatCard 
           title="Storage Used" 
-          value={`${MOCK_STATS.storageUsedGB} GB`} 
+          value={stats ? `${storageUsedGB.toFixed(2)} GB` : '—'} 
           icon={<HardDrive size={24} />} 
-          subtext="15% of 25GB quota"
+          subtext={stats ? `${stats.failed_items} failed items` : undefined}
         />
         <StatCard 
           title="Weekly Uploads" 
-          value={MOCK_STATS.thisWeekUploads} 
+          value={stats ? stats.uploads_last_7_days : '—'} 
           icon={<Activity size={24} />} 
-          subtext="Top 10% activity"
+          subtext="Last 7 days"
         />
         <StatCard 
           title="Connected Sources" 
-          value={MOCK_STATS.connectedSources} 
+          value={stats ? stats.active_connections : '—'} 
           icon={<LinkIcon size={24} />} 
-          subtext="Google Photos, Apple iCloud"
+          subtext="Active connections"
         />
       </div>
 
@@ -77,12 +148,11 @@ export const Dashboard: React.FC = () => {
             <h2 className="text-lg font-semibold text-slate-900">Ingestion Activity</h2>
             <select className="text-sm border-slate-200 rounded-md text-slate-500 focus:ring-primary-500">
               <option>Last 7 Days</option>
-              <option>Last 30 Days</option>
             </select>
           </div>
           <div className="h-64">
             <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={ACTIVITY_DATA}>
+              <BarChart data={activityData}>
                 <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
                 <XAxis 
                   dataKey="name" 
@@ -110,9 +180,15 @@ export const Dashboard: React.FC = () => {
         <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100">
           <h2 className="text-lg font-semibold text-slate-900 mb-4">Recent Memories</h2>
           <div className="space-y-2">
-            {MOCK_MEMORIES.slice(0, 5).map(memory => (
-              <RecentActivityItem key={memory.id} memory={memory} />
-            ))}
+            {stats?.recent_items?.length ? (
+              stats.recent_items.map(item => (
+                <RecentActivityItem key={item.id} item={item} />
+              ))
+            ) : (
+              <div className="text-sm text-slate-500 py-4 text-center">
+                {loading ? 'Loading recent memories…' : 'No recent memories yet.'}
+              </div>
+            )}
           </div>
           <button className="w-full mt-4 py-2 text-sm text-primary-600 font-medium hover:bg-primary-50 rounded-lg transition-colors">
             View All Memories

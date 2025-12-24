@@ -1,11 +1,22 @@
 import React, { useState } from 'react';
 import { UploadCloud, CheckCircle2, FileImage, X, AlertCircle } from 'lucide-react';
+import { apiPost } from '../services/api';
+import { IngestResponse, UploadUrlResponse } from '../types';
 
 export const UploadManager: React.FC = () => {
   const [dragActive, setDragActive] = useState(false);
   const [files, setFiles] = useState<File[]>([]);
   const [uploading, setUploading] = useState(false);
   const [success, setSuccess] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [uploadedCount, setUploadedCount] = useState(0);
+
+  const inferItemType = (file: File) => {
+    if (file.type.startsWith('image/')) return 'photo';
+    if (file.type.startsWith('video/')) return 'video';
+    if (file.type.startsWith('audio/')) return 'audio';
+    return 'document';
+  };
 
   const handleDrag = (e: React.DragEvent) => {
     e.preventDefault();
@@ -37,21 +48,71 @@ export const UploadManager: React.FC = () => {
     const newFiles = Array.from(fileList);
     setFiles(prev => [...prev, ...newFiles]);
     setSuccess(false);
+    setError(null);
+    setUploadedCount(0);
   };
 
   const removeFile = (index: number) => {
     setFiles(prev => prev.filter((_, i) => i !== index));
+    setSuccess(false);
   };
 
-  const handleUpload = () => {
+  const clearFiles = () => {
+    setFiles([]);
+    setSuccess(false);
+    setError(null);
+    setUploadedCount(0);
+  };
+
+  const handleUpload = async () => {
     if (files.length === 0) return;
     setUploading(true);
-    // Simulate API upload
-    setTimeout(() => {
-      setUploading(false);
+    setError(null);
+    setSuccess(false);
+    setUploadedCount(0);
+
+    try {
+      for (const file of files) {
+        const contentType = file.type || 'application/octet-stream';
+        const uploadMeta = await apiPost<UploadUrlResponse>('/storage/upload-url', {
+          filename: file.name,
+          content_type: contentType,
+          prefix: 'uploads/ui',
+        });
+        if (!uploadMeta.url) {
+          throw new Error(`Upload URL missing for ${file.name}`);
+        }
+
+        const headers = { ...(uploadMeta.headers || {}), 'Content-Type': contentType };
+        const uploadResponse = await fetch(uploadMeta.url, {
+          method: 'PUT',
+          headers,
+          body: file,
+        });
+        if (!uploadResponse.ok) {
+          const responseText = await uploadResponse.text();
+          throw new Error(
+            `Upload failed for ${file.name}: ${uploadResponse.status} ${responseText || ''}`.trim()
+          );
+        }
+
+        await apiPost<IngestResponse>('/upload/ingest', {
+          storage_key: uploadMeta.key,
+          item_type: inferItemType(file),
+          content_type: contentType,
+          original_filename: file.name,
+        });
+
+        setUploadedCount((count) => count + 1);
+      }
+
       setSuccess(true);
       setFiles([]);
-    }, 2000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Upload failed.');
+    } finally {
+      setUploading(false);
+    }
   };
 
   return (
@@ -97,7 +158,7 @@ export const UploadManager: React.FC = () => {
               <div className="flex justify-between items-center mb-3">
                 <span className="text-sm font-medium text-slate-700">{files.length} files selected</span>
                 <button 
-                  onClick={() => setFiles([])}
+                  onClick={clearFiles}
                   className="text-xs text-red-500 hover:text-red-600"
                 >
                   Clear all
@@ -127,10 +188,17 @@ export const UploadManager: React.FC = () => {
                       <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
                       <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                     </svg>
-                    Processing...
+                    Uploading {uploadedCount}/{files.length}
                   </>
                 ) : 'Start Processing'}
               </button>
+            </div>
+          )}
+
+          {error && (
+            <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg flex items-center">
+              <AlertCircle className="w-5 h-5 mr-2" />
+              <span className="text-sm">{error}</span>
             </div>
           )}
 

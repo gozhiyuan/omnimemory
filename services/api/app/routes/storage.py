@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Optional
+import re
 
 import uuid
 
@@ -14,6 +15,13 @@ from ..storage import get_storage_provider
 
 
 router = APIRouter()
+
+
+def sanitize_filename(filename: str) -> str:
+    name = filename.strip().split("/")[-1]
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    safe = safe.strip("._-")
+    return safe or "upload"
 
 
 class UploadUrlRequest(BaseModel):
@@ -42,8 +50,9 @@ def create_upload_url(request: UploadUrlRequest) -> UploadUrlResponse:
     settings = get_settings()
     storage = get_storage_provider()
 
-    prefix = request.prefix or "uploads"
-    key = f"{prefix}/{uuid.uuid4()}-{request.filename}"
+    prefix = (request.prefix or "uploads").strip("/")
+    safe_name = sanitize_filename(request.filename)
+    key = f"{prefix}/{uuid.uuid4()}-{safe_name}"
     signed = storage.get_presigned_upload(key, request.content_type, settings.presigned_url_ttl_seconds)
     if not signed.get("url"):
         raise HTTPException(status_code=501, detail="Presigned upload URL not implemented for current provider")

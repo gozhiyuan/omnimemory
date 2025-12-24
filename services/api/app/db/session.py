@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import AsyncIterator
 
@@ -32,7 +31,6 @@ def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(engine, expire_on_commit=False)
 
 
-@asynccontextmanager
 async def get_session() -> AsyncIterator[AsyncSession]:
     """Provide an async session for FastAPI dependencies."""
 

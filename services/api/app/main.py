@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fastapi import FastAPI, Response
+from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 
@@ -12,6 +13,13 @@ from .routes import get_api_router
 
 settings = get_settings()
 app = FastAPI(title=settings.api_title, version=settings.api_version)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_allow_origins or ["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 REQUEST_COUNT = Counter(

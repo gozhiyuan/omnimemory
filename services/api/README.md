@@ -1,6 +1,6 @@
 # Backend API (FastAPI)
 
-This service handles all synchronous requests, including uploads, authentication, and queries.
+This service handles synchronous requests (uploads, storage signing, timeline/dashboard summaries, search) and enqueues Celery tasks to process items. Authentication is not wired yet; endpoints default to the test user ID unless you provide one explicitly.
 
 ## Prerequisites
 
@@ -33,6 +33,10 @@ This service handles all synchronous requests, including uploads, authentication
 
    The runner records applied versions in `schema_migrations`, so re-running it after future SQL
    changes is safe. Verify the tables via `\dt` inside the Postgres container if needed.
+
+4. Configure storage for uploads:
+   - `STORAGE_PROVIDER=supabase` plus `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are required for `/storage/upload-url` and the web upload flow.
+   - If you do not set these, you can still call `/upload/ingest` directly (no presigned uploads), but the UI upload flow will fail with a 501.
 
 Subsequent commands can be executed through `uv run <command>` which automatically reuses the virtual
 environment.
@@ -85,19 +89,41 @@ uv run python -c "from app.vectorstore import ensure_collection; ensure_collecti
 
 ### Storage abstraction (`app/storage.py`)
 
-The `get_storage_client()` factory will return the Supabase storage implementation when
-`SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` are configured. For local development without Supabase,
-set `STORAGE_PROVIDER=local` to use the filesystem-backed stub.
+The `get_storage_provider()` factory returns the Supabase storage implementation when
+`STORAGE_PROVIDER=supabase` and `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` are configured. The
+default in-memory provider does not issue presigned URLs, so `/storage/upload-url` will respond
+with 501 unless Supabase is enabled.
 
 ### Processing pipeline (`app/tasks/process_item.py`)
 
-`process_item` downloads an uploaded asset, extracts metadata, stores the derived record in
-Postgres, and seeds Qdrant. Enqueue a processing job by calling the `/ingest` endpoint or directly
-queuing the Celery task:
+`process_item` downloads an uploaded asset, extracts placeholder metadata/caption/ocr/transcription,
+stores derived records in Postgres, and seeds Qdrant. Enqueue a processing job by calling the
+`/upload/ingest` endpoint or directly queuing the Celery task:
 
 ```bash
 uv run python -c "from app.tasks.process_item import process_item; process_item.delay({'item_id': '...', 'storage_key': '...'})"
 ```
+
+### Seed ingest flow (`scripts/seed_ingest_flow.py`)
+
+This script exercises presigned uploads + ingest + processing and then verifies counts in Postgres:
+
+```bash
+uv run python scripts/seed_ingest_flow.py ./fixtures/sample.jpg \
+  --api-url http://localhost:8000 \
+  --postgres-dsn postgresql://lifelog:lifelog@localhost:5432/lifelog
+```
+
+Use `--direct-upload` to upload directly to Supabase without relying on `/storage/upload-url`.
+
+## HTTP endpoints (current)
+
+- `GET /health`, `GET /health/db`, `GET /health/celery`
+- `POST /storage/upload-url`, `POST /storage/download-url`
+- `POST /upload/ingest`
+- `GET /timeline`
+- `GET /dashboard/stats`
+- `GET /search?q=...`
 
 ## Tests
 

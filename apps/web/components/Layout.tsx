@@ -9,10 +9,10 @@ interface LayoutProps {
 }
 
 const NAV_ITEMS: NavItem[] = [
-  { id: 'dashboard', label: 'Dashboard', icon: <LayoutDashboard size={20} /> },
   { id: 'timeline', label: 'Timeline', icon: <Image size={20} /> },
   { id: 'chat', label: 'Assistant', icon: <MessageSquare size={20} /> },
   { id: 'upload', label: 'Ingest', icon: <Upload size={20} /> },
+  { id: 'dashboard', label: 'Dashboard', icon: <LayoutDashboard size={20} /> },
   { id: 'settings', label: 'Settings', icon: <Settings size={20} /> },
 ];
 

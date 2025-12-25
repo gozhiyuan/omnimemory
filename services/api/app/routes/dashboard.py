@@ -59,9 +59,15 @@ async def get_dashboard_stats(
     """Return aggregate counts used by the dashboard cards."""
 
     since = datetime.utcnow() - timedelta(days=7)
-    total_items_stmt = select(func.count(SourceItem.id)).where(SourceItem.user_id == user_id)
-    processed_items_stmt = total_items_stmt.where(SourceItem.processing_status == "completed")
-    failed_items_stmt = total_items_stmt.where(SourceItem.processing_status == "failed")
+    total_items_stmt = select(func.count(SourceItem.id)).where(
+        SourceItem.user_id == user_id,
+        SourceItem.processing_status == "completed",
+    )
+    processed_items_stmt = total_items_stmt
+    failed_items_stmt = select(func.count(SourceItem.id)).where(
+        SourceItem.user_id == user_id,
+        SourceItem.processing_status == "failed",
+    )
     connections_stmt = select(func.count(DataConnection.id)).where(
         DataConnection.user_id == user_id, DataConnection.status == "active"
     )
@@ -82,14 +88,21 @@ async def get_dashboard_stats(
 
     recent_items_stmt = (
         select(SourceItem)
-        .where(SourceItem.user_id == user_id)
+        .where(
+            SourceItem.user_id == user_id,
+            SourceItem.processing_status == "completed",
+        )
         .order_by(SourceItem.created_at.desc())
         .limit(5)
     )
 
     activity_stmt = (
         select(func.date(SourceItem.created_at).label("day"), func.count(SourceItem.id))
-        .where(SourceItem.user_id == user_id, SourceItem.created_at >= since)
+        .where(
+            SourceItem.user_id == user_id,
+            SourceItem.processing_status == "completed",
+            SourceItem.created_at >= since,
+        )
         .group_by("day")
         .order_by("day")
     )

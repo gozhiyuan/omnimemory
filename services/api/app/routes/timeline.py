@@ -56,7 +56,10 @@ async def get_timeline(
 
     stmt = (
         select(SourceItem)
-        .where(SourceItem.user_id == user_id)
+        .where(
+            SourceItem.user_id == user_id,
+            SourceItem.processing_status == "completed",
+        )
         .order_by(SourceItem.captured_at.desc().nulls_last(), SourceItem.created_at.desc())
         .limit(limit)
     )

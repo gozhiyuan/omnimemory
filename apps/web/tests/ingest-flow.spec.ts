@@ -5,6 +5,8 @@ const imageBuffer = Buffer.from(
   'base64'
 );
 
+const apiBaseUrl = process.env.VITE_API_URL || 'http://127.0.0.1:8000';
+
 test('upload appears in timeline and dashboard responses', async ({ page }) => {
   await page.goto('/');
 
@@ -35,23 +37,29 @@ test('upload appears in timeline and dashboard responses', async ({ page }) => {
   const uploadMeta = await uploadUrlResponse.json();
   const storageKey = uploadMeta.key;
 
-  await page.getByRole('button', { name: 'Timeline' }).click();
-  const timelineResponse = await page.waitForResponse((response) =>
-    response.url().includes('/timeline') && response.request().method() === 'GET'
-  );
-  const timelinePayload = await timelineResponse.json();
-  const timelineHasItem = timelinePayload.some((day: any) =>
-    day.items.some((item: any) => item.storage_key === storageKey)
-  );
-  expect(timelineHasItem).toBeTruthy();
+  await expect
+    .poll(
+      async () => {
+        const response = await page.request.get(`${apiBaseUrl}/timeline`);
+        const timelinePayload = await response.json();
+        return timelinePayload.some((day: any) =>
+          day.items.some((item: any) => item.storage_key === storageKey)
+        );
+      },
+      { timeout: 120_000 }
+    )
+    .toBeTruthy();
 
-  await page.getByRole('button', { name: 'Dashboard' }).click();
-  const dashboardResponse = await page.waitForResponse((response) =>
-    response.url().includes('/dashboard/stats') && response.request().method() === 'GET'
-  );
-  const dashboardPayload = await dashboardResponse.json();
-  const dashboardHasItem = dashboardPayload.recent_items.some(
-    (item: any) => item.storage_key === storageKey
-  );
-  expect(dashboardHasItem).toBeTruthy();
+  await expect
+    .poll(
+      async () => {
+        const response = await page.request.get(`${apiBaseUrl}/dashboard/stats`);
+        const dashboardPayload = await response.json();
+        return dashboardPayload.recent_items.some(
+          (item: any) => item.storage_key === storageKey
+        );
+      },
+      { timeout: 120_000 }
+    )
+    .toBeTruthy();
 });

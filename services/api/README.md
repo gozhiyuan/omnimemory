@@ -34,6 +34,33 @@ This service handles synchronous requests (uploads, storage signing, timeline/da
    The runner records applied versions in `schema_migrations`, so re-running it after future SQL
    changes is safe. Verify the tables via `\dt` inside the Postgres container if needed.
 
+   To apply the same schema to Supabase, point the migrator at the Supabase Postgres host
+   using environment variables and run the same command. You do not need to create tables
+   manually; the migrations create them.
+
+   ```bash
+   POSTGRES_HOST=db.<project-ref>.supabase.co \
+   POSTGRES_PORT=5432 \
+   POSTGRES_DB=postgres \
+   POSTGRES_USER=postgres \
+   POSTGRES_PASSWORD=<db-password> \
+   uv run python -m app.db.migrator
+   ```
+
+   Environment variables set in your shell override values from `.env.dev`/`.env`. The Supabase
+   database password is available in the Supabase dashboard under Project Settings → Database.
+   If your network only resolves the pooler hostname (common on some IPv4-only Wi‑Fi/DNS setups),
+   use the connection pooling host/port and the pooler username from Supabase:
+
+   ```bash
+   POSTGRES_HOST=aws-0-<region>.pooler.supabase.com \
+   POSTGRES_PORT=6543 \
+   POSTGRES_DB=postgres \
+   POSTGRES_USER=postgres.<project-ref> \
+   POSTGRES_PASSWORD=<db-password> \
+   uv run python -m app.db.migrator
+   ```
+
 4. Configure storage for uploads:
    - `STORAGE_PROVIDER=supabase` plus `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are required for `/storage/upload-url` and the web upload flow.
    - If you do not set these, you can still call `/upload/ingest` directly (no presigned uploads), but the UI upload flow will fail with a 501.
@@ -124,6 +151,28 @@ Use `--direct-upload` to upload directly to Supabase without relying on `/storag
 - `GET /timeline`
 - `GET /dashboard/stats`
 - `GET /search?q=...`
+
+## Data flow (upload → processing → search)
+
+```text
+Client
+  │
+  ├─ POST /storage/upload-url  ───────────────▶ API (presigned URL)
+  │
+  ├─ PUT <signed URL> ───────────────────────▶ Supabase Storage (object upload)
+  │
+  └─ POST /upload/ingest (storage_key) ──────▶ API
+                               │
+                               ├─ writes users/source_items in Postgres
+                               └─ enqueues Celery task (Redis broker)
+                                          │
+                                          ▼
+                               Celery worker (process_item)
+                               │
+                               ├─ fetch object from storage
+                               ├─ write processed_content + update source_items
+                               └─ upsert embedding to Qdrant
+```
 
 ## Tests
 

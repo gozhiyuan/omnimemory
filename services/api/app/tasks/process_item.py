@@ -13,7 +13,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from ..celery_app import celery_app
 from ..db.models import ProcessedContent, SourceItem
-from ..db.session import get_sessionmaker
+from ..db.session import isolated_session
 from ..storage import get_storage_provider
 from ..vectorstore import upsert_random_embedding
 
@@ -54,7 +54,6 @@ def _generate_ocr(item: SourceItem) -> Dict[str, Any]:
 
 
 async def _process_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    sessionmaker = get_sessionmaker()
     storage = get_storage_provider()
 
     try:
@@ -67,7 +66,8 @@ async def _process_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     metadata: Dict[str, Any] = {}
     caption: Dict[str, Any] = {}
 
-    async with sessionmaker() as session:
+    # Use an isolated engine per task to avoid asyncpg cross-loop/concurrency issues.
+    async with isolated_session() as session:
         item = await session.get(SourceItem, item_id)
         if item is None:
             raise ValueError(f"source item {item_id} not found")
@@ -137,4 +137,3 @@ def process_item(self, payload: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as exc:  # pragma: no cover - propagate to retry logic
         logger.exception("Unhandled exception in process_item: {}", exc)
         raise
-

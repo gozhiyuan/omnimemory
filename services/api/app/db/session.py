@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import AsyncIterator
 
@@ -11,9 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from ..config import get_settings
 
 
-@lru_cache(maxsize=1)
-def get_engine() -> AsyncEngine:
-    """Return a cached async SQLAlchemy engine."""
+def build_async_engine() -> AsyncEngine:
+    """Create a new async SQLAlchemy engine."""
 
     settings = get_settings()
     url = (
@@ -21,6 +21,13 @@ def get_engine() -> AsyncEngine:
         f"@{settings.postgres_host}:{settings.postgres_port}/{settings.postgres_db}"
     )
     return create_async_engine(url, future=True, echo=False)
+
+
+@lru_cache(maxsize=1)
+def get_engine() -> AsyncEngine:
+    """Return a cached async SQLAlchemy engine."""
+
+    return build_async_engine()
 
 
 @lru_cache(maxsize=1)
@@ -47,3 +54,16 @@ async def database_healthcheck() -> bool:
         result = await session.execute(text("SELECT 1"))
         value = result.scalar()
         return bool(value == 1)
+
+
+@asynccontextmanager
+async def isolated_session() -> AsyncIterator[AsyncSession]:
+    """Yield a session backed by a one-off engine for background tasks."""
+
+    engine = build_async_engine()
+    sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with sessionmaker() as session:
+            yield session
+    finally:
+        await engine.dispose()

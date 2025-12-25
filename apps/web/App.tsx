@@ -7,7 +7,7 @@ import { UploadManager } from './components/UploadManager';
 import { View } from './types';
 
 const App: React.FC = () => {
-  const [currentView, setCurrentView] = useState<View>('dashboard');
+  const [currentView, setCurrentView] = useState<View>('timeline');
 
   const renderContent = () => {
     switch (currentView) {

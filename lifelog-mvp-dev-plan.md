@@ -31,18 +31,13 @@
   ├── docker-compose.yml
   └── README.md
   ```
-- [ ] Set up pnpm workspaces or Turborepo
 - [ ] Create `.env.example` files for all services
-- [ ] Initialize Git hooks with Husky (pre-commit linting)
 
 **Cloud Infrastructure**
 - [ ] Create Supabase project:
-  - [ ] Enable Email & Google OAuth providers
-  - [ ] Set up storage buckets: `user-uploads`, `thumbnails`
-  - [ ] Configure CORS for local development
-- [ ] Create Qdrant Cloud instance (1GB cluster for dev)
+  - [ ] Enable Email auth provider (if using Supabase Auth for login)
+  - [ ] Enable Google OAuth provider later with Google Photos integration
 - [ ] Set up GitHub repository and enable GitHub Actions
-- [ ] Provision staging environment (Supabase + Qdrant) with seeded demo data for onboarding tests
 
 **Database Setup**
 - [ ] Create database schema in Supabase:
@@ -57,10 +52,10 @@
   CREATE TABLE memory_nodes (...);
   CREATE TABLE memory_edges (...);
   ```
-- [ ] Enable `pgvector` extension in Supabase
-- [ ] Set up Row-Level Security (RLS) policies for all tables
-- [ ] Create database migration scripts
-- [ ] Store encryption keys in Supabase `vault.secrets` or KMS for OAuth/app-specific tokens
+- [ ] Create database migration scripts and apply them to local Postgres and Supabase (keep schemas in sync)
+- [ ] Skip `pgvector` for now (using Qdrant); enable later only if hybrid Postgres vector search is needed
+- [ ] Defer Row-Level Security (RLS) until the frontend talks directly to Supabase
+- [ ] Defer encryption key storage (`vault.secrets`/KMS) until OAuth or other app-specific tokens are stored
 
 **Backend API (FastAPI)**
 - [ ] Initialize FastAPI project with poetry/pipenv:
@@ -78,67 +73,39 @@
       "qdrant-client"
   ]
   ```
-- [ ] Set up Supabase client with environment variables
-- [ ] Create JWT authentication middleware
-- [ ] Implement health check endpoint (`/health`)
-- [ ] Add CORS middleware for frontend
-- [ ] Set up logging with structlog + OpenTelemetry traces piped to Prometheus/Tempo
-- [ ] Implement token encryption helper (AES-256-GCM with key rotation schedule)
+- [ ] Implement health check endpoint (`/health`) — done
+- [ ] Add CORS middleware for frontend — done
+- [ ] Set up Supabase storage integration with environment variables (for presigned uploads) — done
+- [ ] Defer JWT authentication middleware until auth is wired
+- [ ] Defer structlog + OpenTelemetry tracing until observability setup
+- [ ] Defer token encryption helper (AES-256-GCM with key rotation schedule) until OAuth tokens are stored
+- [ ] Implement core HTTP endpoints — done:
+  - `GET /health`, `GET /health/db`, `GET /health/celery`
+  - `GET /metrics` (Prometheus)
+  - `POST /storage/upload-url`, `POST /storage/download-url` (presigned URLs)
+  - `POST /upload/ingest` (enqueue processing)
+  - `GET /timeline` (timeline feed)
+  - `GET /dashboard/stats` (dashboard aggregates)
+  - `GET /search` (Qdrant-backed search)
 
 **Storage Abstraction & Presigned URLs**
-- [ ] Implement storage provider interface and Supabase adapter
-  ```python
-  from typing import Protocol, Dict, Optional
-
-  class StorageProvider(Protocol):
-      def get_presigned_upload(self, key: str, content_type: str, expires_s: int = 900) -> Dict: ...
-      def get_presigned_download(self, key: str, expires_s: int = 900) -> Dict: ...
-      def delete(self, key: str) -> None: ...
-
-  class SupabaseStorageProvider:
-      def __init__(self, client, bucket: str):
-          self.client = client
-          self.bucket = bucket
-
-      def get_presigned_upload(self, key, content_type, expires_s=900):
-          # Use storage.from(bucket).create_signed_url for PUT or upload via signed POST
-          url = create_signed_put_url(self.client, self.bucket, key, content_type, expires_s)
-          return {"url": url, "headers": {"Content-Type": content_type}}
-
-      def get_presigned_download(self, key, expires_s=900):
-          url = self.client.storage.from_(self.bucket).create_signed_url(key, expires_s)["signedURL"]
-          return {"url": url}
-
-      def delete(self, key):
-          self.client.storage.from_(self.bucket).remove([key])
-  ```
-- [ ] Add API endpoints for presigned flows
-  ```python
-  @app.post("/api/v1/storage/upload-url")
-  async def create_upload_url(req: UploadUrlRequest, user: User = Depends(get_current_user)):
-      key = f"originals/{user.id}/{uuid4()}-{req.filename}"
-      return storage.get_presigned_upload(key, req.content_type)
-
-  @app.get("/api/v1/storage/download-url")
-  async def create_download_url(key: str, user: User = Depends(get_current_user)):
-      assert_user_owns_key(user.id, key)
-      return storage.get_presigned_download(key)
-  ```
+- [ ] Implement storage provider interface (memory + Supabase) — done
+- [ ] Configure Supabase storage env vars for presigned uploads (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `STORAGE_PROVIDER=supabase`) — done
+- [ ] Add API endpoints for presigned flows (`POST /storage/upload-url`, `POST /storage/download-url`) — done
+- [ ] Use presigned URL TTL from config (`presigned_url_ttl_seconds`) — done
+- [ ] Use storage fetch helper in the processing pipeline — done
+- [ ] Defer `thumbnails` bucket setup until thumbnail generation lands
 
 **Task Queue (Celery)**
-- [ ] Set up Redis locally (Docker)
-- [ ] Initialize Celery app with Redis broker
-- [ ] Create basic task for testing:
-  ```python
-  @celery.task
-  def test_task(message: str):
-      print(f"Task executed: {message}")
-      return {"status": "success"}
-  ```
-- [ ] Verify task execution with Flower (Celery monitoring)
-- [ ] Configure Celery beat / Supabase cron for scheduled jobs (daily summaries, delta sync)
+- [ ] Set up Redis locally (Docker) — done
+- [ ] Initialize Celery app with Redis broker + result backend — done
+- [ ] Implement background tasks (`process_item`, `health.ping`) — done
+- [ ] Wire `/upload/ingest` to enqueue processing tasks — done
+- [ ] Add Celery beat schedule skeleton (health + lifecycle cleanup) — done
+- [ ] Defer Flower monitoring until debugging/ops needs it
+- [ ] Defer production queue tuning (retries, rate limits, per-queue routing) until later
 
--**Frontend (React + Vite SPA)**
+**Frontend (React + Vite SPA)**
 - [ ] Maintain the existing `apps/web` stack of React 19 + TypeScript bundled with Vite 6 (`npm create vite@latest lifelog-ai -- --template react-ts` as reference)
 - [ ] Keep Tailwind via CDN config in `index.html` (custom `primary` palette + Inter font) so component classes in `App.tsx`, `Layout.tsx`, etc. render correctly without a Tailwind build step
 - [ ] Install/maintain runtime dependencies already present in `package.json`: `react`, `react-dom`, `lucide-react` for icons, `recharts` for dashboard charts, and `@google/genai` for assistant calls
@@ -231,6 +198,8 @@
 ### Tasks
 
 **Manual Upload (Backend)**
+- [ ] Create Supabase storage bucket `user-uploads`; add `thumbnails` when thumbnail generation lands
+- [ ] Configure Supabase Storage CORS for local development if the browser uses presigned uploads
 - [ ] Create upload endpoint (presigned preferred; keep batch POST for small files):
   ```python
   @app.post("/api/v1/upload/batch")
@@ -1500,6 +1469,12 @@ User question: {query}"""
   ```
 - [ ] Configure environment variables in production
 - [ ] Set up custom domain and SSL
+
+**Staging & Dev Experience (Deferred from Week 1-2)**
+- [ ] Set up pnpm workspaces or Turborepo (only if/when shared JS packages are introduced)
+- [ ] Initialize Git hooks with Husky (pre-commit linting)
+- [ ] Create Qdrant Cloud instance (1GB dev) for shared dev/staging usage if local Qdrant isn't sufficient
+- [ ] Provision staging environment (Supabase + Qdrant) with seeded demo data for onboarding tests
 
 **Monitoring & Observability**
 - [ ] Set up Sentry for error tracking:

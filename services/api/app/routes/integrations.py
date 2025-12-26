@@ -1,0 +1,186 @@
+"""Integration endpoints for third-party data sources."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+from urllib.parse import urlencode, urljoin
+
+import httpx
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, Field
+from secrets import token_urlsafe
+
+from ..config import get_settings
+
+
+router = APIRouter()
+settings = get_settings()
+
+
+@dataclass
+class StateEntry:
+    created_at: datetime
+
+
+class OAuthStateStore:
+    def __init__(self, ttl_seconds: int = 900) -> None:
+        self._ttl = timedelta(seconds=ttl_seconds)
+        self._states: dict[str, StateEntry] = {}
+
+    def create_state(self) -> str:
+        state = token_urlsafe(32)
+        self._states[state] = StateEntry(created_at=datetime.now(timezone.utc))
+        return state
+
+    def validate_state(self, state: str) -> bool:
+        entry = self._states.pop(state, None)
+        if not entry:
+            return False
+        if datetime.now(timezone.utc) - entry.created_at > self._ttl:
+            return False
+        return True
+
+
+@dataclass
+class TokenRecord:
+    access_token: str
+    refresh_token: Optional[str]
+    expires_at: Optional[datetime]
+    connected_at: datetime
+
+
+class TokenStore:
+    def __init__(self) -> None:
+        self._record: Optional[TokenRecord] = None
+
+    def store(self, record: TokenRecord) -> None:
+        self._record = record
+
+    def get(self) -> Optional[TokenRecord]:
+        return self._record
+
+
+state_store = OAuthStateStore()
+token_store = TokenStore()
+
+
+class AuthUrlResponse(BaseModel):
+    auth_url: str = Field(..., description="Google OAuth authorization URL")
+    state: str = Field(..., description="State token to prevent CSRF")
+
+
+class StatusResponse(BaseModel):
+    connected: bool
+    connected_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+
+
+def _ensure_google_photos_config() -> None:
+    if not settings.google_photos_client_id or not settings.google_photos_client_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="Google Photos OAuth is not configured.",
+        )
+    if not settings.google_photos_redirect_uri:
+        raise HTTPException(
+            status_code=503,
+            detail="Google Photos redirect URI is not configured.",
+        )
+
+
+@router.get("/integrations/google/photos/auth-url", response_model=AuthUrlResponse)
+async def get_google_photos_auth_url() -> AuthUrlResponse:
+    _ensure_google_photos_config()
+    state = state_store.create_state()
+    params = {
+        "client_id": settings.google_photos_client_id,
+        "redirect_uri": settings.google_photos_redirect_uri,
+        "response_type": "code",
+        "access_type": "offline",
+        "prompt": "consent",
+        "include_granted_scopes": "true",
+        "scope": " ".join(settings.google_photos_scopes),
+        "state": state,
+    }
+    auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
+    return AuthUrlResponse(auth_url=auth_url, state=state)
+
+
+@router.get("/integrations/google/photos/status", response_model=StatusResponse)
+async def get_google_photos_status() -> StatusResponse:
+    record = token_store.get()
+    if not record:
+        return StatusResponse(connected=False)
+    return StatusResponse(
+        connected=True,
+        connected_at=record.connected_at,
+        expires_at=record.expires_at,
+    )
+
+
+@router.get("/integrations/google/photos/callback")
+async def google_photos_callback(
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+) -> RedirectResponse:
+    _ensure_google_photos_config()
+    if error:
+        destination = _build_web_redirect("error", error)
+        return RedirectResponse(destination)
+    if not code or not state:
+        destination = _build_web_redirect("error", "missing_code_or_state")
+        return RedirectResponse(destination)
+    if not state_store.validate_state(state):
+        destination = _build_web_redirect("error", "invalid_state")
+        return RedirectResponse(destination)
+
+    token_data = await _exchange_google_photos_code(code)
+    access_token = token_data.get("access_token")
+    if not access_token:
+        destination = _build_web_redirect("error", "token_exchange_failed")
+        return RedirectResponse(destination)
+
+    expires_at = None
+    if token_data.get("expires_in"):
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(token_data["expires_in"]))
+
+    token_store.store(
+        TokenRecord(
+            access_token=access_token,
+            refresh_token=token_data.get("refresh_token"),
+            expires_at=expires_at,
+            connected_at=datetime.now(timezone.utc),
+        )
+    )
+
+    destination = _build_web_redirect("connected", None)
+    return RedirectResponse(destination)
+
+
+async def _exchange_google_photos_code(code: str) -> dict:
+    token_endpoint = "https://oauth2.googleapis.com/token"
+    payload = {
+        "code": code,
+        "client_id": settings.google_photos_client_id,
+        "client_secret": settings.google_photos_client_secret,
+        "redirect_uri": settings.google_photos_redirect_uri,
+        "grant_type": "authorization_code",
+    }
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.post(token_endpoint, data=payload)
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail="Failed to exchange Google OAuth code.")
+    return response.json()
+
+
+def _build_web_redirect(status: str, detail: Optional[str]) -> str:
+    base_url = settings.web_app_url.rstrip("/") + "/"
+    params = {"integration": "google_photos", "status": status}
+    if detail:
+        params["detail"] = detail
+    return urljoin(base_url, f"?{urlencode(params)}")
+

@@ -84,6 +84,17 @@ export interface IngestResponse {
   status: string;
 }
 
+export interface GooglePhotosStatus {
+  connected: boolean;
+  connected_at?: string | null;
+  expires_at?: string | null;
+}
+
+export interface GooglePhotosAuthUrlResponse {
+  auth_url: string;
+  state: string;
+}
+
 export type View = 'dashboard' | 'timeline' | 'chat' | 'upload' | 'settings';
 
 export interface NavItem {

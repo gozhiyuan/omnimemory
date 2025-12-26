@@ -1552,6 +1552,48 @@ User question: {query}"""
 3. Optimize processing speed and cost
 4. Add most requested features
 
+### Ingestion Expansion (Post-MVP)
+
+**Desktop Capture App (macOS first)**
+- [ ] Build a lightweight menubar app that captures screenshots every 30s while the screen is active (idle detection + pause toggle)
+- [ ] Buffer locally (ring buffer) and upload to a user-selected Google Drive folder (either via Drive sync folder or Drive API)
+- [ ] Add privacy controls: pause/resume, exclude apps/windows (best-effort), and “delete local after upload”
+- [ ] Treat uploaded screenshots as normal assets (same processing: OCR/caption/embeddings) with `provider=desktop_capture`
+
+**Google Drive Connector (Cloud Sync Bridge)**
+- [ ] Add `google_drive` as a `data_connections.provider` and implement OAuth + folder picker
+- [ ] Backfill + incremental sync for a specific folder using the Drive Changes API (or folder query + modifiedTime cursor)
+- [ ] Map Drive files into the existing pipeline by writing to Supabase Storage (or using signed URLs) and then calling `/upload/ingest`
+- [ ] De-dupe by `(connection_id, external_id)` plus optional SHA256 if available
+
+**Oura Ring Connector**
+- [ ] Implement OAuth connection and nightly/daily ingestion of sleep/readiness/activity summaries into structured tables
+- [ ] Generate “daily health events” for the Timeline and embed short textual summaries for semantic retrieval
+- [ ] Optional: same-day refresh job (e.g., hourly) with caching to reduce API calls
+
+**Apple Photos (via Mac Agent / Export Bridge)**
+- [ ] Start with a Mac-only approach: the desktop app exports new Photos items into a local folder (or directly to the Drive bridge folder)
+- [ ] Ingest exported media through the same pipeline (mark `provider=apple_photos_export`)
+- [ ] Defer any iCloud-native integration until a reliable API/approach is confirmed
+
+**ESP32 Camera Ingestion (XIAO ESP32S3 Sense)**
+- [ ] Add a `devices` table: `id`, `user_id`, `name`, `device_token_hash`, `created_at`, `last_seen_at`, `revoked_at`
+- [ ] Add API endpoints for device pairing and ingestion:
+  - [ ] `POST /devices/pair` (user authed) → returns `device_id` + one-time `pairing_code`
+  - [ ] `POST /devices/activate` (pairing_code) → returns long-lived `device_token`
+  - [ ] `POST /devices/upload-url` (header `X-Device-Token`) → proxy to `/storage/upload-url` with a safe prefix like `devices/{device_id}`
+  - [ ] `POST /devices/ingest` (header `X-Device-Token`) → creates a `SourceItem` without requiring `user_id` in the payload
+- [ ] Firmware (Arduino) behavior: capture JPEG every 30s to SD, and when Wi-Fi is available (e.g., phone hotspot) upload backlog via `/devices/upload-url` + `/devices/ingest`
+- [ ] Spec: `docs/esp32-ingestion/README.md`
+
+### Live Data Access (MCP) Roadmap
+- [ ] Define a query router that detects time-sensitive or action intents (now/today/current, play/navigate) and decides when to call live tools vs. RAG
+- [ ] Design a normalized `live_context` schema for tool responses (source, retrieved_at, time_range, records, reliability)
+- [ ] Implement MCP connectors (read-only first) for Google Maps and Spotify with rate limits + 15-60 min caching
+- [ ] Optional: add an Oura “live refresh” MCP tool for same-day data when it’s not yet ingested
+- [ ] Merge live tool results into chat context with explicit "live" badges and fallback messaging if tools fail
+- [ ] Add async backfill to store live results into `source_items`/`processed_content` so they become searchable memory
+
 ### Future Phases
 - **Phase 2:** Advanced graph analytics, face clustering, richer retrieval evaluation tooling
 - **Phase 3:** Mobile apps, desktop capture agent, automated story generation

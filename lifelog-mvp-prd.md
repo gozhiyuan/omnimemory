@@ -88,7 +88,8 @@ Build an AI-powered personal memory assistant that ingests multimodal data from 
 - Desktop capture agent
 - Automated screenshot/video capture
 - Vlog generation
-- Additional connectors beyond Google Photos (Apple Photos, Notion, social media APIs)
+- Additional connectors beyond Google Photos (Apple Photos via export/agent, Google Drive, Oura Ring, Spotify, etc.)
+- IoT/device ingestion (e.g., ESP32 camera uploading periodic snapshots)
 - Shareable mini-chatbots
 - Advanced graph visualizations
 - Multi-user collaboration
@@ -445,6 +446,64 @@ def retrieve_relevant_context(query: str, user_id: str, top_k: int = 10):
     
     return ranked_hits[:top_k]
 ```
+
+#### Live Data Access (MCP) and Retrieval Router
+
+**Principle:** embeddings + vector retrieval power long-term memory; MCP tools fetch live or missing data at query time. They are complementary, not interchangeable.
+
+**When to use MCP (live tools):**
+- Queries that are explicitly time-sensitive: "now", "today", "current", "latest"
+- Action intents: "play", "navigate", "start workout", "set reminder"
+- Data that is too large, locked behind API rate limits, or not yet ingested
+
+**Router sketch:**
+
+```
+User Query
+   -> Query Router (intent + time sensitivity)
+       -> RAG Retrieval (vector + temporal + graph)
+       -> Optional MCP Tools (live data)
+   -> Context Fusion + Rerank
+   -> LLM Response
+```
+
+```python
+def route_query(query: str) -> dict:
+    intent = classify_intent(query)
+    needs_live = has_live_time(query) or intent in {
+        "play_music",
+        "navigate",
+        "current_stats",
+        "latest_activity"
+    }
+    tools = tools_for_intent(intent) if needs_live else []
+    return {"use_rag": True, "mcp_tools": tools}
+```
+
+**Source-by-source strategy (future connectors):**
+
+| Source | Long-term memory (embed + store) | Live MCP usage |
+|--------|----------------------------------|----------------|
+| Google Photos | Backfill metadata, captions, OCR, embeddings for semantic recall | Fetch newest uploads not yet synced, or full-res media on demand |
+| Google Maps | Ingest timeline events + places into structured events and embeddings | "Where am I now", live navigation/traffic, current ETA |
+| Spotify | Ingest listening history, playlists, artist metadata, embeddings | "What is playing now", control playback, latest queue |
+| Oura Ring | Ingest daily aggregates (sleep, readiness, activity) into structured tables | "Current readiness", today's live metrics before nightly sync |
+
+**Normalize live tool responses:**
+
+```json
+{
+  "source": "spotify",
+  "retrieved_at": "2025-11-02T10:15:00Z",
+  "time_range": {"start": "2025-11-02", "end": "2025-11-02"},
+  "records": [{"type": "track", "title": "...", "metadata": {...}}],
+  "reliability": "live"
+}
+```
+
+**Caching + memory backfill:**
+- Cache live tool responses for 15-60 minutes to reduce API calls.
+- Optionally ingest tool outputs into `source_items`/`processed_content` asynchronously so "live" becomes searchable memory.
 
 **4. Modular Memory Component Design:**
 
@@ -819,7 +878,7 @@ GET    /api/v1/events/:id               # Get event details
 - [ ] Build Google Photos OAuth integration
 - [ ] Create full sync job for Google Photos
 - [ ] Implement incremental sync logic
-- [ ] Build Notion integration (OAuth + page sync)
+- [ ] Defer additional connectors (Google Drive, Oura, Apple Photos, etc.) until post-MVP
 - [ ] Create processing pipeline (Celery tasks):
   - [ ] Image captioning
   - [ ] OCR
@@ -873,7 +932,11 @@ GET    /api/v1/events/:id               # Get event details
 
 ### Phase 3: Expansion (Weeks 19-26)
 - Mobile apps (iOS, Android)
-- Desktop capture agent
+- Desktop capture app (macOS first) with screenshot sampling (e.g., every 30s while active)
+- Cloud sync bridge: Google Drive connector (folder backfill + incremental sync)
+- Wearables: Oura Ring connector (sleep/readiness/activity)
+- Apple Photos ingestion via macOS agent/export bridge (can be integrated into the desktop app)
+- ESP32 camera ingestion (SD-backed capture + upload-on-Wi-Fi using device tokens + presigned uploads)
 - Additional integrations (Instagram, X/Twitter, TikTok)
 - Shareable memory capsules
 - Multi-user sharing and collaboration
@@ -906,7 +969,8 @@ GET    /api/v1/events/:id               # Get event details
 ## 10. Success Criteria for MVP
 
 **Must-Have:**
-- ✅ User can connect Google Photos, Apple Photos, and Notion
+- ✅ User can connect Google Photos
+- ✅ User can upload photos/videos manually (batch)
 - ✅ User can upload 500+ photos in a single batch
 - ✅ All uploaded data is processed within 1 hour
 - ✅ User can ask temporal queries ("What did I do last week?") and get accurate answers

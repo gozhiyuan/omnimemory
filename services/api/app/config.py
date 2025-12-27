@@ -56,6 +56,15 @@ class Settings(BaseSettings):
     cors_allow_origins: list[str] = Field(
         default_factory=lambda: ["http://localhost:3000", "http://127.0.0.1:3000"]
     )
+    web_app_url: str = "http://localhost:3000"
+
+    # Google Photos OAuth
+    google_photos_client_id: Optional[str] = None
+    google_photos_client_secret: Optional[str] = None
+    google_photos_redirect_uri: Optional[str] = None
+    google_photos_scopes: list[str] = Field(
+        default_factory=lambda: ["https://www.googleapis.com/auth/photoslibrary.readonly"]
+    )
 
     @model_validator(mode="before")
     @classmethod

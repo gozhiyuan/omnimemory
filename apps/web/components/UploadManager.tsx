@@ -1,7 +1,7 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { UploadCloud, CheckCircle2, FileImage, X, AlertCircle } from 'lucide-react';
-import { apiPost } from '../services/api';
-import { IngestResponse, UploadUrlResponse } from '../types';
+import { apiGet, apiPost } from '../services/api';
+import { GooglePhotosAuthUrlResponse, GooglePhotosStatus, IngestResponse, UploadUrlResponse } from '../types';
 
 export const UploadManager: React.FC = () => {
   const [dragActive, setDragActive] = useState(false);
@@ -10,6 +10,9 @@ export const UploadManager: React.FC = () => {
   const [success, setSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [uploadedCount, setUploadedCount] = useState(0);
+  const [googleStatus, setGoogleStatus] = useState<GooglePhotosStatus | null>(null);
+  const [googleLoading, setGoogleLoading] = useState(false);
+  const [googleError, setGoogleError] = useState<string | null>(null);
 
   const inferItemType = (file: File) => {
     if (file.type.startsWith('image/')) return 'photo';
@@ -113,6 +116,46 @@ export const UploadManager: React.FC = () => {
     } finally {
       setUploading(false);
     }
+  };
+
+  const loadGoogleStatus = async () => {
+    setGoogleLoading(true);
+    setGoogleError(null);
+    try {
+      const status = await apiGet<GooglePhotosStatus>('/integrations/google/photos/status');
+      setGoogleStatus(status);
+    } catch (err) {
+      setGoogleError(err instanceof Error ? err.message : 'Failed to load Google Photos status.');
+    } finally {
+      setGoogleLoading(false);
+    }
+  };
+
+  const handleGoogleConnect = async () => {
+    setGoogleLoading(true);
+    setGoogleError(null);
+    try {
+      const response = await apiGet<GooglePhotosAuthUrlResponse>('/integrations/google/photos/auth-url');
+      window.location.href = response.auth_url;
+    } catch (err) {
+      setGoogleError(err instanceof Error ? err.message : 'Failed to start Google Photos connection.');
+      setGoogleLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadGoogleStatus();
+  }, []);
+
+  const formatGoogleStatus = () => {
+    if (!googleStatus?.connected) {
+      return 'Not connected';
+    }
+    if (googleStatus.connected_at) {
+      const connectedAt = new Date(googleStatus.connected_at);
+      return `Connected ${connectedAt.toLocaleString()}`;
+    }
+    return 'Connected';
   };
 
   return (
@@ -221,16 +264,27 @@ export const UploadManager: React.FC = () => {
               </div>
               <div>
                 <h3 className="text-sm font-medium text-slate-900">Google Photos</h3>
-                <p className="text-xs text-green-600 flex items-center">
-                  <CheckCircle2 size={12} className="mr-1" />
-                  Synced (2 hrs ago)
+                <p className={`text-xs flex items-center ${googleStatus?.connected ? 'text-green-600' : 'text-slate-500'}`}>
+                  {googleStatus?.connected ? (
+                    <CheckCircle2 size={12} className="mr-1" />
+                  ) : (
+                    <AlertCircle size={12} className="mr-1" />
+                  )}
+                  {googleLoading ? 'Checking status...' : formatGoogleStatus()}
                 </p>
               </div>
             </div>
-            <button className="text-xs border border-slate-200 px-3 py-1.5 rounded-md hover:bg-slate-50">
-              Manage
+            <button
+              className="text-xs border border-slate-200 px-3 py-1.5 rounded-md hover:bg-slate-50 disabled:opacity-50"
+              onClick={handleGoogleConnect}
+              disabled={googleLoading}
+            >
+              {googleStatus?.connected ? 'Reconnect' : 'Connect'}
             </button>
           </div>
+          {googleError && (
+            <div className="text-xs text-red-600">{googleError}</div>
+          )}
 
           <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex items-center justify-between">
             <div className="flex items-center space-x-3">

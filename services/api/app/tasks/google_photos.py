@@ -14,6 +14,7 @@ from ..celery_app import celery_app
 from ..db.models import DEFAULT_TEST_USER_ID, DataConnection, SourceItem, User
 from ..db.session import isolated_session
 from ..google_photos import (
+    extract_picker_media_fields,
     fetch_picker_media_item,
     fetch_picker_media_items,
     get_valid_access_token,
@@ -39,41 +40,68 @@ async def _ingest_media_item(
     access_token: str,
     session_id: str,
 ) -> Optional[UUID]:
-    media_id = item.get("id")
+    media_id = (
+        item.get("id")
+        or (item.get("mediaItem") or {}).get("id")
+        or (item.get("googlePhotosMediaItem") or {}).get("id")
+        or (item.get("mediaFile") or {}).get("id")
+    )
     if not media_id:
         return None
-    base_url = item.get("baseUrl")
+    base_url, _, mime_type, creation_time = extract_picker_media_fields(item)
     if not base_url:
         try:
             hydrated = await fetch_picker_media_item(access_token, session_id, media_id)
         except RuntimeError as exc:
             logger.warning("Failed to hydrate picker item {}: {}", media_id, exc)
             hydrated = {}
-        base_url = hydrated.get("baseUrl")
+        base_url, _, mime_type, creation_time = extract_picker_media_fields(hydrated)
     if not base_url:
-        logger.warning("Skipping media item {} without baseUrl", media_id)
+        logger.warning(
+            "Skipping media item {} without baseUrl (keys={} session={})",
+            media_id,
+            list(item.keys()),
+            session_id,
+        )
         return None
     download_url = f"{base_url}=d"
     storage_key = download_url
-    mime_type = item.get("mimeType") or "application/octet-stream"
+    mime_type = mime_type or "application/octet-stream"
+    captured_at = parse_google_timestamp(creation_time)
 
     async with isolated_session() as session:
         result = await session.execute(
-            select(SourceItem.id).where(
+            select(SourceItem).where(
                 SourceItem.connection_id == connection.id,
                 SourceItem.storage_key == storage_key,
             )
         )
-        if result.scalar_one_or_none():
-            return None
+        existing = result.scalar_one_or_none()
+        if existing:
+            if existing.processing_status != "completed":
+                existing.processing_status = "pending"
+                existing.processing_error = None
+                existing.updated_at = datetime.now(timezone.utc)
+                await session.commit()
+
+                process_item.delay(
+                    {
+                        "item_id": str(existing.id),
+                        "storage_key": storage_key,
+                        "item_type": existing.item_type,
+                        "user_id": str(connection.user_id),
+                        "captured_at": (existing.captured_at or captured_at or datetime.now(timezone.utc)).isoformat(),
+                        "content_type": existing.content_type or mime_type,
+                        "original_filename": existing.original_filename or item.get("filename"),
+                        "remote_only": True,
+                    }
+                )
+            return existing.id
 
         user = await session.get(User, connection.user_id)
         if user is None:
             session.add(User(id=connection.user_id))
 
-        captured_at = parse_google_timestamp(
-            (item.get("mediaMetadata") or {}).get("creationTime")
-        )
         source_item = SourceItem(
             id=uuid4(),
             user_id=connection.user_id,
@@ -97,6 +125,7 @@ async def _ingest_media_item(
                 "captured_at": captured_at.isoformat() if captured_at else None,
                 "content_type": mime_type,
                 "original_filename": item.get("filename"),
+                "remote_only": True,
             }
         )
         return source_item.id

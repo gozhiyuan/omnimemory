@@ -17,6 +17,7 @@ from loguru import logger
 from ..config import get_settings
 from ..db.models import DEFAULT_TEST_USER_ID, DataConnection, ProcessedContent, SourceItem
 from ..db.session import get_session
+from ..google_photos import get_valid_access_token
 from ..storage import get_storage_provider
 
 
@@ -133,7 +134,23 @@ async def get_dashboard_stats(
     settings = get_settings()
     storage = get_storage_provider()
 
-    async def sign_url(storage_key: str) -> Optional[str]:
+    connections: dict[UUID, DataConnection] = {}
+    if recent_items:
+        connection_ids = [item.connection_id for item in recent_items if item.connection_id]
+        if connection_ids:
+            conn_rows = await session.execute(select(DataConnection).where(DataConnection.id.in_(connection_ids)))
+            connections = {conn.id: conn for conn in conn_rows.scalars().all()}
+
+    async def build_url(item: SourceItem) -> Optional[str]:
+        storage_key = item.storage_key
+        if storage_key.startswith("http://") or storage_key.startswith("https://"):
+            conn = connections.get(item.connection_id)
+            if conn and conn.provider == "google_photos":
+                token = await get_valid_access_token(session, conn)
+                if token:
+                    sep = "&" if "?" in storage_key else "?"
+                    return f"{storage_key}{sep}access_token={token}"
+            return storage_key
         try:
             signed = await asyncio.to_thread(
                 storage.get_presigned_download, storage_key, settings.presigned_url_ttl_seconds
@@ -146,7 +163,7 @@ async def get_dashboard_stats(
     download_urls: dict[UUID, Optional[str]] = {}
     if recent_items:
         signed_list = await asyncio.gather(
-            *(sign_url(item.storage_key) for item in recent_items),
+            *(build_url(item) for item in recent_items),
             return_exceptions=False,
         )
         download_urls = {item.id: url for item, url in zip(recent_items, signed_list)}

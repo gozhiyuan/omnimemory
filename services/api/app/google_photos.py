@@ -31,6 +31,26 @@ def parse_google_timestamp(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def extract_picker_media_fields(item: dict) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Return base_url, filename, mime_type, creation_time from a picker item."""
+    gpm = (
+        item.get("googlePhotosMediaItem")
+        or item.get("mediaItem")
+        or item.get("mediaFile")
+        or item
+    )
+    base_url = item.get("baseUrl") or gpm.get("baseUrl")
+    filename = item.get("filename") or gpm.get("filename")
+    mime_type = item.get("mimeType") or gpm.get("mimeType")
+    creation_time = (
+        item.get("createTime")
+        or (item.get("mediaMetadata") or {}).get("creationTime")
+        or (gpm.get("mediaMetadata") or {}).get("creationTime")
+        or gpm.get("createTime")
+    )
+    return base_url, filename, mime_type, creation_time
+
+
 async def store_google_photos_tokens(
     session: AsyncSession,
     token_data: dict,
@@ -141,13 +161,31 @@ async def fetch_picker_media_items(access_token: str, session_id: str) -> list[d
     headers = {"Authorization": f"Bearer {access_token}"}
     page_token: Optional[str] = None
     items: list[dict] = []
+    use_fields_mask = True
+    fields_mask = (
+        "mediaItems("
+        "id,"
+        "googlePhotosMediaItem(baseUrl,filename,mimeType,mediaMetadata/creationTime)"
+        "),nextPageToken"
+    )
     async with httpx.AsyncClient(timeout=30) as client:
         while True:
-            params = {"pageSize": "100", "sessionId": session_id}
+            params = {
+                "pageSize": "100",
+                "sessionId": session_id,
+            }
+            if use_fields_mask:
+                params["fields"] = fields_mask
             if page_token:
                 params["pageToken"] = page_token
             response = await client.get(GOOGLE_PHOTOS_PICKER_MEDIA_ENDPOINT, headers=headers, params=params)
             if response.status_code >= 400:
+                if use_fields_mask and response.status_code == 400 and "fields" in response.text:
+                    logger.warning("Picker media request failed with fields mask; retrying without fields: {}", response.text)
+                    use_fields_mask = False
+                    page_token = None
+                    items = []
+                    continue
                 raise RuntimeError(
                     f"Google Photos picker media fetch failed ({response.status_code}): {response.text}"
                 )
@@ -156,6 +194,15 @@ async def fetch_picker_media_items(access_token: str, session_id: str) -> list[d
             page_token = payload.get("nextPageToken")
             if not page_token:
                 break
+    if items:
+        first = items[0]
+        logger.info(
+            "Picker sample keys={} gpm_keys={} mediaItem_keys={}",
+            list(first.keys()),
+            list((first.get("googlePhotosMediaItem") or {}).keys()),
+            list((first.get("mediaItem") or {}).keys()),
+        )
+        logger.info("Picker first item snippet={}", {k: first.get(k) for k in list(first.keys())[:6]})
     return items
 
 

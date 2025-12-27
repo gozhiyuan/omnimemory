@@ -136,7 +136,9 @@ async def get_dashboard_stats(
 
     connections: dict[UUID, DataConnection] = {}
     if recent_items:
-        connection_ids = [item.connection_id for item in recent_items if item.connection_id]
+        connection_ids = [
+            getattr(item, "connection_id", None) for item in recent_items if getattr(item, "connection_id", None)
+        ]
         if connection_ids:
             conn_rows = await session.execute(select(DataConnection).where(DataConnection.id.in_(connection_ids)))
             connections = {conn.id: conn for conn in conn_rows.scalars().all()}
@@ -144,7 +146,8 @@ async def get_dashboard_stats(
     async def build_url(item: SourceItem) -> Optional[str]:
         storage_key = item.storage_key
         if storage_key.startswith("http://") or storage_key.startswith("https://"):
-            conn = connections.get(item.connection_id)
+            conn_id = getattr(item, "connection_id", None)
+            conn = connections.get(conn_id) if conn_id else None
             if conn and conn.provider == "google_photos":
                 token = await get_valid_access_token(session, conn)
                 if token:

@@ -100,7 +100,7 @@ async def get_timeline(
     download_urls: dict[UUID, Optional[str]] = {}
     connections: dict[UUID, DataConnection] = {}
     if items:
-        connection_ids = [item.connection_id for item in items if item.connection_id]
+        connection_ids = [getattr(item, "connection_id", None) for item in items if getattr(item, "connection_id", None)]
         if connection_ids:
             conn_rows = await session.execute(select(DataConnection).where(DataConnection.id.in_(connection_ids)))
             connections = {conn.id: conn for conn in conn_rows.scalars().all()}
@@ -108,7 +108,8 @@ async def get_timeline(
     async def download_url_for(item: SourceItem) -> Optional[str]:
         storage_key = item.storage_key
         if storage_key.startswith("http://") or storage_key.startswith("https://"):
-            conn = connections.get(item.connection_id)
+            conn_id = getattr(item, "connection_id", None)
+            conn = connections.get(conn_id) if conn_id else None
             if conn and conn.provider == "google_photos":
                 token = await get_valid_access_token(session, conn)
                 if token:

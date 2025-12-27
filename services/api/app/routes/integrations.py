@@ -18,7 +18,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import get_settings
 from ..db.models import DEFAULT_TEST_USER_ID, DataConnection
 from ..db.session import get_session
-from ..google_photos import create_picker_session, get_valid_access_token, store_google_photos_tokens
+from ..google_photos import (
+    create_picker_session,
+    fetch_picker_media_items,
+    get_valid_access_token,
+    store_google_photos_tokens,
+)
 from ..tasks.google_photos import sync_google_photos_media
 
 
@@ -76,6 +81,18 @@ class SyncRequest(BaseModel):
 class PickerSessionResponse(BaseModel):
     session_id: str
     picker_uri: str
+
+
+class PickerMediaItem(BaseModel):
+    id: str
+    base_url: Optional[str] = None
+    filename: Optional[str] = None
+    mime_type: Optional[str] = None
+    creation_time: Optional[str] = None
+
+
+class PickerMediaResponse(BaseModel):
+    items: list[PickerMediaItem]
 
 
 def _ensure_google_photos_config() -> None:
@@ -217,6 +234,37 @@ async def start_google_photos_picker(
     connection.updated_at = datetime.now(timezone.utc)
     await session.commit()
     return PickerSessionResponse(session_id=session_id, picker_uri=picker_uri)
+
+
+@router.get("/integrations/google/photos/picker-items", response_model=PickerMediaResponse)
+async def get_google_photos_picker_items(
+    session_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> PickerMediaResponse:
+    _ensure_google_photos_config()
+    connection = await _get_google_photos_connection(session)
+    if not connection:
+        raise HTTPException(status_code=404, detail="Google Photos connection not found.")
+    access_token = await get_valid_access_token(session, connection)
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Google Photos token missing or expired.")
+    try:
+        items = await fetch_picker_media_items(access_token, session_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch picker items: {exc}") from exc
+
+    mapped = [
+        PickerMediaItem(
+            id=item.get("id", ""),
+            base_url=item.get("baseUrl"),
+            filename=item.get("filename"),
+            mime_type=item.get("mimeType"),
+            creation_time=(item.get("mediaMetadata") or {}).get("creationTime"),
+        )
+        for item in items
+        if item.get("id")
+    ]
+    return PickerMediaResponse(items=mapped)
 
 
 async def _get_google_photos_connection(session: AsyncSession) -> Optional[DataConnection]:

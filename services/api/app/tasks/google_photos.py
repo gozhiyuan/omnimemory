@@ -7,18 +7,14 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID, uuid4
 
-import httpx
 from loguru import logger
 from sqlalchemy import select
 
 from ..celery_app import celery_app
 from ..db.models import DEFAULT_TEST_USER_ID, DataConnection, SourceItem, User
 from ..db.session import isolated_session
-from ..google_photos import get_valid_access_token, parse_google_timestamp
+from ..google_photos import fetch_picker_media_items, get_valid_access_token, parse_google_timestamp
 from .process_item import process_item
-
-
-GOOGLE_PHOTOS_PICKER_MEDIA_ENDPOINT = "https://photospicker.googleapis.com/v1/mediaItems"
 
 
 def _media_item_type(mime_type: Optional[str]) -> str:
@@ -28,22 +24,8 @@ def _media_item_type(mime_type: Optional[str]) -> str:
 
 
 async def _fetch_media_items(access_token: str, session_id: str) -> list[dict[str, Any]]:
-    headers = {"Authorization": f"Bearer {access_token}"}
-    page_token: Optional[str] = None
-    items: list[dict[str, Any]] = []
-    async with httpx.AsyncClient(timeout=30) as client:
-        while True:
-            params = {"pageSize": "100", "sessionId": session_id}
-            if page_token:
-                params["pageToken"] = page_token
-            response = await client.get(GOOGLE_PHOTOS_PICKER_MEDIA_ENDPOINT, headers=headers, params=params)
-            response.raise_for_status()
-            payload = response.json()
-            items.extend(payload.get("mediaItems", []))
-            page_token = payload.get("nextPageToken")
-            if not page_token:
-                break
-    return items
+    items = await fetch_picker_media_items(access_token, session_id)
+    return [item for item in items if isinstance(item, dict)]
 
 
 async def _ingest_media_item(

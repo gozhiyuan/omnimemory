@@ -112,12 +112,15 @@ async def get_timeline(
                 and item.storage_key
                 and item.storage_key.startswith(("http://", "https://"))
             }
-            for conn_id in http_connection_ids:
-                conn = connections.get(conn_id)
-                if conn and conn.provider == "google_photos":
-                    token = await get_valid_access_token(session, conn)
-                    if token:
-                        tokens[conn_id] = token
+            google_photos_connections = [
+                connections[conn_id]
+                for conn_id in http_connection_ids
+                if conn_id in connections and connections[conn_id].provider == "google_photos"
+            ]
+            for conn in google_photos_connections:
+                token = await get_valid_access_token(session, conn)
+                if token:
+                    tokens[conn.id] = token
 
     async def download_url_for(item: SourceItem) -> Optional[str]:
         storage_key = item.storage_key

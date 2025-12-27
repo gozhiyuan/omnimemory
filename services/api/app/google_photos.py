@@ -16,6 +16,7 @@ from .db.models import DataConnection, DEFAULT_TEST_USER_ID
 
 GOOGLE_PHOTOS_PICKER_SESSIONS_ENDPOINT = "https://photospicker.googleapis.com/v1/sessions"
 GOOGLE_PHOTOS_PICKER_MEDIA_ENDPOINT = "https://photospicker.googleapis.com/v1/mediaItems"
+GOOGLE_PHOTOS_PICKER_MEDIA_ITEM_ENDPOINT = "https://photospicker.googleapis.com/v1/mediaItems/"
 GOOGLE_PHOTOS_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 
 
@@ -156,6 +157,23 @@ async def fetch_picker_media_items(access_token: str, session_id: str) -> list[d
             if not page_token:
                 break
     return items
+
+
+async def fetch_picker_media_item(
+    access_token: str,
+    session_id: str,
+    media_item_id: str,
+) -> dict:
+    headers = {"Authorization": f"Bearer {access_token}"}
+    url = f"{GOOGLE_PHOTOS_PICKER_MEDIA_ITEM_ENDPOINT}{media_item_id}"
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(url, headers=headers, params={"sessionId": session_id})
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Google Photos picker media item fetch failed ({response.status_code}): {response.text}"
+        )
+    payload = response.json()
+    return payload if isinstance(payload, dict) else {}
 
 
 async def _get_google_photos_connection(session: AsyncSession) -> Optional[DataConnection]:

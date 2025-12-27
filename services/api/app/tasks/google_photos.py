@@ -13,7 +13,12 @@ from sqlalchemy import select
 from ..celery_app import celery_app
 from ..db.models import DEFAULT_TEST_USER_ID, DataConnection, SourceItem, User
 from ..db.session import isolated_session
-from ..google_photos import fetch_picker_media_items, get_valid_access_token, parse_google_timestamp
+from ..google_photos import (
+    fetch_picker_media_item,
+    fetch_picker_media_items,
+    get_valid_access_token,
+    parse_google_timestamp,
+)
 from .process_item import process_item
 
 
@@ -31,11 +36,20 @@ async def _fetch_media_items(access_token: str, session_id: str) -> list[dict[st
 async def _ingest_media_item(
     connection: DataConnection,
     item: dict[str, Any],
+    access_token: str,
+    session_id: str,
 ) -> Optional[UUID]:
     media_id = item.get("id")
     if not media_id:
         return None
     base_url = item.get("baseUrl")
+    if not base_url:
+        try:
+            hydrated = await fetch_picker_media_item(access_token, session_id, media_id)
+        except RuntimeError as exc:
+            logger.warning("Failed to hydrate picker item {}: {}", media_id, exc)
+            hydrated = {}
+        base_url = hydrated.get("baseUrl")
     if not base_url:
         logger.warning("Skipping media item {} without baseUrl", media_id)
         return None
@@ -115,7 +129,7 @@ async def _sync_google_photos(session_id: Optional[str]) -> dict[str, Any]:
     media_items = await _fetch_media_items(access_token, resolved_session_id)
     ingested = 0
     for item in media_items:
-        item_id = await _ingest_media_item(connection, item)
+        item_id = await _ingest_media_item(connection, item, access_token, resolved_session_id)
         if item_id:
             ingested += 1
 

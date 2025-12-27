@@ -95,6 +95,20 @@ export interface GooglePhotosAuthUrlResponse {
   state: string;
 }
 
+export interface GooglePhotosPickerSessionResponse {
+  session_id: string;
+  picker_uri: string;
+}
+
+export interface GooglePhotosSyncRequest {
+  session_id?: string | null;
+}
+
+export interface GooglePhotosSyncResponse {
+  task_id: string;
+  status: string;
+}
+
 export type View = 'dashboard' | 'timeline' | 'chat' | 'upload' | 'settings';
 
 export interface NavItem {

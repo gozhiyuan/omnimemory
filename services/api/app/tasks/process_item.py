@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any, Dict
 from uuid import UUID
 
+import httpx
 from loguru import logger
 from sqlalchemy import delete
 from sqlalchemy.exc import SQLAlchemyError
@@ -53,6 +54,15 @@ def _generate_ocr(item: SourceItem) -> Dict[str, Any]:
     return {"text": text}
 
 
+async def _fetch_item_blob(storage, storage_key: str) -> bytes:
+    if storage_key.startswith("http://") or storage_key.startswith("https://"):
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.get(storage_key)
+            response.raise_for_status()
+            return response.content
+    return storage.fetch(storage_key)
+
+
 async def _process_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     storage = get_storage_provider()
 
@@ -82,7 +92,7 @@ async def _process_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         await session.flush()
 
         try:
-            blob = storage.fetch(item.storage_key)
+            blob = await _fetch_item_blob(storage, item.storage_key)
             metadata = _extract_metadata(blob, payload)
             caption = _generate_caption(item, metadata)
             transcription = _generate_transcription(item)

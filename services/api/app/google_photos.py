@@ -123,7 +123,10 @@ async def create_picker_session(access_token: str) -> Tuple[str, str]:
     headers = {"Authorization": f"Bearer {access_token}"}
     async with httpx.AsyncClient(timeout=10) as client:
         response = await client.post(GOOGLE_PHOTOS_PICKER_SESSIONS_ENDPOINT, headers=headers)
-    response.raise_for_status()
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Google Photos picker session failed ({response.status_code}): {response.text}"
+        )
     payload = response.json()
     session_id = payload.get("id")
     picker_uri = payload.get("pickerUri")

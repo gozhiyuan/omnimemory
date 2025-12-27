@@ -199,7 +199,17 @@ async def start_google_photos_picker(
     if not access_token:
         raise HTTPException(status_code=401, detail="Google Photos token missing or expired.")
 
-    session_id, picker_uri = await create_picker_session(access_token)
+    try:
+        session_id, picker_uri = await create_picker_session(access_token)
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Failed to create Google Photos picker session. "
+                "Ensure the Google Photos Picker API is enabled and the OAuth client is authorized. "
+                f"Details: {exc}"
+            ),
+        ) from exc
     config = dict(connection.config or {})
     config["picker_session_id"] = session_id
     config["picker_session_created_at"] = datetime.now(timezone.utc).isoformat()

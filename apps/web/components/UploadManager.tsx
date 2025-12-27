@@ -1,7 +1,17 @@
 import React, { useEffect, useState } from 'react';
 import { UploadCloud, CheckCircle2, FileImage, X, AlertCircle } from 'lucide-react';
 import { apiGet, apiPost } from '../services/api';
-import { GooglePhotosAuthUrlResponse, GooglePhotosStatus, IngestResponse, UploadUrlResponse } from '../types';
+import {
+  GooglePhotosAuthUrlResponse,
+  GooglePhotosPickerSessionResponse,
+  GooglePhotosStatus,
+  GooglePhotosSyncRequest,
+  GooglePhotosSyncResponse,
+  IngestResponse,
+  TimelineDay,
+  TimelineItem,
+  UploadUrlResponse,
+} from '../types';
 
 export const UploadManager: React.FC = () => {
   const [dragActive, setDragActive] = useState(false);
@@ -13,6 +23,13 @@ export const UploadManager: React.FC = () => {
   const [googleStatus, setGoogleStatus] = useState<GooglePhotosStatus | null>(null);
   const [googleLoading, setGoogleLoading] = useState(false);
   const [googleError, setGoogleError] = useState<string | null>(null);
+  const [pickerLoading, setPickerLoading] = useState(false);
+  const [pickerError, setPickerError] = useState<string | null>(null);
+  const [pickerSessionId, setPickerSessionId] = useState<string | null>(null);
+  const [syncLoading, setSyncLoading] = useState(false);
+  const [syncMessage, setSyncMessage] = useState<string | null>(null);
+  const [recentItems, setRecentItems] = useState<TimelineItem[]>([]);
+  const [recentError, setRecentError] = useState<string | null>(null);
 
   const inferItemType = (file: File) => {
     if (file.type.startsWith('image/')) return 'photo';
@@ -131,6 +148,17 @@ export const UploadManager: React.FC = () => {
     }
   };
 
+  const loadRecentItems = async () => {
+    setRecentError(null);
+    try {
+      const days = await apiGet<TimelineDay[]>('/timeline?limit=12&provider=google_photos');
+      const flattened = days.flatMap((day) => day.items);
+      setRecentItems(flattened.slice(0, 8));
+    } catch (err) {
+      setRecentError(err instanceof Error ? err.message : 'Failed to load recent items.');
+    }
+  };
+
   const handleGoogleConnect = async () => {
     setGoogleLoading(true);
     setGoogleError(null);
@@ -143,8 +171,43 @@ export const UploadManager: React.FC = () => {
     }
   };
 
+  const handleGooglePicker = async () => {
+    setPickerLoading(true);
+    setPickerError(null);
+    setSyncMessage(null);
+    try {
+      const response = await apiPost<GooglePhotosPickerSessionResponse>('/integrations/google/photos/picker-session');
+      setPickerSessionId(response.session_id);
+      window.open(response.picker_uri, '_blank', 'noopener,noreferrer');
+    } catch (err) {
+      setPickerError(err instanceof Error ? err.message : 'Failed to open Google Photos picker.');
+    } finally {
+      setPickerLoading(false);
+    }
+  };
+
+  const handleGoogleSync = async () => {
+    if (!pickerSessionId) {
+      setPickerError('Start a picker session before syncing.');
+      return;
+    }
+    setSyncLoading(true);
+    setSyncMessage(null);
+    setPickerError(null);
+    try {
+      const payload: GooglePhotosSyncRequest = { session_id: pickerSessionId };
+      const response = await apiPost<GooglePhotosSyncResponse>('/integrations/google/photos/sync', payload);
+      setSyncMessage(`Sync queued (task ${response.task_id}).`);
+    } catch (err) {
+      setPickerError(err instanceof Error ? err.message : 'Failed to queue Google Photos sync.');
+    } finally {
+      setSyncLoading(false);
+    }
+  };
+
   useEffect(() => {
     void loadGoogleStatus();
+    void loadRecentItems();
   }, []);
 
   const formatGoogleStatus = () => {
@@ -274,17 +337,83 @@ export const UploadManager: React.FC = () => {
                 </p>
               </div>
             </div>
-            <button
-              className="text-xs border border-slate-200 px-3 py-1.5 rounded-md hover:bg-slate-50 disabled:opacity-50"
-              onClick={handleGoogleConnect}
-              disabled={googleLoading}
-            >
-              {googleStatus?.connected ? 'Reconnect' : 'Connect'}
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                className="text-xs border border-slate-200 px-3 py-1.5 rounded-md hover:bg-slate-50 disabled:opacity-50"
+                onClick={handleGoogleConnect}
+                disabled={googleLoading}
+              >
+                {googleStatus?.connected ? 'Reconnect' : 'Connect'}
+              </button>
+              <button
+                className="text-xs bg-primary-600 text-white px-3 py-1.5 rounded-md hover:bg-primary-700 disabled:opacity-50"
+                onClick={handleGooglePicker}
+                disabled={!googleStatus?.connected || pickerLoading}
+              >
+                {pickerLoading ? 'Opening...' : 'Select photos'}
+              </button>
+            </div>
           </div>
           {googleError && (
             <div className="text-xs text-red-600">{googleError}</div>
           )}
+          {pickerError && (
+            <div className="text-xs text-red-600">{pickerError}</div>
+          )}
+          {googleStatus?.connected && (
+            <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-xs text-slate-600 space-y-2">
+              <p>Select photos in the Google Picker, then start ingestion below.</p>
+              <p>Already ingested items are skipped automatically during sync.</p>
+              <button
+                className="text-xs bg-slate-900 text-white px-3 py-1.5 rounded-md hover:bg-slate-800 disabled:opacity-50"
+                onClick={handleGoogleSync}
+                disabled={syncLoading || !pickerSessionId}
+              >
+                {syncLoading ? 'Queueing sync...' : 'Ingest selected photos'}
+              </button>
+              {syncMessage && <p className="text-green-600">{syncMessage}</p>}
+              {!pickerSessionId && <p className="text-slate-500">Waiting for picker selection.</p>}
+            </div>
+          )}
+          <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-medium text-slate-900">Recently ingested</h3>
+              <button
+                className="text-xs text-slate-500 hover:text-slate-700"
+                onClick={loadRecentItems}
+                type="button"
+              >
+                Refresh
+              </button>
+            </div>
+            {recentError && <p className="text-xs text-red-600">{recentError}</p>}
+            {recentItems.length === 0 && !recentError ? (
+              <p className="text-xs text-slate-500">No recent items yet.</p>
+            ) : (
+              <ul className="space-y-2 text-xs text-slate-600">
+                {recentItems.map((item) => (
+                  <li key={item.id} className="flex items-start gap-2">
+                    <CheckCircle2 className="w-4 h-4 text-green-600 mt-0.5" />
+                    {item.item_type === 'photo' && item.download_url ? (
+                      <img
+                        src={item.download_url}
+                        alt={item.original_filename || 'Google Photos thumbnail'}
+                        className="w-12 h-12 rounded-md object-cover border border-slate-200"
+                      />
+                    ) : null}
+                    <div>
+                      <p className="text-slate-800 font-medium">
+                        {item.original_filename || item.storage_key}
+                      </p>
+                      <p className="text-slate-500">
+                        {item.captured_at ? new Date(item.captured_at).toLocaleString() : 'Unknown date'}
+                      </p>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
 
           <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex items-center justify-between">
             <div className="flex items-center space-x-3">

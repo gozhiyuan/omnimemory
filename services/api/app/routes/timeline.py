@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
 from ..config import get_settings
-from ..db.models import DEFAULT_TEST_USER_ID, ProcessedContent, SourceItem
+from ..db.models import DEFAULT_TEST_USER_ID, DataConnection, ProcessedContent, SourceItem
 from ..db.session import get_session
 from ..storage import get_storage_provider
 
@@ -46,6 +46,7 @@ async def get_timeline(
     user_id: UUID = DEFAULT_TEST_USER_ID,
     session: AsyncSession = Depends(get_session),
     limit: int = 200,
+    provider: Optional[str] = None,
 ) -> list[TimelineDay]:
     """Return a grouped timeline of items for the user.
 
@@ -54,15 +55,16 @@ async def get_timeline(
     for UI rendering while still surfacing recent activity.
     """
 
-    stmt = (
-        select(SourceItem)
-        .where(
-            SourceItem.user_id == user_id,
-            SourceItem.processing_status == "completed",
-        )
-        .order_by(SourceItem.captured_at.desc().nulls_last(), SourceItem.created_at.desc())
-        .limit(limit)
+    stmt = select(SourceItem).where(
+        SourceItem.user_id == user_id,
+        SourceItem.processing_status == "completed",
     )
+    if provider:
+        stmt = (
+            stmt.join(DataConnection, SourceItem.connection_id == DataConnection.id)
+            .where(DataConnection.provider == provider)
+        )
+    stmt = stmt.order_by(SourceItem.captured_at.desc().nulls_last(), SourceItem.created_at.desc()).limit(limit)
     result = await session.execute(stmt)
     items: list[SourceItem] = list(result.scalars().all())
 
@@ -83,6 +85,8 @@ async def get_timeline(
     storage = get_storage_provider()
 
     async def sign_url(storage_key: str) -> Optional[str]:
+        if storage_key.startswith("http://") or storage_key.startswith("https://"):
+            return storage_key
         try:
             signed = await asyncio.to_thread(
                 storage.get_presigned_download, storage_key, settings.presigned_url_ttl_seconds

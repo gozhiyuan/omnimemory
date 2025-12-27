@@ -8,6 +8,8 @@ import {
   GooglePhotosSyncRequest,
   GooglePhotosSyncResponse,
   IngestResponse,
+  GooglePhotosPickerItem,
+  GooglePhotosPickerItemsResponse,
   TimelineDay,
   TimelineItem,
   UploadUrlResponse,
@@ -30,6 +32,9 @@ export const UploadManager: React.FC = () => {
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
   const [recentItems, setRecentItems] = useState<TimelineItem[]>([]);
   const [recentError, setRecentError] = useState<string | null>(null);
+  const [selectedItems, setSelectedItems] = useState<GooglePhotosPickerItem[]>([]);
+  const [selectedLoading, setSelectedLoading] = useState(false);
+  const [selectedError, setSelectedError] = useState<string | null>(null);
 
   const inferItemType = (file: File) => {
     if (file.type.startsWith('image/')) return 'photo';
@@ -175,6 +180,8 @@ export const UploadManager: React.FC = () => {
     setPickerLoading(true);
     setPickerError(null);
     setSyncMessage(null);
+    setSelectedItems([]);
+    setSelectedError(null);
     try {
       const response = await apiPost<GooglePhotosPickerSessionResponse>('/integrations/google/photos/picker-session');
       setPickerSessionId(response.session_id);
@@ -183,6 +190,25 @@ export const UploadManager: React.FC = () => {
       setPickerError(err instanceof Error ? err.message : 'Failed to open Google Photos picker.');
     } finally {
       setPickerLoading(false);
+    }
+  };
+
+  const loadPickerSelection = async () => {
+    if (!pickerSessionId) {
+      setSelectedError('Start a picker session before loading selections.');
+      return;
+    }
+    setSelectedLoading(true);
+    setSelectedError(null);
+    try {
+      const response = await apiGet<GooglePhotosPickerItemsResponse>(
+        `/integrations/google/photos/picker-items?session_id=${encodeURIComponent(pickerSessionId)}`
+      );
+      setSelectedItems(response.items);
+    } catch (err) {
+      setSelectedError(err instanceof Error ? err.message : 'Failed to load picker selections.');
+    } finally {
+      setSelectedLoading(false);
     }
   };
 
@@ -198,6 +224,7 @@ export const UploadManager: React.FC = () => {
       const payload: GooglePhotosSyncRequest = { session_id: pickerSessionId };
       const response = await apiPost<GooglePhotosSyncResponse>('/integrations/google/photos/sync', payload);
       setSyncMessage(`Sync queued (task ${response.task_id}).`);
+      void loadRecentItems();
     } catch (err) {
       setPickerError(err instanceof Error ? err.message : 'Failed to queue Google Photos sync.');
     } finally {
@@ -364,6 +391,33 @@ export const UploadManager: React.FC = () => {
             <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-xs text-slate-600 space-y-2">
               <p>Select photos in the Google Picker, then start ingestion below.</p>
               <p>Already ingested items are skipped automatically during sync.</p>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  className="text-xs border border-slate-300 px-3 py-1.5 rounded-md hover:bg-white disabled:opacity-50"
+                  onClick={loadPickerSelection}
+                  disabled={selectedLoading || !pickerSessionId}
+                >
+                  {selectedLoading ? 'Loading selection...' : 'Load selection'}
+                </button>
+                {selectedItems.length > 0 && (
+                  <span className="text-slate-500">Selected {selectedItems.length} photos</span>
+                )}
+              </div>
+              {selectedError && <p className="text-xs text-red-600">{selectedError}</p>}
+              {selectedItems.length > 0 && (
+                <div className="flex flex-wrap gap-2">
+                  {selectedItems.slice(0, 6).map((item) =>
+                    item.base_url ? (
+                      <img
+                        key={item.id}
+                        src={item.base_url}
+                        alt={item.filename || 'Selected Google photo'}
+                        className="w-12 h-12 rounded-md object-cover border border-slate-200"
+                      />
+                    ) : null
+                  )}
+                </div>
+              )}
               <button
                 className="text-xs bg-slate-900 text-white px-3 py-1.5 rounded-md hover:bg-slate-800 disabled:opacity-50"
                 onClick={handleGoogleSync}

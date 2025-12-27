@@ -100,6 +100,18 @@ export interface GooglePhotosPickerSessionResponse {
   picker_uri: string;
 }
 
+export interface GooglePhotosPickerItem {
+  id: string;
+  base_url?: string | null;
+  filename?: string | null;
+  mime_type?: string | null;
+  creation_time?: string | null;
+}
+
+export interface GooglePhotosPickerItemsResponse {
+  items: GooglePhotosPickerItem[];
+}
+
 export interface GooglePhotosSyncRequest {
   session_id?: string | null;
 }

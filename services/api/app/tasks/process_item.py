@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any, Dict
 from uuid import UUID
 
+import httpx
 from loguru import logger
 from sqlalchemy import delete
 from sqlalchemy.exc import SQLAlchemyError
@@ -82,7 +83,12 @@ async def _process_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         await session.flush()
 
         try:
-            blob = storage.fetch(item.storage_key)
+            if item.storage_key.startswith("http://") or item.storage_key.startswith("https://"):
+                response = httpx.get(item.storage_key, timeout=30)
+                response.raise_for_status()
+                blob = response.content
+            else:
+                blob = storage.fetch(item.storage_key)
             metadata = _extract_metadata(blob, payload)
             caption = _generate_caption(item, metadata)
             transcription = _generate_transcription(item)

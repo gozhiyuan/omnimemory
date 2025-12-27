@@ -83,6 +83,8 @@ async def get_timeline(
     storage = get_storage_provider()
 
     async def sign_url(storage_key: str) -> Optional[str]:
+        if storage_key.startswith("http://") or storage_key.startswith("https://"):
+            return storage_key
         try:
             signed = await asyncio.to_thread(
                 storage.get_presigned_download, storage_key, settings.presigned_url_ttl_seconds

@@ -32,6 +32,10 @@ def configure_celery() -> None:
                 "task": "maintenance.cleanup",
                 "schedule": 3600.0,
             },
+            "google-photos-sync": {
+                "task": "google_photos.sync_all",
+                "schedule": 3600.0,
+            },
         },
         task_queues=(
             Queue("default", Exchange("default"), routing_key="default"),
@@ -53,4 +57,3 @@ def ping() -> str:
     """Simple ping task for monitoring."""
 
     return "pong"
-

@@ -57,6 +57,10 @@ class Settings(BaseSettings):
         default_factory=lambda: ["http://localhost:3000", "http://127.0.0.1:3000"]
     )
 
+    google_photos_client_id: Optional[str] = Field(default=None)
+    google_photos_client_secret: Optional[str] = Field(default=None)
+    google_photos_redirect_uri: Optional[str] = Field(default=None)
+
     @model_validator(mode="before")
     @classmethod
     def _coerce_empty_strings(cls, values):

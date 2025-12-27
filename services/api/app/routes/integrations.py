@@ -50,7 +50,6 @@ class OAuthStateStore:
         return True
 
 
-@dataclass
 state_store = OAuthStateStore()
 
 

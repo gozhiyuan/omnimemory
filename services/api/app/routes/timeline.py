@@ -99,22 +99,34 @@ async def get_timeline(
 
     download_urls: dict[UUID, Optional[str]] = {}
     connections: dict[UUID, DataConnection] = {}
+    tokens: dict[UUID, str] = {}
     if items:
         connection_ids = [getattr(item, "connection_id", None) for item in items if getattr(item, "connection_id", None)]
         if connection_ids:
             conn_rows = await session.execute(select(DataConnection).where(DataConnection.id.in_(connection_ids)))
             connections = {conn.id: conn for conn in conn_rows.scalars().all()}
+            http_connection_ids = {
+                item.connection_id
+                for item in items
+                if item.connection_id
+                and item.storage_key
+                and item.storage_key.startswith(("http://", "https://"))
+            }
+            for conn_id in http_connection_ids:
+                conn = connections.get(conn_id)
+                if conn and conn.provider == "google_photos":
+                    token = await get_valid_access_token(session, conn)
+                    if token:
+                        tokens[conn_id] = token
 
     async def download_url_for(item: SourceItem) -> Optional[str]:
         storage_key = item.storage_key
         if storage_key.startswith("http://") or storage_key.startswith("https://"):
             conn_id = getattr(item, "connection_id", None)
-            conn = connections.get(conn_id) if conn_id else None
-            if conn and conn.provider == "google_photos":
-                token = await get_valid_access_token(session, conn)
-                if token:
-                    sep = "&" if "?" in storage_key else "?"
-                    return f"{storage_key}{sep}access_token={token}"
+            token = tokens.get(conn_id) if conn_id else None
+            if token:
+                sep = "&" if "?" in storage_key else "?"
+                return f"{storage_key}{sep}access_token={token}"
             return storage_key
         try:
             signed = await asyncio.to_thread(

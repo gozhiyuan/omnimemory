@@ -20,6 +20,7 @@ from ..db.models import DEFAULT_TEST_USER_ID, DataConnection
 from ..db.session import get_session
 from ..google_photos import (
     create_picker_session,
+    extract_picker_media_fields,
     fetch_picker_media_items,
     get_valid_access_token,
     store_google_photos_tokens,
@@ -253,17 +254,21 @@ async def get_google_photos_picker_items(
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=f"Failed to fetch picker items: {exc}") from exc
 
-    mapped = [
-        PickerMediaItem(
-            id=item.get("id", ""),
-            base_url=item.get("baseUrl"),
-            filename=item.get("filename"),
-            mime_type=item.get("mimeType"),
-            creation_time=(item.get("mediaMetadata") or {}).get("creationTime"),
+    mapped: list[PickerMediaItem] = []
+    for item in items:
+        item_id = item.get("id")
+        if not item_id:
+            continue
+        base_url, filename, mime_type, creation_time = extract_picker_media_fields(item)
+        mapped.append(
+            PickerMediaItem(
+                id=item_id,
+                base_url=base_url,
+                filename=filename,
+                mime_type=mime_type,
+                creation_time=creation_time,
+            )
         )
-        for item in items
-        if item.get("id")
-    ]
     return PickerMediaResponse(items=mapped)
 
 

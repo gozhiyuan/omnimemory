@@ -17,6 +17,7 @@ from loguru import logger
 from ..config import get_settings
 from ..db.models import DEFAULT_TEST_USER_ID, DataConnection, ProcessedContent, SourceItem
 from ..db.session import get_session
+from ..google_photos import get_valid_access_token
 from ..storage import get_storage_provider
 
 
@@ -97,9 +98,35 @@ async def get_timeline(
         return signed.get("url") if signed else None
 
     download_urls: dict[UUID, Optional[str]] = {}
+    connections: dict[UUID, DataConnection] = {}
+    if items:
+        connection_ids = [item.connection_id for item in items if item.connection_id]
+        if connection_ids:
+            conn_rows = await session.execute(select(DataConnection).where(DataConnection.id.in_(connection_ids)))
+            connections = {conn.id: conn for conn in conn_rows.scalars().all()}
+
+    async def download_url_for(item: SourceItem) -> Optional[str]:
+        storage_key = item.storage_key
+        if storage_key.startswith("http://") or storage_key.startswith("https://"):
+            conn = connections.get(item.connection_id)
+            if conn and conn.provider == "google_photos":
+                token = await get_valid_access_token(session, conn)
+                if token:
+                    sep = "&" if "?" in storage_key else "?"
+                    return f"{storage_key}{sep}access_token={token}"
+            return storage_key
+        try:
+            signed = await asyncio.to_thread(
+                storage.get_presigned_download, storage_key, settings.presigned_url_ttl_seconds
+            )
+        except Exception as exc:  # pragma: no cover - external service dependency
+            logger.warning("Failed to sign download URL for {}: {}", storage_key, exc)
+            return None
+        return signed.get("url") if signed else None
+
     if items:
         signed_list = await asyncio.gather(
-            *(sign_url(item.storage_key) for item in items),
+            *(download_url_for(item) for item in items),
             return_exceptions=False,
         )
         download_urls = {item.id: url for item, url in zip(items, signed_list)}

@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { UploadCloud, CheckCircle2, FileImage, X, AlertCircle } from 'lucide-react';
+import { UploadCloud, CheckCircle2, FileImage, X, AlertCircle, ChevronDown } from 'lucide-react';
 import { apiGet, apiPost } from '../services/api';
 import {
   GooglePhotosAuthUrlResponse,
@@ -35,6 +35,7 @@ export const UploadManager: React.FC = () => {
   const [selectedItems, setSelectedItems] = useState<GooglePhotosPickerItem[]>([]);
   const [selectedLoading, setSelectedLoading] = useState(false);
   const [selectedError, setSelectedError] = useState<string | null>(null);
+  const [detailsOpen, setDetailsOpen] = useState(true);
 
   const inferItemType = (file: File) => {
     if (file.type.startsWith('image/')) return 'photo';
@@ -193,22 +194,21 @@ export const UploadManager: React.FC = () => {
     }
   };
 
-  const loadPickerSelection = async () => {
+  const fetchPickerSelection = async () => {
     if (!pickerSessionId) {
       setSelectedError('Start a picker session before loading selections.');
-      return;
+      return 0;
     }
-    setSelectedLoading(true);
     setSelectedError(null);
     try {
       const response = await apiGet<GooglePhotosPickerItemsResponse>(
         `/integrations/google/photos/picker-items?session_id=${encodeURIComponent(pickerSessionId)}`
       );
       setSelectedItems(response.items);
+      return response.items.length;
     } catch (err) {
       setSelectedError(err instanceof Error ? err.message : 'Failed to load picker selections.');
-    } finally {
-      setSelectedLoading(false);
+      return 0;
     }
   };
 
@@ -236,6 +236,35 @@ export const UploadManager: React.FC = () => {
     void loadGoogleStatus();
     void loadRecentItems();
   }, []);
+
+  useEffect(() => {
+    if (!pickerSessionId) return;
+
+    let cancelled = false;
+    let attempts = 0;
+    setSelectedItems([]);
+    setSelectedLoading(true);
+    setSelectedError(null);
+
+    const pollSelection = async () => {
+      attempts += 1;
+      const count = await fetchPickerSelection();
+      if (cancelled) return;
+      if (count > 0 || attempts >= 10) {
+        setSelectedLoading(false);
+        window.clearInterval(intervalId);
+      }
+    };
+
+    const intervalId = window.setInterval(pollSelection, 2000);
+    void pollSelection();
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+      setSelectedLoading(false);
+    };
+  }, [pickerSessionId]);
 
   const formatGoogleStatus = () => {
     if (!googleStatus?.connected) {
@@ -347,150 +376,132 @@ export const UploadManager: React.FC = () => {
         <div className="space-y-4">
           <h2 className="text-lg font-semibold text-slate-800">Connected Sources</h2>
           
-          <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex items-center justify-between">
-            <div className="flex items-center space-x-3">
-              <div className="w-10 h-10 bg-blue-50 rounded-lg flex items-center justify-center">
-                 <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/c/c1/Google_%22G%22_logo.svg/768px-Google_%22G%22_logo.svg.png" className="w-5 h-5" alt="Google" />
+          <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-3">
+                <div className="w-10 h-10 bg-blue-50 rounded-lg flex items-center justify-center">
+                   <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/c/c1/Google_%22G%22_logo.svg/768px-Google_%22G%22_logo.svg.png" className="w-5 h-5" alt="Google" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-medium text-slate-900">Google Photos</h3>
+                  <p className={`text-xs flex items-center ${googleStatus?.connected ? 'text-green-600' : 'text-slate-500'}`}>
+                    {googleStatus?.connected ? (
+                      <CheckCircle2 size={12} className="mr-1" />
+                    ) : (
+                      <AlertCircle size={12} className="mr-1" />
+                    )}
+                    {googleLoading ? 'Checking status...' : formatGoogleStatus()}
+                  </p>
+                </div>
               </div>
-              <div>
-                <h3 className="text-sm font-medium text-slate-900">Google Photos</h3>
-                <p className={`text-xs flex items-center ${googleStatus?.connected ? 'text-green-600' : 'text-slate-500'}`}>
-                  {googleStatus?.connected ? (
-                    <CheckCircle2 size={12} className="mr-1" />
-                  ) : (
-                    <AlertCircle size={12} className="mr-1" />
-                  )}
-                  {googleLoading ? 'Checking status...' : formatGoogleStatus()}
-                </p>
-              </div>
-            </div>
-            <div className="flex items-center gap-2">
-              <button
-                className="text-xs border border-slate-200 px-3 py-1.5 rounded-md hover:bg-slate-50 disabled:opacity-50"
-                onClick={handleGoogleConnect}
-                disabled={googleLoading}
-              >
-                {googleStatus?.connected ? 'Reconnect' : 'Connect'}
-              </button>
-              <button
-                className="text-xs bg-primary-600 text-white px-3 py-1.5 rounded-md hover:bg-primary-700 disabled:opacity-50"
-                onClick={handleGooglePicker}
-                disabled={!googleStatus?.connected || pickerLoading}
-              >
-                {pickerLoading ? 'Opening...' : 'Select photos'}
-              </button>
-            </div>
-          </div>
-          {googleError && (
-            <div className="text-xs text-red-600">{googleError}</div>
-          )}
-          {pickerError && (
-            <div className="text-xs text-red-600">{pickerError}</div>
-          )}
-          {googleStatus?.connected && (
-            <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-xs text-slate-600 space-y-2">
-              <p>Select photos in the Google Picker, then start ingestion below.</p>
-              <p>Already ingested items are skipped automatically during sync.</p>
-              <div className="flex flex-wrap items-center gap-2">
+              <div className="flex items-center gap-2">
                 <button
-                  className="text-xs border border-slate-300 px-3 py-1.5 rounded-md hover:bg-white disabled:opacity-50"
-                  onClick={loadPickerSelection}
-                  disabled={selectedLoading || !pickerSessionId}
+                  className="text-xs border border-slate-200 px-3 py-1.5 rounded-md hover:bg-slate-50 disabled:opacity-50"
+                  onClick={handleGoogleConnect}
+                  disabled={googleLoading}
+                  type="button"
                 >
-                  {selectedLoading ? 'Loading selection...' : 'Load selection'}
+                  {googleStatus?.connected ? 'Reconnect' : 'Connect'}
                 </button>
-                {selectedItems.length > 0 && (
-                  <span className="text-slate-500">Selected {selectedItems.length} photos</span>
+                <button
+                  className="text-xs bg-primary-600 text-white px-3 py-1.5 rounded-md hover:bg-primary-700 disabled:opacity-50"
+                  onClick={handleGooglePicker}
+                  disabled={!googleStatus?.connected || pickerLoading}
+                  type="button"
+                >
+                  {pickerLoading ? 'Opening...' : 'Select photos'}
+                </button>
+              </div>
+            </div>
+
+            {googleError && (
+              <div className="text-xs text-red-600 mt-2">{googleError}</div>
+            )}
+            {pickerError && (
+              <div className="text-xs text-red-600 mt-2">{pickerError}</div>
+            )}
+
+            {googleStatus?.connected && (
+              <div className="mt-4 border border-slate-200 rounded-lg">
+                <button
+                  type="button"
+                  onClick={() => setDetailsOpen((open) => !open)}
+                  className="w-full flex items-center justify-between px-3 py-2 text-sm font-medium text-slate-800"
+                  aria-expanded={detailsOpen}
+                >
+                  <span>Google Photos ingestion details</span>
+                  <ChevronDown
+                    className={`w-4 h-4 transition-transform ${detailsOpen ? 'rotate-180' : ''}`}
+                  />
+                </button>
+                {detailsOpen && (
+                  <div className="border-t border-slate-200 bg-slate-50 rounded-b-lg p-3 text-xs text-slate-600 space-y-3">
+                    <div className="space-y-1">
+                      <p className="text-sm text-slate-800 font-medium">Select photos in Google Picker</p>
+                      <p>Selections refresh automatically after you finish picking. Already ingested items are skipped during sync.</p>
+                      <div className="flex items-center gap-3">
+                        <span className="text-slate-700 font-medium">
+                          {selectedLoading ? 'Loading selection...' : `Selected ${selectedItems.length} photos`}
+                        </span>
+                        {!pickerSessionId && <span className="text-slate-500">Open the picker to start a selection.</span>}
+                      </div>
+                      {selectedError && <p className="text-xs text-red-600">{selectedError}</p>}
+                      <button
+                        className="text-xs bg-slate-900 text-white px-3 py-1.5 rounded-md hover:bg-slate-800 disabled:opacity-50"
+                        onClick={handleGoogleSync}
+                        disabled={syncLoading || !pickerSessionId}
+                        type="button"
+                      >
+                        {syncLoading ? 'Queueing sync...' : 'Ingest selected photos'}
+                      </button>
+                      {syncMessage && <p className="text-green-600">{syncMessage}</p>}
+                      {!pickerSessionId && <p className="text-slate-500">Waiting for picker selection.</p>}
+                    </div>
+
+                    <div className="border-t border-slate-200 pt-3">
+                      <div className="flex items-center justify-between">
+                        <p className="text-sm text-slate-800 font-medium">Recently ingested from Google Photos</p>
+                        <button
+                          className="text-xs text-slate-500 hover:text-slate-700"
+                          onClick={loadRecentItems}
+                          type="button"
+                        >
+                          Refresh
+                        </button>
+                      </div>
+                      {recentError && <p className="text-xs text-red-600">{recentError}</p>}
+                      {recentItems.length === 0 && !recentError ? (
+                        <p className="text-xs text-slate-500">No recent items yet.</p>
+                      ) : (
+                        <ul className="space-y-2 text-xs text-slate-600 mt-2">
+                          {recentItems.map((item) => (
+                            <li key={item.id} className="flex items-start gap-2">
+                              <CheckCircle2 className="w-4 h-4 text-green-600 mt-0.5" />
+                              {item.item_type === 'photo' && item.download_url ? (
+                                <img
+                                  src={item.download_url}
+                                  alt={item.original_filename || 'Google Photos thumbnail'}
+                                  className="w-12 h-12 rounded-md object-cover border border-slate-200"
+                                />
+                              ) : null}
+                              <div>
+                                <p className="text-slate-800 font-medium">
+                                  {item.original_filename || item.storage_key}
+                                </p>
+                                <p className="text-slate-500">
+                                  {item.captured_at ? new Date(item.captured_at).toLocaleString() : 'Unknown date'}
+                                </p>
+                              </div>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  </div>
                 )}
               </div>
-              {selectedError && <p className="text-xs text-red-600">{selectedError}</p>}
-              {selectedItems.length > 0 && (
-                <div className="flex flex-wrap gap-2">
-                  {selectedItems.slice(0, 6).map((item) =>
-                    item.base_url ? (
-                      <img
-                        key={item.id}
-                        src={item.base_url}
-                        alt={item.filename || 'Selected Google photo'}
-                        className="w-12 h-12 rounded-md object-cover border border-slate-200"
-                      />
-                    ) : null
-                  )}
-                </div>
-              )}
-              <button
-                className="text-xs bg-slate-900 text-white px-3 py-1.5 rounded-md hover:bg-slate-800 disabled:opacity-50"
-                onClick={handleGoogleSync}
-                disabled={syncLoading || !pickerSessionId}
-              >
-                {syncLoading ? 'Queueing sync...' : 'Ingest selected photos'}
-              </button>
-              {syncMessage && <p className="text-green-600">{syncMessage}</p>}
-              {!pickerSessionId && <p className="text-slate-500">Waiting for picker selection.</p>}
-            </div>
-          )}
-          <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="text-sm font-medium text-slate-900">Recently ingested</h3>
-              <button
-                className="text-xs text-slate-500 hover:text-slate-700"
-                onClick={loadRecentItems}
-                type="button"
-              >
-                Refresh
-              </button>
-            </div>
-            {recentError && <p className="text-xs text-red-600">{recentError}</p>}
-            {recentItems.length === 0 && !recentError ? (
-              <p className="text-xs text-slate-500">No recent items yet.</p>
-            ) : (
-              <ul className="space-y-2 text-xs text-slate-600">
-                {recentItems.map((item) => (
-                  <li key={item.id} className="flex items-start gap-2">
-                    <CheckCircle2 className="w-4 h-4 text-green-600 mt-0.5" />
-                    {item.item_type === 'photo' && item.download_url ? (
-                      <img
-                        src={item.download_url}
-                        alt={item.original_filename || 'Google Photos thumbnail'}
-                        className="w-12 h-12 rounded-md object-cover border border-slate-200"
-                      />
-                    ) : null}
-                    <div>
-                      <p className="text-slate-800 font-medium">
-                        {item.original_filename || item.storage_key}
-                      </p>
-                      <p className="text-slate-500">
-                        {item.captured_at ? new Date(item.captured_at).toLocaleString() : 'Unknown date'}
-                      </p>
-                    </div>
-                  </li>
-                ))}
-              </ul>
             )}
           </div>
-
-          <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex items-center justify-between">
-            <div className="flex items-center space-x-3">
-              <div className="w-10 h-10 bg-slate-50 rounded-lg flex items-center justify-center text-slate-800">
-                <svg className="w-6 h-6" viewBox="0 0 24 24" fill="currentColor"><path d="M17.05 20.28c-.98.95-2.05.88-3.08.4-.55-.26-1.1-.5-1.68-.5-.59 0-1.18.26-1.74.52-1 .47-2.04.53-3.03-.43-1.6-1.57-2.8-4.44-1.16-7.29 1.1-1.91 3.03-2.14 4.09-2.16 1.05-.03 2 .69 2.65.69.64 0 1.83-.87 3.08-.73 1.3.06 2.3.52 3 1.54-2.6 1.56-2.17 4.75.47 5.92-.58 1.48-1.4 2.94-2.6 4.04zm-4.14-15.65c1.1-1.34 1.85-3.2 1.66-4.63-1.6.06-3.52 1.07-4.66 2.43-.97 1.14-1.81 2.97-1.59 4.7 1.78.14 3.6-1.15 4.59-2.5z"/></svg>
-              </div>
-              <div>
-                <h3 className="text-sm font-medium text-slate-900">iCloud Photos</h3>
-                <p className="text-xs text-slate-500 flex items-center">
-                  <AlertCircle size={12} className="mr-1" />
-                  Action required
-                </p>
-              </div>
-            </div>
-            <button className="text-xs bg-slate-900 text-white px-3 py-1.5 rounded-md hover:bg-slate-800">
-              Connect
-            </button>
-          </div>
-
-          <div className="bg-slate-50 p-4 rounded-xl border border-dashed border-slate-300 flex items-center justify-center text-slate-400 cursor-pointer hover:bg-slate-100 hover:text-slate-500 transition-colors">
-            <span className="text-xs font-medium">+ Add new source</span>
-          </div>
-
         </div>
       </div>
     </div>

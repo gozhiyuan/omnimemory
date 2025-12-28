@@ -74,8 +74,6 @@ async def _fetch_item_blob(session, storage, item: SourceItem) -> bytes:
 
 async def _process_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     storage = get_storage_provider()
-    remote_only = bool(payload.get("remote_only"))
-
     try:
         item_id = UUID(str(payload["item_id"]))
     except (KeyError, ValueError) as exc:  # pragma: no cover - validation guard
@@ -102,14 +100,8 @@ async def _process_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         await session.flush()
 
         try:
-            if remote_only:
-                # Remote-only sources avoid storing blobs in object storage.
-                blob = b""
-            else:
-                blob = await _fetch_item_blob(session, storage, item)
+            blob = await _fetch_item_blob(session, storage, item)
             metadata = _extract_metadata(blob, payload)
-            if remote_only:
-                metadata["remote_only"] = True
             caption = _generate_caption(item, metadata)
             transcription = _generate_transcription(item)
             ocr = _generate_ocr(item)

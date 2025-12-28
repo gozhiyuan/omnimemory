@@ -6,8 +6,16 @@ import { Timeline } from './components/Timeline';
 import { UploadManager } from './components/UploadManager';
 import { View } from './types';
 
+const getInitialView = (): View => {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('integration') === 'google_photos') {
+    return 'upload';
+  }
+  return 'timeline';
+};
+
 const App: React.FC = () => {
-  const [currentView, setCurrentView] = useState<View>('timeline');
+  const [currentView, setCurrentView] = useState<View>(getInitialView);
 
   const renderContent = () => {
     switch (currentView) {

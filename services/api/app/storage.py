@@ -28,6 +28,9 @@ class StorageProvider(Protocol):
     def fetch(self, key: str) -> bytes:
         ...
 
+    def store(self, key: str, data: bytes, content_type: str) -> None:
+        ...
+
 
 @dataclass
 class MemoryStorageProvider(StorageProvider):
@@ -50,7 +53,7 @@ class MemoryStorageProvider(StorageProvider):
         logger.info("MemoryStorageProvider fetch called for key={}", key)
         return self.objects.get(key, b"")
 
-    def store(self, key: str, data: bytes) -> None:
+    def store(self, key: str, data: bytes, content_type: str) -> None:
         logger.info("MemoryStorageProvider store called for key={} size={}", key, len(data))
         self.objects[key] = data
 
@@ -195,6 +198,26 @@ class SupabaseStorageProvider(StorageProvider):
         resp = httpx.get(url, headers=headers, timeout=30)
         resp.raise_for_status()
         return resp.content
+
+    def store(self, key: str, data: bytes, content_type: str) -> None:
+        if not self.settings.supabase_url or not self.settings.supabase_service_role_key:
+            raise RuntimeError("Supabase credentials not configured")
+
+        object_path = self._encode_object_key(key)
+        base_url = str(self.settings.supabase_url).rstrip("/")
+        url = f"{base_url}/storage/v1/object/{self.settings.bucket_originals}/{object_path}"
+        headers = {
+            "apikey": self.settings.supabase_service_role_key,
+            "Authorization": f"Bearer {self.settings.supabase_service_role_key}",
+            "Content-Type": content_type,
+            "x-upsert": "true",
+        }
+        resp = httpx.post(url, headers=headers, content=data, timeout=60)
+        if resp.status_code >= 400:
+            logger.error(
+                "Supabase upload failed status={} body={}", resp.status_code, resp.text
+            )
+        resp.raise_for_status()
 
 
 @lru_cache(maxsize=1)

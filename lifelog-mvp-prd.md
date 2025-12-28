@@ -9,7 +9,7 @@
 
 Build an AI-powered personal memory assistant that ingests multimodal data from 3rd-party sources and user uploads, processes and organizes it into a queryable knowledge base, and provides conversational access through a web-based chat interface.
 
-**MVP Scope (8-12 weeks):** React + Vite single-page web app (tabs: Dashboard, Timeline, Chat, Ingest) backed by FastAPI + Celery, focusing on manual uploads, Google Photos sync, the ingestion pipeline, timeline/day summaries, and RAG-powered chat.
+**MVP Scope (8-12 weeks):** React + Vite single-page web app (tabs: Dashboard, Timeline, Chat, Ingest) backed by FastAPI + Celery, focusing on manual uploads, Google Photos picker-based ingest, the ingestion pipeline, timeline/day summaries, and RAG-powered chat.
 
 ---
 
@@ -41,8 +41,7 @@ Build an AI-powered personal memory assistant that ingests multimodal data from 
 
 **3.1 Data Layer**
 - Manual upload (drag-and-drop or folder selection) for photos, videos, and audio files with batch support
-- Google Photos connector (OAuth) that performs a full historical backfill after the user authorizes, persists encrypted refresh tokens, and runs automated daily delta syncs through Celery beat
-- Background ingestion monitors (Celery workers) track last-sync timestamps per connection and enqueue new media for processing/embedding whenever Google Photos adds new assets
+- Google Photos connector (OAuth + Picker API): user launches the picker, selects items, we copy the chosen media into Supabase Storage for rendering, and enqueue ingestion; no automated full-library/delta sync (API limitation)
 - Metadata extraction: timestamp, EXIF, location, file type, source, album references
 - Deduplication logic (combine SHA256 + perceptual hash + EXIF heuristics to catch resized/edited duplicates) so manual uploads and Google imports do not create duplicate events
 
@@ -68,7 +67,7 @@ Build an AI-powered personal memory assistant that ingests multimodal data from 
 
 **3.5 Application Layer (Web Only)**
 - User authentication (Supabase Auth: email/password + Google OAuth) gating a single React + Vite SPA shell (`Layout` + `App.tsx` view switcher)
-- **Ingest Tab:** Combined drag-and-drop upload interface and Google Photos connection card with OAuth popup, sync state, and manual retry controls
+- **Ingest Tab:** Combined drag-and-drop upload interface and Google Photos connection card with OAuth + Picker launch, selection count, and ingest status
 - **Chat Tab:** Conversational UI with memory-powered responses, source citations, and daily summary context chips
 - **Timeline Tab:** Calendar/timeline visualization of per-day events; clicking a day opens a detail drawer with summaries, thumbnails, video clips, and external (Google Photos) deep links
 - **Dashboard Tab:** Weekly/monthly summaries, ingestion statistics, storage usage, and connected-source health indicators
@@ -88,7 +87,8 @@ Build an AI-powered personal memory assistant that ingests multimodal data from 
 - Desktop capture agent
 - Automated screenshot/video capture
 - Vlog generation
-- Additional connectors beyond Google Photos (Apple Photos via export/agent, Google Drive, Oura Ring, Spotify, etc.)
+- Automated Google Photos full-library backfill/delta sync (Picker API does not allow it)
+- Additional connectors beyond Google Photos (Apple Photos export/agent, Google Drive, Oura Ring, Spotify, etc.)
 - IoT/device ingestion (e.g., ESP32 camera uploading periodic snapshots)
 - Shareable mini-chatbots
 - Advanced graph visualizations
@@ -102,50 +102,37 @@ Build an AI-powered personal memory assistant that ingests multimodal data from 
 
 #### Problem: How to handle 3rd-party data ingestion?
 
-**Recommendation:** Full historical fetch + incremental sync
+**Current approach (MVP):** Picker-based, user-selected Google Photos ingest
 
 **Rationale:**
-1. **Full control:** Store all data in your DB for fast queries, no API rate limits during user queries
-2. **Avoid reprocessing:** Process once, query many times
-3. **Consistency:** Single source of truth for all memory operations
-4. **Cost-effective:** One-time processing cost vs. repeated API calls
+1. **API constraint:** Google Photos API does not allow unattended full-library sync; Picker requires user selection.
+2. **Reliable rendering:** Copying selected items into Supabase Storage avoids expired Google URLs and enables signed delivery in the app.
+3. **Deterministic ingestion:** User explicitly chooses what to ingest; dedupe skips already imported media IDs.
 
 **Implementation Pattern:**
 
 ```
-Initial Sync (One-time):
-1. User connects Google Photos via OAuth
-2. Backend job fetches ALL photos metadata (photo_id, timestamp, location, albums)
-3. For each photo:
-   - Download to temp storage
-   - Extract metadata
-   - Process (caption, OCR, embed)
-   - Store processed data + embeddings
-   - Store reference to original in 3rd party (for display)
-   - Delete temp file
-4. Mark sync complete, store last_sync_timestamp
-
-Incremental Sync (Daily):
-1. Cron job triggers daily sync for each connected source
-2. Query 3rd party API for items modified_since last_sync_timestamp
-3. Process only new/updated items
-4. Update last_sync_timestamp
+User-driven ingest (per picker session):
+1. User connects Google Photos via OAuth, then opens the Picker.
+2. Picker returns selected media IDs; backend fetches bytes for those items.
+3. Copy media to Supabase Storage (previews/original as configured) and create source_item records.
+4. Enqueue processing (captions/OCR/embeddings) and emit timeline entries.
 ```
 
-> **Note:** Additional connectors (Apple Photos, Notion, social feeds) will reuse this pattern post-MVP. Their auth/data handling is out of current scope but should mirror the Google Photos model (token storage, last-sync tracking, Celery-driven backfill + delta jobs).
+> **Note:** Automated backfill/delta sync is blocked by the Picker API. To achieve passive ingestion later, consider an additional capture path (e.g., ESP32 camera agent) or future connector work once API/permissions allow.
 
 **Storage Strategy:**
-- **Metadata only:** Store photo URLs, IDs, timestamps in your DB
+- **Metadata only:** Store photo IDs, timestamps, and provider metadata in your DB
 - **Processed artifacts:** Store captions, embeddings, OCR text in your DB
-- **Original files:** Keep in 3rd party (Google Photos) for display, or selectively cache thumbnails
+- **Original files:** For Google Photos picker selections, copy media into Supabase Storage (preview/original as needed) so the app can render reliably; keep provider IDs for dedupe
 
 #### Storage Policy (MVP)
 
 Objectives: minimize storage cost, avoid duplicate originals, ensure fast UX with thumbnails/previews, and keep derived artifacts for retrieval.
 
-- Google Photos
-  - Do not mirror originals. Store metadata, IDs/URLs, small thumbnails you control, and all derived artifacts (captions/OCR/transcripts/embeddings).
-  - Fetch full-resolution only on explicit user request; optionally cache mid‑res previews.
+- Google Photos (Picker)
+  - Mirror user-selected items into Supabase Storage for thumbnails/timeline playback; keep provider IDs to avoid duplicate ingests.
+  - Fetch only selected items; full-library or unattended delta sync is out-of-scope/blocked by API.
 - Future connectors (Apple Photos, Notion, others) follow the same rule set once implemented, but are deferred until after the MVP.
 
 - Manual Uploads
@@ -484,7 +471,7 @@ def route_query(query: str) -> dict:
 
 | Source | Long-term memory (embed + store) | Live MCP usage |
 |--------|----------------------------------|----------------|
-| Google Photos | Backfill metadata, captions, OCR, embeddings for semantic recall | Fetch newest uploads not yet synced, or full-res media on demand |
+| Google Photos | Ingest user-selected Picker items; store metadata/captions/OCR/embeddings and Supabase copies for rendering | Fetch full-res on demand for already-selected items |
 | Google Maps | Ingest timeline events + places into structured events and embeddings | "Where am I now", live navigation/traffic, current ETA |
 | Spotify | Ingest listening history, playlists, artist metadata, embeddings | "What is playing now", control playback, latest queue |
 | Oura Ring | Ingest daily aggregates (sleep, readiness, activity) into structured tables | "Current readiness", today's live metrics before nightly sync |
@@ -788,12 +775,12 @@ GET    /api/v1/events/:id               # Get event details
 
 ## 6. Data Flow Diagrams
 
-### Initial Data Sync Flow
+### Google Photos Picker Ingest Flow
 
 ```
 [User] → [Web UI: Connect Google Photos]
            ↓
-[Frontend] → [API: POST /connections]
+[Frontend] → [API: GET /integrations/google/photos/auth-url]
            ↓
 [API] → [Initiate OAuth Flow] → [Google OAuth]
            ↓
@@ -801,19 +788,21 @@ GET    /api/v1/events/:id               # Get event details
            ↓
 [API] → [Store encrypted token in DB]
            ↓
-[API] → [Queue: sync_google_photos task]
+[User] → [Web UI: Open Google Picker]
            ↓
-[Celery Worker] → [Google Photos API: List all photos]
+[Frontend] → [API: POST /integrations/google/photos/picker-session]
            ↓
-[Celery Worker] → [For each photo:]
-                    ├→ [Create source_items record]
-                    ├→ [Queue: process_item task]
-                    └→ [Update sync progress]
+[Picker UI] → [User selects items] → [Picker returns session + media IDs]
+           ↓
+[API] → [Fetch selected media bytes]
+           ↓
+[API] → [Copy to Supabase Storage] → [Create source_items]
+           ↓
+[API] → [Queue: process_item task]
            ↓
 [Celery Worker] → [process_item task]
-                    ├→ [Download photo]
                     ├→ [Extract EXIF metadata]
-                    ├→ [Run captioning (GPT-4V)]
+                    ├→ [Run captioning (GPT-4V/Gemini)]
                     ├→ [Run OCR if text detected]
                     ├→ [Generate embedding]
                     ├→ [Store in processed_content]
@@ -875,9 +864,9 @@ GET    /api/v1/events/:id               # Get event details
 
 ### Week 3-4: Data Ingestion
 - [ ] Implement batch upload endpoint + UI
-- [ ] Build Google Photos OAuth integration
-- [ ] Create full sync job for Google Photos
-- [ ] Implement incremental sync logic
+- [ ] Build Google Photos OAuth + Picker integration (connect, launch picker, poll selection)
+- [ ] Fetch selected Google Photos items, copy to Supabase Storage, and queue ingest (no automated full-library sync)
+- [ ] Deduplicate by provider media ID to avoid reprocessing the same selection
 - [ ] Defer additional connectors (Google Drive, Oura, Apple Photos, etc.) until post-MVP
 - [ ] Create processing pipeline (Celery tasks):
   - [ ] Image captioning

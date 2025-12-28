@@ -28,6 +28,10 @@ def configure_celery() -> None:
                 "task": "health.ping",
                 "schedule": 60.0,
             },
+            "google-photos-sync": {
+                "task": "integrations.google_photos.sync",
+                "schedule": 3600.0,
+            },
             "lifecycle-cleanup": {
                 "task": "maintenance.cleanup",
                 "schedule": 3600.0,
@@ -53,4 +57,3 @@ def ping() -> str:
     """Simple ping task for monitoring."""
 
     return "pong"
-

@@ -8,12 +8,24 @@ from typing import Optional
 from urllib.parse import urlencode, urljoin
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from secrets import token_urlsafe
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
+from ..db.models import DEFAULT_TEST_USER_ID, DataConnection
+from ..db.session import get_session
+from ..google_photos import (
+    create_picker_session,
+    extract_picker_media_fields,
+    fetch_picker_media_items,
+    get_valid_access_token,
+    store_google_photos_tokens,
+)
+from ..tasks.google_photos import sync_google_photos_media
 
 
 router = APIRouter()
@@ -44,27 +56,7 @@ class OAuthStateStore:
         return True
 
 
-@dataclass
-class TokenRecord:
-    access_token: str
-    refresh_token: Optional[str]
-    expires_at: Optional[datetime]
-    connected_at: datetime
-
-
-class TokenStore:
-    def __init__(self) -> None:
-        self._record: Optional[TokenRecord] = None
-
-    def store(self, record: TokenRecord) -> None:
-        self._record = record
-
-    def get(self) -> Optional[TokenRecord]:
-        return self._record
-
-
 state_store = OAuthStateStore()
-token_store = TokenStore()
 
 
 class AuthUrlResponse(BaseModel):
@@ -76,6 +68,32 @@ class StatusResponse(BaseModel):
     connected: bool
     connected_at: Optional[datetime] = None
     expires_at: Optional[datetime] = None
+
+
+class SyncResponse(BaseModel):
+    task_id: str
+    status: str = "queued"
+
+
+class SyncRequest(BaseModel):
+    session_id: Optional[str] = None
+
+
+class PickerSessionResponse(BaseModel):
+    session_id: str
+    picker_uri: str
+
+
+class PickerMediaItem(BaseModel):
+    id: str
+    base_url: Optional[str] = None
+    filename: Optional[str] = None
+    mime_type: Optional[str] = None
+    creation_time: Optional[str] = None
+
+
+class PickerMediaResponse(BaseModel):
+    items: list[PickerMediaItem]
 
 
 def _ensure_google_photos_config() -> None:
@@ -110,15 +128,17 @@ async def get_google_photos_auth_url() -> AuthUrlResponse:
 
 
 @router.get("/integrations/google/photos/status", response_model=StatusResponse)
-async def get_google_photos_status() -> StatusResponse:
-    record = token_store.get()
-    if not record:
+async def get_google_photos_status(session: AsyncSession = Depends(get_session)) -> StatusResponse:
+    connection = await _get_google_photos_connection(session)
+    if not connection:
         return StatusResponse(connected=False)
-    return StatusResponse(
-        connected=True,
-        connected_at=record.connected_at,
-        expires_at=record.expires_at,
-    )
+
+    config = connection.config or {}
+    connected_at = _parse_timestamp(config.get("connected_at"))
+    expires_at = _parse_timestamp(config.get("expires_at"))
+    if not config.get("access_token"):
+        return StatusResponse(connected=False)
+    return StatusResponse(connected=True, connected_at=connected_at, expires_at=expires_at)
 
 
 @router.get("/integrations/google/photos/callback")
@@ -126,6 +146,7 @@ async def google_photos_callback(
     code: Optional[str] = None,
     state: Optional[str] = None,
     error: Optional[str] = None,
+    session: AsyncSession = Depends(get_session),
 ) -> RedirectResponse:
     _ensure_google_photos_config()
     if error:
@@ -148,14 +169,7 @@ async def google_photos_callback(
     if token_data.get("expires_in"):
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(token_data["expires_in"]))
 
-    token_store.store(
-        TokenRecord(
-            access_token=access_token,
-            refresh_token=token_data.get("refresh_token"),
-            expires_at=expires_at,
-            connected_at=datetime.now(timezone.utc),
-        )
-    )
+    await store_google_photos_tokens(session, token_data, access_token, expires_at)
 
     destination = _build_web_redirect("connected", None)
     return RedirectResponse(destination)
@@ -184,3 +198,94 @@ def _build_web_redirect(status: str, detail: Optional[str]) -> str:
         params["detail"] = detail
     return urljoin(base_url, f"?{urlencode(params)}")
 
+
+@router.post("/integrations/google/photos/sync", response_model=SyncResponse)
+async def sync_google_photos(request: SyncRequest) -> SyncResponse:
+    task = sync_google_photos_media.delay(session_id=request.session_id)
+    return SyncResponse(task_id=task.id)
+
+
+@router.post("/integrations/google/photos/picker-session", response_model=PickerSessionResponse)
+async def start_google_photos_picker(
+    session: AsyncSession = Depends(get_session),
+) -> PickerSessionResponse:
+    _ensure_google_photos_config()
+    connection = await _get_google_photos_connection(session)
+    if not connection:
+        raise HTTPException(status_code=404, detail="Google Photos connection not found.")
+    access_token = await get_valid_access_token(session, connection)
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Google Photos token missing or expired.")
+
+    try:
+        session_id, picker_uri = await create_picker_session(access_token)
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Failed to create Google Photos picker session. "
+                "Ensure the Google Photos Picker API is enabled and the OAuth client is authorized. "
+                f"Details: {exc}"
+            ),
+        ) from exc
+    config = dict(connection.config or {})
+    config["picker_session_id"] = session_id
+    config["picker_session_created_at"] = datetime.now(timezone.utc).isoformat()
+    connection.config = config
+    connection.updated_at = datetime.now(timezone.utc)
+    await session.commit()
+    return PickerSessionResponse(session_id=session_id, picker_uri=picker_uri)
+
+
+@router.get("/integrations/google/photos/picker-items", response_model=PickerMediaResponse)
+async def get_google_photos_picker_items(
+    session_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> PickerMediaResponse:
+    _ensure_google_photos_config()
+    connection = await _get_google_photos_connection(session)
+    if not connection:
+        raise HTTPException(status_code=404, detail="Google Photos connection not found.")
+    access_token = await get_valid_access_token(session, connection)
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Google Photos token missing or expired.")
+    try:
+        items = await fetch_picker_media_items(access_token, session_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch picker items: {exc}") from exc
+
+    mapped: list[PickerMediaItem] = []
+    for item in items:
+        item_id = item.get("id")
+        if not item_id:
+            continue
+        base_url, filename, mime_type, creation_time = extract_picker_media_fields(item)
+        mapped.append(
+            PickerMediaItem(
+                id=item_id,
+                base_url=base_url,
+                filename=filename,
+                mime_type=mime_type,
+                creation_time=creation_time,
+            )
+        )
+    return PickerMediaResponse(items=mapped)
+
+
+async def _get_google_photos_connection(session: AsyncSession) -> Optional[DataConnection]:
+    result = await session.execute(
+        select(DataConnection).where(
+            DataConnection.user_id == DEFAULT_TEST_USER_ID,
+            DataConnection.provider == "google_photos",
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None

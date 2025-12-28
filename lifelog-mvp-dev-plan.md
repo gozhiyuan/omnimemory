@@ -191,7 +191,7 @@
 
 ### Objectives
 - Implement file upload with progress tracking
-- Build Google Photos integration
+- Build Google Photos ingestion via Picker (manual selection only)
 - Create processing pipeline for images
 - Store processed data in vector database
 
@@ -240,38 +240,14 @@
 - [ ] Show thumbnail previews before upload
 - [ ] Display upload status (pending/processing/completed/failed)
 
-**Google Photos Integration**
+**Google Photos Integration (Picker-based)**
 - [ ] Set up Google Cloud Project & enable Photos API
-- [ ] Implement OAuth flow:
-  ```python
-  @app.get("/api/v1/connections/google-photos/oauth")
-  async def google_photos_oauth(user: User = Depends(get_current_user)):
-      # Generate OAuth URL
-      return {"auth_url": oauth_url}
-  
-  @app.get("/api/v1/connections/google-photos/callback")
-  async def google_photos_callback(code: str, user: User):
-      # Exchange code for token
-      # Encrypt and store token
-      # Queue initial sync task
-      return {"status": "connected"}
-  ```
-- [ ] Create OAuth frontend flow with popup window
-- [ ] Build sync task:
-  ```python
-  @celery.task
-  def sync_google_photos(connection_id: str):
-      # Get OAuth token
-      # Paginate through all photos
-      # For each photo:
-      #   - Create source_item record
-      #   - Queue process_item task
-      # Update last_sync_at
-  ```
-- [ ] Implement pagination handling (Google Photos API returns 50 items/page)
-- [ ] Add sync status tracking in UI
-- [ ] Wire Celery Beat to enqueue `sync_google_photos` nightly (or more frequently) per connected account so new media land in the ingest queue without manual action
-- [ ] Persist Google media IDs + album references so timeline/day-summary queries can deep-link to original Google Photos items when the user opens details
+- [ ] Implement OAuth flow + picker session endpoints (start session, poll selected items)
+- [ ] Frontend: OAuth connect + Google Picker launch; automatically poll selection count after picker closes
+- [ ] Ingest flow: user-selected items only (Picker API limitation); no background/full-library sync
+- [ ] Fetch selected media bytes and copy into Supabase Storage so thumbnails/timeline can render without hotlinking Google URLs
+- [ ] Queue ingest per selected item (`/upload/ingest`), skipping already ingested IDs
+- [ ] Track picker session + ingest status in UI; surface recent Google Photos ingests
 
 **Image Processing Pipeline**
 - [ ] Create `process_item` Celery task:
@@ -439,7 +415,8 @@ def process_item(item_id: str):
 
 ### Deliverables
 - ✅ User can upload 100+ mixed media items (photos/videos/audio) at once
-- ✅ Users can connect Google Photos and Apple Photos accounts with automated backfill + delta sync
+- ✅ Users can connect Google Photos via Picker, select items, and ingest them (no automated full-library/delta sync via API)
+- ✅ Selected Google Photos are copied into Supabase Storage so thumbnails/timeline render reliably; processed artifacts land in Qdrant + Supabase
 - ✅ Video keyframes/transcripts and audio diarization are generated and searchable
 - ✅ Processed data (captions, transcripts, embeddings) is stored in Qdrant + Supabase
 - ✅ Sync + processing status, throughput, and cost telemetry are visible in monitoring dashboard

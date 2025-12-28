@@ -1,6 +1,5 @@
 """Celery task modules."""
 
-from . import process_item  # noqa: F401
+from . import google_photos, process_item  # noqa: F401
 
-__all__ = ["process_item"]
-
+__all__ = ["google_photos", "process_item"]

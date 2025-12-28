@@ -7,13 +7,15 @@ from datetime import datetime
 from typing import Any, Dict
 from uuid import UUID
 
+import httpx
 from loguru import logger
 from sqlalchemy import delete
 from sqlalchemy.exc import SQLAlchemyError
 
 from ..celery_app import celery_app
-from ..db.models import ProcessedContent, SourceItem
+from ..db.models import DataConnection, ProcessedContent, SourceItem
 from ..db.session import isolated_session
+from ..google_photos import get_valid_access_token
 from ..storage import get_storage_provider
 from ..vectorstore import upsert_random_embedding
 
@@ -53,9 +55,25 @@ def _generate_ocr(item: SourceItem) -> Dict[str, Any]:
     return {"text": text}
 
 
+async def _fetch_item_blob(session, storage, item: SourceItem) -> bytes:
+    storage_key = item.storage_key
+    if storage_key.startswith("http://") or storage_key.startswith("https://"):
+        headers = {}
+        if item.connection_id:
+            connection = await session.get(DataConnection, item.connection_id)
+            if connection and connection.provider == "google_photos":
+                access_token = await get_valid_access_token(session, connection)
+                if access_token:
+                    headers["Authorization"] = f"Bearer {access_token}"
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.get(storage_key, headers=headers)
+            response.raise_for_status()
+            return response.content
+    return storage.fetch(storage_key)
+
+
 async def _process_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     storage = get_storage_provider()
-
     try:
         item_id = UUID(str(payload["item_id"]))
     except (KeyError, ValueError) as exc:  # pragma: no cover - validation guard
@@ -82,7 +100,7 @@ async def _process_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         await session.flush()
 
         try:
-            blob = storage.fetch(item.storage_key)
+            blob = await _fetch_item_blob(session, storage, item)
             metadata = _extract_metadata(blob, payload)
             caption = _generate_caption(item, metadata)
             transcription = _generate_transcription(item)

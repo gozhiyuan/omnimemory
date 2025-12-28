@@ -63,7 +63,10 @@ class Settings(BaseSettings):
     google_photos_client_secret: Optional[str] = None
     google_photos_redirect_uri: Optional[str] = None
     google_photos_scopes: list[str] = Field(
-        default_factory=lambda: ["https://www.googleapis.com/auth/photoslibrary.readonly"]
+        default_factory=lambda: [
+            "https://www.googleapis.com/auth/photospicker.mediaitems.readonly",
+            "https://www.googleapis.com/auth/photoslibrary.readonly",
+        ]
     )
 
     @model_validator(mode="before")

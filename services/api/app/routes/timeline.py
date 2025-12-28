@@ -15,8 +15,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
 from ..config import get_settings
-from ..db.models import DEFAULT_TEST_USER_ID, ProcessedContent, SourceItem
+from ..db.models import DEFAULT_TEST_USER_ID, DataConnection, ProcessedContent, SourceItem
 from ..db.session import get_session
+from ..google_photos import get_valid_access_token
 from ..storage import get_storage_provider
 
 
@@ -46,6 +47,7 @@ async def get_timeline(
     user_id: UUID = DEFAULT_TEST_USER_ID,
     session: AsyncSession = Depends(get_session),
     limit: int = 200,
+    provider: Optional[str] = None,
 ) -> list[TimelineDay]:
     """Return a grouped timeline of items for the user.
 
@@ -54,15 +56,16 @@ async def get_timeline(
     for UI rendering while still surfacing recent activity.
     """
 
-    stmt = (
-        select(SourceItem)
-        .where(
-            SourceItem.user_id == user_id,
-            SourceItem.processing_status == "completed",
-        )
-        .order_by(SourceItem.captured_at.desc().nulls_last(), SourceItem.created_at.desc())
-        .limit(limit)
+    stmt = select(SourceItem).where(
+        SourceItem.user_id == user_id,
+        SourceItem.processing_status == "completed",
     )
+    if provider:
+        stmt = (
+            stmt.join(DataConnection, SourceItem.connection_id == DataConnection.id)
+            .where(DataConnection.provider == provider)
+        )
+    stmt = stmt.order_by(SourceItem.captured_at.desc().nulls_last(), SourceItem.created_at.desc()).limit(limit)
     result = await session.execute(stmt)
     items: list[SourceItem] = list(result.scalars().all())
 
@@ -83,6 +86,8 @@ async def get_timeline(
     storage = get_storage_provider()
 
     async def sign_url(storage_key: str) -> Optional[str]:
+        if storage_key.startswith("http://") or storage_key.startswith("https://"):
+            return storage_key
         try:
             signed = await asyncio.to_thread(
                 storage.get_presigned_download, storage_key, settings.presigned_url_ttl_seconds
@@ -93,9 +98,51 @@ async def get_timeline(
         return signed.get("url") if signed else None
 
     download_urls: dict[UUID, Optional[str]] = {}
+    connections: dict[UUID, DataConnection] = {}
+    tokens: dict[UUID, str] = {}
+    if items:
+        connection_ids = [getattr(item, "connection_id", None) for item in items if getattr(item, "connection_id", None)]
+        if connection_ids:
+            conn_rows = await session.execute(select(DataConnection).where(DataConnection.id.in_(connection_ids)))
+            connections = {conn.id: conn for conn in conn_rows.scalars().all()}
+            http_connection_ids = {
+                item.connection_id
+                for item in items
+                if item.connection_id
+                and item.storage_key
+                and item.storage_key.startswith(("http://", "https://"))
+            }
+            google_photos_connections = [
+                connections[conn_id]
+                for conn_id in http_connection_ids
+                if conn_id in connections and connections[conn_id].provider == "google_photos"
+            ]
+            for conn in google_photos_connections:
+                token = await get_valid_access_token(session, conn)
+                if token:
+                    tokens[conn.id] = token
+
+    async def download_url_for(item: SourceItem) -> Optional[str]:
+        storage_key = item.storage_key
+        if storage_key.startswith("http://") or storage_key.startswith("https://"):
+            conn_id = getattr(item, "connection_id", None)
+            token = tokens.get(conn_id) if conn_id else None
+            if token:
+                sep = "&" if "?" in storage_key else "?"
+                return f"{storage_key}{sep}access_token={token}"
+            return storage_key
+        try:
+            signed = await asyncio.to_thread(
+                storage.get_presigned_download, storage_key, settings.presigned_url_ttl_seconds
+            )
+        except Exception as exc:  # pragma: no cover - external service dependency
+            logger.warning("Failed to sign download URL for {}: {}", storage_key, exc)
+            return None
+        return signed.get("url") if signed else None
+
     if items:
         signed_list = await asyncio.gather(
-            *(sign_url(item.storage_key) for item in items),
+            *(download_url_for(item) for item in items),
             return_exceptions=False,
         )
         download_urls = {item.id: url for item, url in zip(items, signed_list)}

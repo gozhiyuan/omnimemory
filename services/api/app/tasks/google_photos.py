@@ -8,6 +8,9 @@ from typing import Any, Optional
 from uuid import UUID, uuid4
 
 from loguru import logger
+import re
+from pathlib import Path
+import httpx
 from sqlalchemy import select
 
 from ..celery_app import celery_app
@@ -20,6 +23,7 @@ from ..google_photos import (
     get_valid_access_token,
     parse_google_timestamp,
 )
+from ..storage import get_storage_provider
 from .process_item import process_item
 
 
@@ -27,6 +31,32 @@ def _media_item_type(mime_type: Optional[str]) -> str:
     if mime_type and mime_type.startswith("video/"):
         return "video"
     return "photo"
+
+
+def _safe_filename(name: str) -> str:
+    base = Path(name).name
+    if "." in base:
+        stem, suffix = base.rsplit(".", 1)
+    else:
+        stem, suffix = base, ""
+    stem = re.sub(r"[^A-Za-z0-9._-]", "_", stem).strip("._-") or "file"
+    suffix = re.sub(r"[^A-Za-z0-9]", "", suffix)
+    return f"{stem}.{suffix}" if suffix else stem
+
+
+def _infer_filename(media_id: str, filename: Optional[str], mime_type: Optional[str]) -> str:
+    if filename:
+        return _safe_filename(filename)
+    ext_map = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/heic": ".heic",
+        "image/heif": ".heif",
+        "video/mp4": ".mp4",
+        "video/quicktime": ".mov",
+    }
+    ext = ext_map.get((mime_type or "").lower(), "")
+    return _safe_filename(media_id + ext)
 
 
 async def _fetch_media_items(access_token: str, session_id: str) -> list[dict[str, Any]]:
@@ -48,7 +78,7 @@ async def _ingest_media_item(
     )
     if not media_id:
         return None
-    base_url, _, mime_type, creation_time = extract_picker_media_fields(item)
+    base_url, filename, mime_type, creation_time = extract_picker_media_fields(item)
     if not base_url:
         try:
             hydrated = await fetch_picker_media_item(access_token, session_id, media_id)
@@ -65,70 +95,70 @@ async def _ingest_media_item(
         )
         return None
     download_url = f"{base_url}=d"
-    storage_key = download_url
+    storage_key = f"google_photos/{connection.user_id}/{media_id}/{_infer_filename(media_id, filename, mime_type)}"
     mime_type = mime_type or "application/octet-stream"
     captured_at = parse_google_timestamp(creation_time)
+
+    storage = get_storage_provider()
 
     async with isolated_session() as session:
         result = await session.execute(
             select(SourceItem).where(
                 SourceItem.connection_id == connection.id,
-                SourceItem.storage_key == storage_key,
+                SourceItem.storage_key.in_([storage_key, download_url]),
             )
         )
         existing = result.scalar_one_or_none()
         if existing:
-            if existing.processing_status != "completed":
-                existing.processing_status = "pending"
-                existing.processing_error = None
-                existing.updated_at = datetime.now(timezone.utc)
-                await session.commit()
-
-                process_item.delay(
-                    {
-                        "item_id": str(existing.id),
-                        "storage_key": storage_key,
-                        "item_type": existing.item_type,
-                        "user_id": str(connection.user_id),
-                        "captured_at": (existing.captured_at or captured_at or datetime.now(timezone.utc)).isoformat(),
-                        "content_type": existing.content_type or mime_type,
-                        "original_filename": existing.original_filename or item.get("filename"),
-                        "remote_only": True,
-                    }
-                )
-            return existing.id
+            existing.storage_key = storage_key
+            existing.content_type = existing.content_type or mime_type
+            existing.original_filename = existing.original_filename or filename
+            existing.processing_status = "pending"
+            existing.processing_error = None
+            existing.updated_at = datetime.now(timezone.utc)
 
         user = await session.get(User, connection.user_id)
         if user is None:
             session.add(User(id=connection.user_id))
 
-        source_item = SourceItem(
-            id=uuid4(),
-            user_id=connection.user_id,
-            connection_id=connection.id,
-            storage_key=storage_key,
-            item_type=_media_item_type(mime_type),
-            content_type=mime_type,
-            original_filename=item.get("filename"),
-            captured_at=captured_at,
-            processing_status="pending",
-        )
-        session.add(source_item)
-        await session.commit()
+        if not existing:
+            source_item = SourceItem(
+                id=uuid4(),
+                user_id=connection.user_id,
+                connection_id=connection.id,
+                storage_key=storage_key,
+                item_type=_media_item_type(mime_type),
+                content_type=mime_type,
+                original_filename=filename,
+                captured_at=captured_at,
+                processing_status="pending",
+            )
+            session.add(source_item)
+            await session.commit()
+        else:
+            source_item = existing
+            await session.commit()
 
-        process_item.delay(
-            {
-                "item_id": str(source_item.id),
-                "storage_key": storage_key,
-                "item_type": source_item.item_type,
-                "user_id": str(connection.user_id),
-                "captured_at": captured_at.isoformat() if captured_at else None,
-                "content_type": mime_type,
-                "original_filename": item.get("filename"),
-                "remote_only": True,
-            }
-        )
-        return source_item.id
+    # Download and store the media in our storage to survive token revocation.
+    headers = {"Authorization": f"Bearer {access_token}"}
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.get(download_url, headers=headers)
+        response.raise_for_status()
+        blob = response.content
+    storage.store(storage_key, blob, mime_type)
+
+    process_item.delay(
+        {
+            "item_id": str(source_item.id),
+            "storage_key": storage_key,
+            "item_type": source_item.item_type,
+            "user_id": str(connection.user_id),
+            "captured_at": captured_at.isoformat() if captured_at else None,
+            "content_type": mime_type,
+            "original_filename": filename,
+        }
+    )
+    return source_item.id
 
 
 async def _sync_google_photos(session_id: Optional[str]) -> dict[str, Any]:

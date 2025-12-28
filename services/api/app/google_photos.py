@@ -161,7 +161,7 @@ async def fetch_picker_media_items(access_token: str, session_id: str) -> list[d
     headers = {"Authorization": f"Bearer {access_token}"}
     page_token: Optional[str] = None
     items: list[dict] = []
-    use_fields_mask = True
+    use_fields_mask = False
     fields_mask = (
         "mediaItems("
         "id,"

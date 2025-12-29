@@ -110,9 +110,9 @@
 - [ ] Keep Tailwind via CDN config in `index.html` (custom `primary` palette + Inter font) so component classes in `App.tsx`, `Layout.tsx`, etc. render correctly without a Tailwind build step
 - [ ] Install/maintain runtime dependencies already present in `package.json`: `react`, `react-dom`, `lucide-react` for icons, `recharts` for dashboard charts, and `@google/genai` for assistant calls
 - [ ] Ensure `App.tsx` view switcher (dashboard/chat/timeline/upload/settings) remains the single source of truth after login so every tab can reuse shared layout + auth state
-- [ ] Flesh out the Ingest tab so manual uploads call the FastAPI `/upload/batch` endpoint and the Google Photos connector UI triggers OAuth, shows sync status, and surfaces retry/manage actions
+- [ ] Flesh out the Ingest tab so manual uploads use `POST /storage/upload-url` + `PUT <signed url>` + `POST /upload/ingest`, and the Google Photos connector UI triggers OAuth, shows sync status, and surfaces retry/manage actions
 - [ ] Build chat + ingestion workflows against the Gemini API via `@google/genai` services, reusing hooks/utilities under `apps/web/services`
-- [ ] Drive the Timeline view from the `/timeline` API (daily activity heatmap + detail drawer per day showing photos, videos, summaries) and hydrate the Dashboard components with stats returned by `/stats`
+- [ ] Drive the Timeline view from the `/timeline` API (daily activity heatmap + detail drawer per day showing photos, videos, summaries) and hydrate the Dashboard components with stats returned by `/dashboard/stats`
 - [ ] Add lightweight routing or state persistence as needed (URL params or Zustand) instead of server-side routing, and gate authenticated data fetches through supabase/api clients once backend endpoints exist
 
 **Docker Compose for Local Development**
@@ -190,135 +190,72 @@
 ## Week 3-4: Data Ingestion Pipeline
 
 ### Objectives
-- Implement file upload with progress tracking
-- Build Google Photos ingestion via Picker (manual selection only)
-- Create processing pipeline for images
-- Store processed data in vector database
+- Harden existing ingest flows (manual upload + Google Photos Picker)
+- Implement versioned artifacts, dedupe gates, and canonical timestamps
+- Implement image multi-context extraction + context-level Qdrant indexing
+- Lay the foundation for video/audio pipelines (artifacts first)
+- Prepare episode merge + daily summaries (Week 4→5 bridge)
 
 ### Tasks
 
-**Manual Upload (Backend)**
-- [ ] Create Supabase storage bucket `user-uploads`; add `thumbnails` when thumbnail generation lands
-- [ ] Configure Supabase Storage CORS for local development if the browser uses presigned uploads
-- [ ] Create upload endpoint (presigned preferred; keep batch POST for small files):
-  ```python
-  @app.post("/api/v1/upload/batch")
-  async def batch_upload(
-      files: List[UploadFile],
-      user: User = Depends(get_current_user)
-  ):
-      batch_id = str(uuid.uuid4())
-      for file in files:
-          # Extract EXIF metadata
-          # Upload to Supabase Storage
-          # Create source_item record
-          # Queue processing task
-      return {"batch_id": batch_id}
-  ```
-- [ ] Implement EXIF metadata extraction (timestamp, location, camera info)
-- [ ] Create Supabase Storage upload helper with presigned URLs
-- [ ] Add file type validation (images, videos, audio only)
-- [ ] Implement deduplication using SHA256 + perceptual hash + EXIF heuristics
+**Week 3 (current): Ingestion core (artifacts → contexts → embeddings)**
 
-**Manual Upload (Frontend)**
-- [ ] Create `/upload` page with drag-and-drop UI
-- [ ] Implement file selection with folder support
-- [ ] Add upload progress tracking:
-  ```typescript
-  const { mutate: uploadFiles } = useMutation({
-    mutationFn: async (files: File[]) => {
-      const formData = new FormData();
-      files.forEach(f => formData.append('files', f));
-      return api.post('/upload/batch', formData, {
-        onUploadProgress: (e) => {
-          setProgress(Math.round((e.loaded * 100) / e.total));
-        }
-      });
-    }
-  });
-  ```
-- [ ] Show thumbnail previews before upload
-- [ ] Display upload status (pending/processing/completed/failed)
+Reference: `docs/minecontext/lifelog_ingestion_rag_design.md`
 
-**Google Photos Integration (Picker-based)**
-- [ ] Set up Google Cloud Project & enable Photos API
-- [ ] Implement OAuth flow + picker session endpoints (start session, poll selected items)
-- [ ] Frontend: OAuth connect + Google Picker launch; automatically poll selection count after picker closes
-- [ ] Ingest flow: user-selected items only (Picker API limitation); no background/full-library sync
-- [ ] Fetch selected media bytes and copy into Supabase Storage so thumbnails/timeline can render without hotlinking Google URLs
-- [ ] Queue ingest per selected item (`/upload/ingest`), skipping already ingested IDs
-- [ ] Track picker session + ingest status in UI; surface recent Google Photos ingests
+1) **Confirm and document what’s already working**
+   - [ ] Manual uploads enqueue via `POST /upload/ingest` and complete a worker task.
+   - [ ] Google Photos OAuth + Picker session works and enqueues ingestion jobs.
 
-**Image Processing Pipeline**
-- [ ] Create `process_item` Celery task:
-```python
-@celery.task
-def process_item(item_id: str):
-    item = db.get(source_items, item_id)
-    file_path = storage.download_to_tmp(item.original_url)
-    
-    caption = ""
-    ocr_text = ""
-    transcript = ""
-    
-    if item.item_type == "photo":
-        ocr_text = run_ocr(file_path)
-        caption = generate_caption(load_bytes(file_path))
-    
-    elif item.item_type == "video":
-        keyframes = extract_keyframes(file_path, interval_sec=3)
-        scenes = detect_scenes(keyframes)
-        caption = summarize_scenes(scenes)
-        transcript = transcribe_audio(file_path)
-        generate_video_thumbnails(keyframes)
-    
-    elif item.item_type == "audio":
-        transcript, speakers = transcribe_and_diarize(file_path)
-    
-    content_records = []
-    if caption:
-        content_records.append({"content_type": "caption", "content_text": caption})
-    if ocr_text:
-        content_records.append({"content_type": "ocr", "content_text": ocr_text})
-    if transcript:
-        content_records.append({"content_type": "transcript", "content_text": transcript})
-    
-    for record in content_records:
-        db.insert(processed_content, {
-            "source_item_id": item_id,
-            "user_id": item.user_id,
-            **record
-        })
-    
-    embedding_payload = " ".join([r["content_text"] for r in content_records])
-    embedding = get_embedding(embedding_payload)
-    
-    qdrant.upsert(
-        collection_name=f"user_{item.user_id}",
-        points=[{
-            "id": item_id,
-            "vector": embedding,
-            "payload": {
-                "item_id": item_id,
-                "user_id": item.user_id,
-                "caption": caption,
-                "ocr_text": ocr_text,
-                "transcript": transcript,
-                "timestamp": item.captured_at,
-                "location": item.location,
-                "item_type": item.item_type
-            }
-        }]
-    )
-    
-    db.update(source_items, item_id, {"processing_status": "completed"})
-    emit_processing_metrics(item_id, item.item_type, duration_ms)
-```
+2) **Schema migrations (enable timeline alignment + dedupe + contexts)**
+   - [ ] Extend `source_items` with: `provider`, `external_id`, `content_hash`, `phash`, `event_time_utc`, `event_time_source`, `event_time_confidence` (and `processing_error` if missing).
+   - [ ] Add `derived_artifacts` (or evolve `processed_content`) to store versioned step outputs with `producer_version` + `input_fingerprint`.
+   - [ ] Add `processed_contexts` to store 1..N contexts per item plus merged episode contexts later.
 
-- [ ] Implement ffmpeg-based `extract_keyframes` + PySceneDetect integration
-- [ ] Use Whisper large-v3 or faster alternative on GPU-backed worker (RunPod or Modal)
-- [ ] Cache embeddings + captions to avoid recomputation on reprocess
-- [ ] Enforce processing SLA dashboards (queue depth, items/minute)
+3) **Pipeline modularization (so you can swap/upgrade steps)**
+   - [ ] Create `services/api/app/pipeline/` with a small step interface: `name`, `version`, `run(item, artifacts, config)`.
+   - [ ] Refactor `services/api/app/tasks/process_item.py` to:
+     - run shared pre-processing steps for all items
+     - route into per-type steps (`photo|video|audio|document`)
+     - persist artifacts/contexts incrementally
+     - be idempotent (safe retry) and cacheable (skip recomputation using `input_fingerprint`)
+
+4) **Canonical timestamp normalization (timeline correctness)**
+   - [ ] Implement `event_time_utc` selection priority: EXIF/container → provider metadata → request `captured_at` → server time.
+   - [ ] Store `event_time_source` + `event_time_confidence`.
+
+5) **Dedup gates (cost control; required for future devices)**
+   - [ ] Exact dedup: compute `content_hash` (SHA256); if duplicate, link to canonical and skip expensive steps.
+   - [ ] Near-dup for images: compute `pHash` and compare within a rolling window; mark redundant items and skip VLM (configurable).
+
+6) **Image pipeline v1 (multi-context extraction)**
+   - [ ] OCR step (configurable backend; start with a placeholder or simple implementation).
+   - [ ] VLM batch analysis using `lifelog_image_analysis_v1` (see prompt templates in the design doc).
+   - [ ] Parse VLM JSON → write `processed_contexts` (require `activity_context` per image; add others as present).
+   - [ ] Semantic merge hook (design now; implement merge in Week 4): `lifelog_semantic_merging_v1`.
+
+7) **Embeddings + Qdrant indexing (context IDs)**
+   - [ ] Embed `processed_contexts.vector_text` and upsert to Qdrant using **context_id**.
+   - [ ] Store filterable payload: `user_id`, `context_type`, `event_time_utc`, `source_item_ids`, `entities`.
+   - [ ] Update `/search` to search contexts (not raw items) and return context IDs + citations.
+
+8) **API/UI wiring validation**
+   - [ ] Timeline uses `event_time_utc` and shows context-derived title/summary (fallback to legacy caption).
+   - [ ] Add a small “processing inspector” view (optional): show derived artifacts + contexts per item for debugging.
+
+**Week 4: Video/audio foundations + episode merge**
+
+9) **Video artifacts first**
+   - [ ] Extract technical metadata + keyframes/scenes (bounded max frames per video).
+   - [ ] Extract audio track and run transcription (timestamps; diarization optional).
+   - [ ] Generate contexts from keyframes + transcript and upsert context vectors.
+
+10) **Audio pipeline v1**
+   - [ ] Transcribe with timestamps; chunk transcript for embeddings.
+   - [ ] Extract entities/topics; create `social_context`/`knowledge_context` where appropriate.
+
+11) **Episode merge job + daily summaries**
+   - [ ] Implement an episode clustering job (time window + merge prompt) that creates episode contexts (`is_episode=true`).
+   - [ ] Implement daily summary generation based on episode contexts; embed and index daily summaries for fast broad retrieval.
 
 **Lifecycle & Retention Jobs**
 - [ ] Create `enforce_storage_lifecycle` Celery task:
@@ -339,10 +276,10 @@ def process_item(item_id: str):
 - [ ] Add “Optimize storage” UI action to trigger a one-off lifecycle run per user
 
 **AI Model Integration**
-- [ ] Document model decision matrix (cost per 1k tokens/min, throughput, latency) for GPT-4V vs BLIP, Whisper vs Faster-Whisper
-- [ ] Implement caching layer (Redis) for identical caption/transcript requests and chunk batching
+- [ ] Document model decision matrix (cost/latency/throughput) for VLM vs OCR vs ASR choices
+- [ ] Implement caching by `input_fingerprint` so identical artifacts are never recomputed
 - [ ] Set monthly budget guardrails + alerts for model spend; failover to cheaper models when threshold hit
-- [ ] Integrate OCR service (Tesseract or cloud OCR):
+- [ ] Integrate OCR service (Tesseract or cloud OCR) when ready:
   ```python
   import pytesseract
   from PIL import Image
@@ -352,25 +289,7 @@ def process_item(item_id: str):
       text = pytesseract.image_to_string(image)
       return text.strip()
   ```
-- [ ] Integrate image captioning:
-  - Option A: Use GPT-4V API
-  - Option B: Use Hugging Face BLIP model
-  ```python
-  async def generate_caption(image_data: bytes) -> str:
-      # Using GPT-4V
-      response = await openai.ChatCompletion.create(
-          model="gpt-4-vision-preview",
-          messages=[{
-              "role": "user",
-              "content": [
-                  {"type": "text", "text": "Describe this image in detail"},
-                  {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-              ]
-          }]
-      )
-      return response.choices[0].message.content
-  ```
-- [ ] Integrate embedding model:
+- [ ] Integrate embedding model (text):
   ```python
   from openai import OpenAI
   
@@ -385,21 +304,9 @@ def process_item(item_id: str):
   ```
 
 **Qdrant Integration**
-- [ ] Create user collection on first upload:
-  ```python
-  def ensure_user_collection(user_id: str):
-      collection_name = f"user_{user_id}"
-      if not qdrant.collection_exists(collection_name):
-          qdrant.create_collection(
-              collection_name=collection_name,
-              vectors_config={
-                  "size": 1536,  # OpenAI embedding size
-                  "distance": "Cosine"
-              }
-          )
-  ```
-- [ ] Implement batch upsert for efficiency
-- [ ] Add error handling and retry logic
+- [ ] Ensure the collection exists and supports the chosen embedding dimension.
+- [ ] Implement batch upsert for efficiency (contexts + chunks).
+- [ ] Add error handling and retry logic; make Qdrant failures non-fatal (item can still be marked processed with a warning).
 
 **Connections Management UI**
 - [ ] Create `/connections` page
@@ -414,12 +321,11 @@ def process_item(item_id: str):
 - [ ] Add alerts on high growth (>5 GB/day) and quota breaches
 
 ### Deliverables
-- ✅ User can upload 100+ mixed media items (photos/videos/audio) at once
-- ✅ Users can connect Google Photos via Picker, select items, and ingest them (no automated full-library/delta sync via API)
-- ✅ Selected Google Photos are copied into Supabase Storage so thumbnails/timeline render reliably; processed artifacts land in Qdrant + Supabase
-- ✅ Video keyframes/transcripts and audio diarization are generated and searchable
-- ✅ Processed data (captions, transcripts, embeddings) is stored in Qdrant + Supabase
-- ✅ Sync + processing status, throughput, and cost telemetry are visible in monitoring dashboard
+- ✅ Upload/Google Photos ingestion stays functional while the pipeline is upgraded
+- ✅ Every ingested item has a canonical `event_time_utc` and dedupe signals (`content_hash`, optional `pHash`)
+- ✅ Images produce 1..N `processed_contexts` (at minimum `activity_context`) and are indexed in Qdrant by context ID
+- ✅ Search returns context-level hits with timestamps + citations
+- ✅ Video/audio pipelines produce at least artifacts + first contexts (Week 4), ready for episode merge/daily summaries (Week 5)
 
 ---
 
@@ -791,7 +697,7 @@ def process_item(item_id: str):
 **Chat API Endpoint**
 - [ ] Create chat endpoint:
   ```python
-  @app.post("/api/v1/chat")
+  @app.post("/chat")
   async def chat(
       request: ChatRequest,
       user: User = Depends(get_current_user)
@@ -1048,7 +954,7 @@ User question: {query}"""
 **Session Management**
 - [ ] Create session list endpoint:
   ```python
-  @app.get("/api/v1/chat/sessions")
+  @app.get("/chat/sessions")
   async def list_sessions(user: User = Depends(get_current_user)):
       # Get unique session IDs from mem0
       sessions = memory.get_sessions(user_id=user.id)
@@ -1100,7 +1006,7 @@ User question: {query}"""
 **Timeline View**
 - [ ] Create timeline API endpoint:
   ```python
-  @app.get("/api/v1/timeline")
+  @app.get("/timeline")
   async def get_timeline(
       start_date: date,
       end_date: date,
@@ -1167,7 +1073,7 @@ User question: {query}"""
 **Dashboard**
 - [ ] Create dashboard stats endpoint:
   ```python
-  @app.get("/api/v1/dashboard/stats")
+  @app.get("/dashboard/stats")
   async def get_dashboard_stats(user: User = Depends(get_current_user)):
       total_items = db.query(func.count(source_items.id)).filter(
           user_id=user.id
@@ -1385,12 +1291,17 @@ User question: {query}"""
           ('files', open('test_image2.jpg', 'rb'))
       ]
       response = client.post(
-          '/api/v1/upload/batch',
-          files=files,
+          '/upload/ingest',
+          json={
+              "storage_key": "fixtures/test_image.jpg",
+              "item_type": "photo",
+              "content_type": "image/jpeg",
+              "original_filename": "test_image.jpg",
+          },
           headers={'Authorization': f'Bearer {auth_token}'}
       )
       assert response.status_code == 200
-      assert 'batch_id' in response.json()
+      assert 'item_id' in response.json()
   ```
 - [ ] Test processing pipeline end-to-end
 - [ ] Write frontend E2E tests with Playwright:
@@ -1415,7 +1326,7 @@ User question: {query}"""
   class LifelogUser(HttpUser):
       @task
       def chat(self):
-          self.client.post("/api/v1/chat", json={
+          self.client.post("/chat", json={
               "message": "What did I do yesterday?",
               "session_id": "test-session"
           })
@@ -1440,7 +1351,7 @@ User question: {query}"""
 - [ ] Deploy Celery workers as separate service
 - [ ] Provision GPU-backed media processing workers (RunPod/Modal) for Whisper + captioning
 - [ ] Set up Redis on Cloud Memorystore (or Upstash)
-- [ ] Deploy Next.js to Vercel:
+- [ ] Deploy the React + Vite SPA (Vercel/Netlify or Cloud Storage + CDN):
   ```bash
   vercel --prod
   ```

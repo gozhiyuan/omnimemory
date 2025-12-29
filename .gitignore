@@ -19,6 +19,7 @@ dist/
 .vscode/
 *.swp
 node_modules/
+fixtures/
 
 # uv / pip caches
 .uv/

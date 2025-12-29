@@ -1,7 +1,9 @@
 # Lifelog AI - MVP Product Requirements Document
 
 > **Status:** MVP-focused version emphasizing core data and memory architecture
-> **Last Updated:** November 2, 2025
+> **Last Updated:** December 29, 2025
+>
+> **Canonical detailed design:** `docs/minecontext/lifelog_ingestion_rag_design.md`
 
 ---
 
@@ -42,28 +44,29 @@ Build an AI-powered personal memory assistant that ingests multimodal data from 
 **3.1 Data Layer**
 - Manual upload (drag-and-drop or folder selection) for photos, videos, and audio files with batch support
 - Google Photos connector (OAuth + Picker API): user launches the picker, selects items, we copy the chosen media into Supabase Storage for rendering, and enqueue ingestion; no automated full-library/delta sync (API limitation)
-- Metadata extraction: timestamp, EXIF, location, file type, source, album references
-- Deduplication logic (combine SHA256 + perceptual hash + EXIF heuristics to catch resized/edited duplicates) so manual uploads and Google imports do not create duplicate events
+- Metadata extraction (MVP): content type, file size, EXIF/video container metadata, provider metadata, normalized timestamps (`event_time_utc`)
+- Deduplication (MVP): exact dedup (SHA256) + near-duplicate dedup (pHash for images, signature for video) to control costs for frequent capture sources
+- Multi-context extraction per media item (1..N contexts) using a taxonomy (activity/social/location/food/emotion/entity/knowledge)
 
 **3.2 Processing Pipeline**
-- Image (Google Photos + manual uploads): OCR (text extraction), captioning (Gemini Vision/BLIP), CLIP embeddings, throughput target 2 img/s/worker
-- Video: Keyframe extraction (ffmpeg every 3s), scene boundary detection, multimodal captioning per scene, audio transcription, thumbnail generation
-- Audio (if uploaded manually): Speech-to-text (Whisper), speaker diarization, silence trimming
-- Entity extraction: People, places, objects, events (using LLM)
-- Temporal clustering: Group items into "events" by time proximity
-- Processing SLA: ingest + process 10k mixed assets within 60 minutes via horizontal worker scaling
+- Shared pre-processing: download/fetch bytes, sniff MIME, extract technical metadata, compute `content_hash` and perceptual hash where applicable
+- Image: OCR + VLM batch analysis → 1..N contexts per image → optional semantic merge into episode contexts → text embeddings → Qdrant upsert (context IDs)
+- Video: keyframes/scenes + audio extraction → transcript (timestamps) → VLM analysis on selected frames (+ transcript grounding) → contexts → embeddings → Qdrant upsert
+- Audio: transcript (+ optional diarization) → entities/topics → contexts + transcript chunks → embeddings → Qdrant upsert
+- Document: text extraction + chunking → `knowledge_context` chunks → embeddings → Qdrant upsert
+- Derived artifacts are versioned and cacheable so reprocessing is possible without re-uploading media (see `docs/minecontext/lifelog_ingestion_rag_design.md`)
 
 **3.3 Memory Layer**
-- **Vector Store (Qdrant/Pinecone):** Semantic embeddings for all content
-- **Structured DB (Postgres):** Timeline data, metadata, entity relationships
-- **Memory Graph (Postgres graph tables):** Entity nodes (person/place/event) and relationships
-- **Daily Summaries:** Nightly Celery job aggregates previous day’s events + entities, prompts LLM with canonical template, stores to `daily_summaries` table, surfaced in dashboard + chat preamble
-- **Hybrid Retrieval:** Weighted score = 0.5 * vector similarity + 0.3 * temporal proximity decay + 0.2 * entity overlap, with minimum freshness threshold and reranking before chat response
+- **Vector store (Qdrant):** store embeddings for `processed_contexts` (and optional transcript/doc chunks) keyed by **context_id**
+- **Postgres:** source item metadata + derived artifacts + processed contexts + daily summaries; supports time/entity filtering
+- **Episode contexts:** merge raw contexts into higher-signal “episodes” (time-window clustering + LLM merge decision)
+- **Daily summaries:** nightly job over episode contexts; summary is embedded and indexed for fast “broad” queries
+- **Retrieval-first principle:** pre-filter by time/type/entity, then vector search within the filtered set, then synthesize with citations
 
 **3.4 Model Layer**
 - LLM API integration: GPT-4o, Claude 3.5/4, or Gemini for chat and summarization
 - Vision API: GPT-4V or Gemini Vision for image understanding
-- Local embedding model: all-MiniLM-L6-v2 or OpenAI embeddings API
+- Text embeddings: OpenAI `text-embedding-3-*` or a local embedding model; store vectors in Qdrant
 
 **3.5 Application Layer (Web Only)**
 - User authentication (Supabase Auth: email/password + Google OAuth) gating a single React + Vite SPA shell (`Layout` + `App.tsx` view switcher)
@@ -121,6 +124,33 @@ User-driven ingest (per picker session):
 
 > **Note:** Automated backfill/delta sync is blocked by the Picker API. To achieve passive ingestion later, consider an additional capture path (e.g., ESP32 camera agent) or future connector work once API/permissions allow.
 
+#### Week 3 ingestion pipeline requirements (implementation guidance)
+
+Week 3 is about turning “upload + enqueue” into a robust, reprocessable ingestion pipeline.
+
+1) **Canonical timeline timestamp**
+   - Add `event_time_utc`, `event_time_source`, `event_time_confidence` to `source_items`.
+   - Implement timestamp priority: EXIF/container → provider metadata → client-provided → server receive time.
+
+2) **Dedup gates (cost control)**
+   - Exact dedup: `content_hash` (SHA256) per user/provider.
+   - Near-duplicate: `pHash` for images (rolling window) + simple video signatures to skip redundant VLM/ASR.
+
+3) **Versioned derived artifacts**
+   - Persist step outputs as versioned artifacts (`derived_artifacts`) with `producer_version` + `input_fingerprint`.
+   - Make the pipeline idempotent (safe retries) and cacheable (skip recomputation).
+
+4) **Multi-context extraction (start with images)**
+   - Generate 1..N contexts per media item using the taxonomy in `docs/minecontext/lifelog_ingestion_rag_design.md`.
+   - Require `activity_context` for every image; add `entity/social/location/food/emotion` as detected.
+
+5) **Context-level embeddings in Qdrant**
+   - Upsert vectors for `processed_contexts` (context IDs), not raw item IDs.
+   - Include filterable payload fields: `user_id`, `context_type`, `event_time_utc`, `source_item_ids`, `entities`.
+
+6) **Design for episode merge + daily summary (Week 4)**
+   - Define the merge window + prompt contract now so you can add episode contexts and daily summaries without redoing storage/indexing.
+
 **Storage Strategy:**
 - **Metadata only:** Store photo IDs, timestamps, and provider metadata in your DB
 - **Processed artifacts:** Store captions, embeddings, OCR text in your DB
@@ -150,58 +180,82 @@ Objectives: minimize storage cost, avoid duplicate originals, ensure fast UX wit
   - Serve media via short‑lived signed URLs; encrypt tokens/keys; enforce RLS on metadata.
   - Bucket structure: `originals/{user_id}/{item_id}`, `previews/{user_id}/{item_id}`, `thumbnails/{user_id}/{item_id}`.
 
-**Data Schema:**
+**Data Schema (Target MVP; implement starting Week 3):**
+
+The current repo schema is intentionally minimal. Week 3 ingestion work should add missing fields/tables via migrations and keep the model in sync with `docs/minecontext/lifelog_ingestion_rag_design.md`.
 
 ```sql
--- Connections table
+-- Connections table (OAuth + provider config)
 CREATE TABLE data_connections (
   id UUID PRIMARY KEY,
   user_id UUID REFERENCES users(id),
-  provider TEXT, -- 'google_photos', 'notion', 'apple_photos'
+  provider TEXT, -- 'google_photos', ...
   status TEXT, -- 'connected', 'syncing', 'error'
-  oauth_token_encrypted TEXT,
-  last_sync_at TIMESTAMP,
-  total_items INTEGER,
-  created_at TIMESTAMP DEFAULT now()
+  config JSONB,
+  created_at TIMESTAMP DEFAULT now(),
+  updated_at TIMESTAMP DEFAULT now()
 );
 
--- Source items table (generic for all sources)
+-- Source items table (raw occurrences)
 CREATE TABLE source_items (
   id UUID PRIMARY KEY,
   user_id UUID REFERENCES users(id),
   connection_id UUID REFERENCES data_connections(id),
-  provider TEXT,
-  external_id TEXT, -- ID in 3rd party system
-  item_type TEXT, -- 'photo', 'video', 'note', 'audio'
-  original_url TEXT,
-  thumbnail_url TEXT,
-  captured_at TIMESTAMP,
-  location JSONB, -- {lat, lng, place_name}
-  metadata JSONB, -- provider-specific data
-  processing_status TEXT, -- 'pending', 'processing', 'completed', 'failed'
+  provider TEXT,              -- 'manual_upload' | 'google_photos' | 'device'
+  external_id TEXT,           -- provider media ID (for dedupe)
+  item_type TEXT,             -- 'photo' | 'video' | 'audio' | 'document'
+  storage_key TEXT,           -- object storage key/path (raw)
+  content_type TEXT,
+  original_filename TEXT,
+  content_hash TEXT,          -- sha256 for exact dedupe
+  phash TEXT,                 -- perceptual hash for near-dup (images)
+  captured_at TIMESTAMP,      -- original timestamp if available
+  event_time_utc TIMESTAMP,   -- normalized timeline timestamp (canonical)
+  event_time_source TEXT,     -- exif|provider|client|server
+  event_time_confidence FLOAT,
+  location JSONB,
+  metadata JSONB,
+  processing_status TEXT,     -- 'pending' | 'processing' | 'completed' | 'failed'
+  processing_error TEXT,
+  processed_at TIMESTAMP,
   created_at TIMESTAMP DEFAULT now(),
+  updated_at TIMESTAMP DEFAULT now(),
   UNIQUE(connection_id, external_id)
 );
 
--- Processed content table
-CREATE TABLE processed_content (
+-- Derived artifacts table (versioned, cacheable; idempotent pipeline outputs)
+CREATE TABLE derived_artifacts (
   id UUID PRIMARY KEY,
-  source_item_id UUID REFERENCES source_items(id),
   user_id UUID REFERENCES users(id),
-  content_type TEXT, -- 'caption', 'ocr', 'transcript', 'summary'
-  content_text TEXT,
-  language TEXT,
-  confidence FLOAT,
-  created_at TIMESTAMP DEFAULT now()
+  source_item_id UUID REFERENCES source_items(id),
+  artifact_type TEXT,          -- exif|hash|phash|ocr|transcript|keyframes|vlm_observations...
+  producer TEXT,               -- whisper|ffmpeg|vlm|embedder...
+  producer_version TEXT,
+  input_fingerprint TEXT,      -- enables caching/idempotency
+  payload JSONB,
+  storage_key TEXT,
+  created_at TIMESTAMP DEFAULT now(),
+  UNIQUE(source_item_id, artifact_type, producer, producer_version, input_fingerprint)
 );
 
--- Embeddings table (or use Qdrant exclusively)
-CREATE TABLE embeddings (
+-- Retrieval unit table (1..N per item; also stores merged episode contexts)
+CREATE TABLE processed_contexts (
   id UUID PRIMARY KEY,
-  source_item_id UUID REFERENCES source_items(id),
-  processed_content_id UUID REFERENCES processed_content(id),
   user_id UUID REFERENCES users(id),
-  embedding vector(384), -- or 1536 for OpenAI
+  context_type TEXT,           -- activity_context|food_context|...
+  title TEXT,
+  summary TEXT,
+  keywords JSONB,
+  entities JSONB,
+  location JSONB,
+  event_time_utc TIMESTAMP,
+  start_time_utc TIMESTAMP,
+  end_time_utc TIMESTAMP,
+  is_episode BOOLEAN DEFAULT false,
+  source_item_ids UUID[],
+  merged_from_context_ids UUID[],
+  vector_text TEXT,
+  processor_versions JSONB,
   created_at TIMESTAMP DEFAULT now()
 );
 ```
@@ -211,41 +265,34 @@ CREATE TABLE embeddings (
 **User uploads a folder of 1000 photos:**
 
 ```python
-# FastAPI endpoint
-@app.post("/api/v1/upload/batch")
-async def batch_upload(
-    files: List[UploadFile],
-    user: User = Depends(get_current_user)
-):
-    upload_batch_id = str(uuid.uuid4())
-    
+# Recommended MVP pattern: presigned upload + ingest enqueue.
+# (The API provides presigned URLs; the browser uploads bytes directly.)
+
+async def batch_upload(files: list[UploadFile], user: User):
+    batch_id = str(uuid.uuid4())
     for file in files:
-        # Generate unique ID
-        item_id = str(uuid.uuid4())
-        
-        # Extract EXIF metadata for timestamp, location
-        metadata = extract_exif(file)
-        
-        # Upload to object storage
-        storage_path = f"{user.id}/uploads/{upload_batch_id}/{item_id}"
-        await supabase.storage.upload(storage_path, file)
-        
-        # Create source_item record
-        db.insert(source_items, {
-            'id': item_id,
-            'user_id': user.id,
-            'item_type': 'photo',
-            'original_url': storage_path,
-            'captured_at': metadata.get('timestamp'),
-            'location': metadata.get('location'),
-            'metadata': metadata,
-            'processing_status': 'pending'
-        })
-        
-        # Queue for processing
-        celery.send_task('process_item', args=[item_id])
-    
-    return {"batch_id": upload_batch_id, "queued": len(files)}
+        # 1) Request a presigned upload URL from the API.
+        signed = await api.post(
+            "/storage/upload-url",
+            json={"filename": file.filename, "content_type": file.content_type},
+        )
+
+        # 2) Upload bytes directly to object storage.
+        await http.put(signed["url"], data=file.file, headers=signed["headers"])
+
+        # 3) Create a SourceItem + enqueue processing.
+        await api.post(
+            "/upload/ingest",
+            json={
+                "storage_key": signed["key"],
+                "item_type": "photo",
+                "captured_at": None,  # server will normalize from EXIF/provider if available
+                "content_type": file.content_type,
+                "original_filename": file.filename,
+            },
+        )
+
+    return {"batch_id": batch_id, "queued": len(files)}
 ```
 
 ---
@@ -653,21 +700,19 @@ def chat_handler(user_id: str, message: str, session_id: str):
 ### 4.4 Application Layer (Web)
 
 **Tech Stack:**
-- **Framework:** Next.js 14 (App Router)
-- **UI:** TailwindCSS + shadcn/ui
-- **State:** TanStack Query + Zustand
+- **Framework:** React 19 + TypeScript SPA (Vite)
+- **UI:** Tailwind (current repo uses CDN styling)
+- **State/data:** TanStack Query (optional Zustand for UI state)
 - **Auth:** Supabase Auth
-- **Deployment:** Vercel
+- **Deployment:** Static hosting + CDN (or Vercel/Netlify) + API/worker on a container runtime
 
-**Key Pages:**
+**Key Views (Tabs):**
 
-1. **/auth** - Login/Signup with email + Google OAuth
-2. **/dashboard** - Overview: storage usage, connected sources, activity timeline
-3. **/connections** - Manage 3rd-party connections, trigger syncs
-4. **/upload** - Batch upload interface with progress tracking
-5. **/chat** - Conversational memory interface with source citations
-6. **/timeline** - Calendar view of memories
-7. **/settings** - Account settings, privacy controls, export data
+1. **Dashboard** - Overview: storage usage, ingestion stats, and recent activity
+2. **Ingest** - Manual upload + Google Photos connection + Picker ingest status
+3. **Timeline** - Per-day media browsing + captions/summaries
+4. **Chat** - RAG-powered memory Q&A with citations
+5. **Settings** - Account + privacy + retention controls
 
 **Chat Interface Design:**
 
@@ -745,30 +790,28 @@ CREATE POLICY user_isolation_policy ON source_items
 ### Core Endpoints
 
 ```
-POST   /api/v1/auth/signup              # Create account
-POST   /api/v1/auth/login               # Login
-POST   /api/v1/auth/logout              # Logout
+GET    /health                          # Service health
+GET    /health/db                       # Database connectivity
+GET    /health/celery                   # Celery connectivity
+GET    /metrics                         # Prometheus metrics
 
-GET    /api/v1/connections              # List connected sources
-POST   /api/v1/connections              # Add new connection (OAuth)
-DELETE /api/v1/connections/:id          # Remove connection
-POST   /api/v1/connections/:id/sync     # Trigger manual sync
+POST   /storage/upload-url              # Get presigned upload URL
+POST   /storage/download-url            # Get presigned download URL
 
-POST   /api/v1/upload/batch             # Batch upload files
-GET    /api/v1/upload/batch/:id/status  # Check upload progress
+POST   /upload/ingest                   # Create SourceItem + enqueue processing
 
-GET    /api/v1/items                    # List all user items (paginated)
-GET    /api/v1/items/:id                # Get item details
-DELETE /api/v1/items/:id                # Delete item
+GET    /timeline                        # Timeline feed (grouped by day)
+GET    /dashboard/stats                 # Dashboard aggregates
+GET    /search?q=...                    # Qdrant-backed search
 
-POST   /api/v1/chat                     # Send chat message
-GET    /api/v1/chat/sessions            # List chat sessions
-GET    /api/v1/chat/sessions/:id        # Get session history
+GET    /integrations/google/photos/auth-url
+GET    /integrations/google/photos/status
+GET    /integrations/google/photos/callback
+POST   /integrations/google/photos/picker-session
+GET    /integrations/google/photos/picker-items?session_id=...
+POST   /integrations/google/photos/sync # Enqueue ingest of picker selections
 
-GET    /api/v1/timeline                 # Get timeline data
-GET    /api/v1/dashboard/stats          # Get dashboard statistics
-GET    /api/v1/events                   # List events (daily summaries)
-GET    /api/v1/events/:id               # Get event details
+POST   /chat                            # (Week 7+) RAG chat endpoint
 ```
 
 ---
@@ -801,13 +844,14 @@ GET    /api/v1/events/:id               # Get event details
 [API] → [Queue: process_item task]
            ↓
 [Celery Worker] → [process_item task]
-                    ├→ [Extract EXIF metadata]
-                    ├→ [Run captioning (GPT-4V/Gemini)]
-                    ├→ [Run OCR if text detected]
-                    ├→ [Generate embedding]
-                    ├→ [Store in processed_content]
-                    ├→ [Upsert to Qdrant]
-                    └→ [Update processing_status]
+                    ├→ [Normalize event_time_utc (EXIF/provider/server fallback)]
+                    ├→ [Compute content_hash + pHash; dedup gate]
+                    ├→ [Persist derived_artifacts (metadata/ocr/transcript/keyframes/vlm outputs)]
+                    ├→ [Extract 1..N contexts per item (taxonomy)]
+                    ├→ [Optional: semantic merge into episode contexts (time window)]
+                    ├→ [Embed vector_text for contexts]
+                    ├→ [Upsert contexts to Qdrant (context IDs + filterable payload)]
+                    └→ [Update processing_status + processing_error]
            ↓
 [Nightly Job] → [generate_daily_events]
                  ├→ [Cluster items by time]
@@ -857,24 +901,20 @@ GET    /api/v1/events/:id               # Get event details
 - [ ] Initialize Supabase project (Postgres + Auth + Storage)
 - [ ] Set up Qdrant Cloud instance
 - [ ] Implement FastAPI boilerplate with Supabase Auth integration
-- [ ] Create database schema (users, source_items, processed_content, embeddings, events, memory_nodes, memory_edges)
+- [ ] Create initial database schema (users, data_connections, source_items, processed_content, daily_summaries)
 - [ ] Set up Celery + Redis for task queue
-- [ ] Create Next.js app with Supabase Auth
+- [ ] Create/maintain React + Vite SPA with Supabase Auth
 - [ ] Implement login/logout flow
 
 ### Week 3-4: Data Ingestion
-- [ ] Implement batch upload endpoint + UI
-- [ ] Build Google Photos OAuth + Picker integration (connect, launch picker, poll selection)
-- [ ] Fetch selected Google Photos items, copy to Supabase Storage, and queue ingest (no automated full-library sync)
-- [ ] Deduplicate by provider media ID to avoid reprocessing the same selection
+- [ ] Harden manual upload + Google Photos Picker ingest (keep current flows working)
+- [ ] Add canonical timestamps (`event_time_utc`) + dedupe signals (`content_hash`, optional `pHash`)
+- [ ] Add versioned artifacts storage (`derived_artifacts` or evolve `processed_content`)
+- [ ] Add `processed_contexts` (1..N contexts per media item) and index by context ID in Qdrant
+- [ ] Implement image pipeline v1: OCR + VLM batch analysis → contexts → embeddings → Qdrant upsert
+- [ ] Implement video/audio v1 foundations: keyframes + transcript artifacts → initial contexts
 - [ ] Defer additional connectors (Google Drive, Oura, Apple Photos, etc.) until post-MVP
-- [ ] Create processing pipeline (Celery tasks):
-  - [ ] Image captioning
-  - [ ] OCR
-  - [ ] Video keyframe extraction
-  - [ ] Audio transcription
-  - [ ] Embedding generation
-- [ ] Implement Qdrant upsert logic
+- [ ] Implement Qdrant upsert for contexts + chunks with filterable payloads
 
 ### Week 5-6: Memory Layer
 - [ ] Build daily event clustering job

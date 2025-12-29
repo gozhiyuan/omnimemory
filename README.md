@@ -9,6 +9,7 @@ This repository houses the Lifelog AI MVP: a FastAPI + Celery backend (Postgres,
 - `orchestration/` – Docker Compose stack (Postgres, Redis, Qdrant, Prometheus, Grafana, Flower).
 - `lifelog-mvp-prd.md` – Product requirements.
 - `lifelog-mvp-dev-plan.md` – Development roadmap.
+- `docs/minecontext/lifelog_ingestion_rag_design.md` – Detailed ingestion + RAG design (draft).
 
 ### Tooling Prerequisites
 

@@ -1,6 +1,7 @@
 """Application configuration using pydantic-settings."""
 
 from functools import lru_cache
+import json
 from typing import Literal, Optional
 
 from pydantic import AnyUrl, Field, field_validator, model_validator
@@ -25,6 +26,7 @@ class Settings(BaseSettings):
         env_file=_env_paths,
         env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
     # App metadata
@@ -69,10 +71,30 @@ class Settings(BaseSettings):
         ]
     )
 
+    # OCR settings
+    ocr_provider: Literal["google_cloud_vision", "none"] = "google_cloud_vision"
+    ocr_google_api_key: Optional[str] = None
+    ocr_language_hints_raw: str = Field(default="", alias="OCR_LANGUAGE_HINTS")
+    ocr_timeout_seconds: int = 15
+
+    # VLM settings
+    vlm_provider: Literal["gemini", "none"] = "gemini"
+    gemini_api_key: Optional[str] = None
+    gemini_model: str = "gemini-2.5-flash-lite"
+    vlm_temperature: float = 0.2
+    vlm_max_output_tokens: int = 2048
+    vlm_timeout_seconds: int = 30
+
     @model_validator(mode="before")
     @classmethod
     def _coerce_empty_strings(cls, values):
-        for key in ("supabase_url", "supabase_service_role_key"):
+        for key in (
+            "supabase_url",
+            "supabase_service_role_key",
+            "ocr_google_api_key",
+            "gemini_api_key",
+            "ocr_language_hints_raw",
+        ):
             if values.get(key) == "":
                 values[key] = None
         return values
@@ -90,6 +112,19 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return [origin.strip() for origin in value.split(",") if origin.strip()]
         return value
+
+    @property
+    def ocr_language_hints(self) -> list[str]:
+        raw = (self.ocr_language_hints_raw or "").strip()
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        except json.JSONDecodeError:
+            pass
+        return [lang.strip() for lang in raw.split(",") if lang.strip()]
 
 
 @lru_cache(maxsize=1)

@@ -59,6 +59,7 @@ def test_dashboard_stats_returns_activity_and_recent_items(monkeypatch):
         id=item_id,
         item_type="photo",
         captured_at=created_at,
+        event_time_utc=created_at,
         created_at=created_at,
         processing_status="completed",
         storage_key="uploads/ui/example.png",
@@ -78,6 +79,7 @@ def test_dashboard_stats_returns_activity_and_recent_items(monkeypatch):
             FakeResult(scalar=4285357),
             FakeResult(scalars=[item]),
             FakeResult(rows=[caption_row]),
+            FakeResult(scalars=[]),
             FakeResult(rows=[ActivityRow(day=date.today(), count=4)]),
         ]
     )
@@ -107,6 +109,7 @@ def test_dashboard_handles_signing_failures(monkeypatch):
         id=item_id,
         item_type="photo",
         captured_at=created_at,
+        event_time_utc=created_at,
         created_at=created_at,
         processing_status="completed",
         storage_key="uploads/ui/example.png",
@@ -125,6 +128,7 @@ def test_dashboard_handles_signing_failures(monkeypatch):
             FakeResult(scalar=0),
             FakeResult(scalars=[item]),
             FakeResult(rows=[]),
+            FakeResult(scalars=[]),
             FakeResult(rows=[ActivityRow(day=date.today(), count=1)]),
         ]
     )

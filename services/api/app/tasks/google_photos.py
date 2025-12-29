@@ -11,7 +11,7 @@ from loguru import logger
 import re
 from pathlib import Path
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, or_
 
 from ..celery_app import celery_app
 from ..db.models import DEFAULT_TEST_USER_ID, DataConnection, SourceItem, User
@@ -105,7 +105,10 @@ async def _ingest_media_item(
         result = await session.execute(
             select(SourceItem).where(
                 SourceItem.connection_id == connection.id,
-                SourceItem.storage_key.in_([storage_key, download_url]),
+                or_(
+                    SourceItem.external_id == media_id,
+                    SourceItem.storage_key.in_([storage_key, download_url]),
+                ),
             )
         )
         existing = result.scalar_one_or_none()
@@ -113,6 +116,14 @@ async def _ingest_media_item(
             existing.storage_key = storage_key
             existing.content_type = existing.content_type or mime_type
             existing.original_filename = existing.original_filename or filename
+            existing.provider = existing.provider or "google_photos"
+            existing.external_id = existing.external_id or media_id
+            if captured_at and not existing.captured_at:
+                existing.captured_at = captured_at
+            if captured_at and not existing.event_time_utc:
+                existing.event_time_utc = captured_at
+                existing.event_time_source = "provider"
+                existing.event_time_confidence = 0.85
             existing.processing_status = "pending"
             existing.processing_error = None
             existing.updated_at = datetime.now(timezone.utc)
@@ -126,11 +137,16 @@ async def _ingest_media_item(
                 id=uuid4(),
                 user_id=connection.user_id,
                 connection_id=connection.id,
+                provider="google_photos",
+                external_id=media_id,
                 storage_key=storage_key,
                 item_type=_media_item_type(mime_type),
                 content_type=mime_type,
                 original_filename=filename,
                 captured_at=captured_at,
+                event_time_utc=captured_at,
+                event_time_source="provider",
+                event_time_confidence=0.85,
                 processing_status="pending",
             )
             session.add(source_item)

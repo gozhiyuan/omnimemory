@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import random
 from functools import lru_cache
-from typing import Any, Dict, List
-from uuid import UUID
+from typing import Any, Dict, Iterable, List, Optional
 
 from loguru import logger
 from qdrant_client import QdrantClient
@@ -38,48 +38,75 @@ def ensure_collection() -> None:
         )
 
 
-def _random_vector(seed: int, size: int) -> List[float]:
+def _deterministic_vector(seed: int, size: int) -> List[float]:
     rng = random.Random(seed)
     return [rng.random() for _ in range(size)]
 
 
-def upsert_random_embedding(item_id: UUID, payload: Dict[str, Any]) -> None:
-    """Insert a placeholder vector for an item."""
+def embed_text(text: str, size: int) -> List[float]:
+    digest = hashlib.sha256(text.encode("utf-8")).digest()
+    seed = int.from_bytes(digest[:8], "big", signed=False)
+    return _deterministic_vector(seed, size)
+
+
+def upsert_context_embeddings(contexts: Iterable[Any]) -> None:
+    """Insert embeddings for processed contexts."""
 
     settings = get_settings()
     ensure_collection()
     client = get_qdrant_client()
-    vector = _random_vector(hash(item_id.int) & 0xFFFFFFFF, settings.embedding_dimension)
-    logger.info("Upserting placeholder embedding for item {}", item_id)
+    points: list[qmodels.PointStruct] = []
+    for context in contexts:
+        vector_text = getattr(context, "vector_text", "") or ""
+        vector = embed_text(vector_text, settings.embedding_dimension)
+        payload = {
+            "context_id": str(context.id),
+            "user_id": str(context.user_id),
+            "context_type": getattr(context, "context_type", None),
+            "event_time_utc": getattr(context, "event_time_utc", None).isoformat()
+            if getattr(context, "event_time_utc", None)
+            else None,
+            "source_item_ids": [str(value) for value in getattr(context, "source_item_ids", [])],
+            "entities": getattr(context, "entities", []),
+        }
+        points.append(
+            qmodels.PointStruct(id=str(context.id), vector=vector, payload=payload)
+        )
+    if not points:
+        return
+    logger.info("Upserting {} context embeddings", len(points))
     client.upsert(
         collection_name=settings.qdrant_collection,
-        points=[
-            qmodels.PointStruct(
-                id=str(item_id),
-                vector=vector,
-                payload=payload,
-            )
-        ],
+        points=points,
         wait=True,
     )
 
 
-def search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
-    """Query Qdrant using a deterministic placeholder embedding for now."""
+def _user_filter(user_id: Optional[str]) -> Optional[qmodels.Filter]:
+    if not user_id:
+        return None
+    return qmodels.Filter(
+        must=[qmodels.FieldCondition(key="user_id", match=qmodels.MatchValue(value=user_id))]
+    )
+
+
+def search_contexts(query: str, limit: int = 5, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Query Qdrant using deterministic placeholder embeddings."""
 
     settings = get_settings()
     ensure_collection()
     client = get_qdrant_client()
-    vector = _random_vector(hash(query) & 0xFFFFFFFF, settings.embedding_dimension)
+    vector = embed_text(query, settings.embedding_dimension)
     results = client.search(
         collection_name=settings.qdrant_collection,
         query_vector=vector,
         limit=limit,
         with_payload=True,
+        query_filter=_user_filter(user_id),
     )
     return [
         {
-            "item_id": point.payload.get("item_id"),
+            "context_id": point.payload.get("context_id") or str(point.id),
             "score": point.score,
             "payload": point.payload,
         }
@@ -90,6 +117,7 @@ def search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
 __all__ = [
     "get_qdrant_client",
     "ensure_collection",
-    "upsert_random_embedding",
-    "search",
+    "embed_text",
+    "upsert_context_embeddings",
+    "search_contexts",
 ]

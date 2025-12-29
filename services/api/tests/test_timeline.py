@@ -53,6 +53,7 @@ def test_timeline_groups_items_and_signs_urls(monkeypatch):
         id=item_id,
         item_type="photo",
         captured_at=captured_at,
+        event_time_utc=captured_at,
         created_at=captured_at,
         processing_status="completed",
         storage_key="uploads/ui/example.png",
@@ -65,6 +66,7 @@ def test_timeline_groups_items_and_signs_urls(monkeypatch):
         [
             FakeResult(scalars=[item]),
             FakeResult(rows=[caption_row]),
+            FakeResult(scalars=[]),
         ]
     )
 

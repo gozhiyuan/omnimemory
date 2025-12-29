@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
 from ..config import get_settings
-from ..db.models import DEFAULT_TEST_USER_ID, DataConnection, ProcessedContent, SourceItem
+from ..db.models import DEFAULT_TEST_USER_ID, DataConnection, ProcessedContent, ProcessedContext, SourceItem
 from ..db.session import get_session
 from ..google_photos import get_valid_access_token
 from ..storage import get_storage_provider
@@ -93,7 +93,7 @@ async def get_dashboard_stats(
             SourceItem.user_id == user_id,
             SourceItem.processing_status == "completed",
         )
-        .order_by(SourceItem.created_at.desc())
+        .order_by(SourceItem.event_time_utc.desc().nulls_last(), SourceItem.created_at.desc())
         .limit(5)
     )
 
@@ -119,9 +119,11 @@ async def get_dashboard_stats(
     recent_items = list(recent_items_result.scalars().all())
 
     captions: dict[UUID, str] = {}
+    context_summaries: dict[UUID, str] = {}
     if recent_items:
+        recent_ids = [item.id for item in recent_items]
         caption_stmt = select(ProcessedContent.item_id, ProcessedContent.data).where(
-            ProcessedContent.item_id.in_([item.id for item in recent_items]),
+            ProcessedContent.item_id.in_(recent_ids),
             ProcessedContent.content_role == "caption",
         )
         caption_rows = await session.execute(caption_stmt)
@@ -130,6 +132,20 @@ async def get_dashboard_stats(
             for row in caption_rows.fetchall()
             if row.data
         }
+
+        context_stmt = select(ProcessedContext).where(
+            ProcessedContext.user_id == user_id,
+            ProcessedContext.is_episode.is_(False),
+            ProcessedContext.source_item_ids.overlap(recent_ids),
+        )
+        context_rows = await session.execute(context_stmt)
+        for context in context_rows.scalars().all():
+            for source_id in context.source_item_ids:
+                existing = context_summaries.get(source_id)
+                if existing and context.context_type != "activity_context":
+                    continue
+                if source_id not in context_summaries or context.context_type == "activity_context":
+                    context_summaries[source_id] = context.summary
 
     settings = get_settings()
     storage = get_storage_provider()
@@ -189,12 +205,12 @@ async def get_dashboard_stats(
             DashboardRecentItem(
                 id=item.id,
                 item_type=item.item_type,
-                captured_at=(item.captured_at or item.created_at).isoformat(),
+                captured_at=(item.event_time_utc or item.captured_at or item.created_at).isoformat(),
                 processed=item.processing_status == "completed",
                 storage_key=item.storage_key,
                 content_type=item.content_type,
                 original_filename=item.original_filename,
-                caption=captions.get(item.id),
+                caption=context_summaries.get(item.id) or captions.get(item.id),
                 download_url=download_urls.get(item.id),
             )
             for item in recent_items

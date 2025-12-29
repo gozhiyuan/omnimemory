@@ -30,6 +30,8 @@ class IngestRequest(BaseModel):
     storage_key: str = Field(..., description="Key/path in object storage")
     item_type: ItemType = Field(..., description="Asset type")
     user_id: UUID = Field(default=DEFAULT_TEST_USER_ID, description="Owner identifier")
+    provider: Optional[str] = Field(default="upload", description="Source provider name")
+    external_id: Optional[str] = Field(default=None, description="Source provider item id")
     captured_at: Optional[datetime] = Field(default=None, description="Original capture timestamp")
     content_type: Optional[str] = Field(default=None, description="MIME type of the asset")
     original_filename: Optional[str] = Field(default=None, description="Original filename if available")
@@ -54,12 +56,23 @@ async def ingest_item(
         session.add(user)
 
     item_id = uuid4()
+    provider = request.provider or "upload"
+    event_time_source = "provider" if provider != "upload" else "client"
+    event_time_confidence = 0.85 if provider != "upload" else 0.7
+    if not request.captured_at:
+        event_time_source = "server"
+        event_time_confidence = 0.4
     source_item = SourceItem(
         id=item_id,
         user_id=request.user_id,
+        provider=provider,
+        external_id=request.external_id,
         storage_key=request.storage_key,
         item_type=request.item_type.value,
         captured_at=request.captured_at,
+        event_time_utc=request.captured_at,
+        event_time_source=event_time_source,
+        event_time_confidence=event_time_confidence,
         content_type=request.content_type,
         original_filename=request.original_filename,
         processing_status="pending",
@@ -80,4 +93,3 @@ async def ingest_item(
     )
 
     return IngestResponse(item_id=str(item_id), task_id=task.id)
-

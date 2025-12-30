@@ -17,6 +17,7 @@ from ..celery_app import celery_app
 from ..db.models import DEFAULT_TEST_USER_ID, DataConnection, SourceItem, User
 from ..db.session import isolated_session
 from ..google_photos import (
+    extract_picker_location,
     extract_picker_media_fields,
     fetch_picker_media_item,
     fetch_picker_media_items,
@@ -79,6 +80,7 @@ async def _ingest_media_item(
     if not media_id:
         return None
     base_url, filename, mime_type, creation_time = extract_picker_media_fields(item)
+    provider_location = extract_picker_location(item)
     if not base_url:
         try:
             hydrated = await fetch_picker_media_item(access_token, session_id, media_id)
@@ -86,6 +88,8 @@ async def _ingest_media_item(
             logger.warning("Failed to hydrate picker item {}: {}", media_id, exc)
             hydrated = {}
         base_url, _, mime_type, creation_time = extract_picker_media_fields(hydrated)
+        if not provider_location:
+            provider_location = extract_picker_location(hydrated)
     if not base_url:
         logger.warning(
             "Skipping media item {} without baseUrl (keys={} session={})",
@@ -172,6 +176,7 @@ async def _ingest_media_item(
             "captured_at": captured_at.isoformat() if captured_at else None,
             "content_type": mime_type,
             "original_filename": filename,
+            "provider_location": provider_location,
         }
     )
     return source_item.id

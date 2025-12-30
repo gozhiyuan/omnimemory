@@ -85,6 +85,15 @@ class Settings(BaseSettings):
     vlm_max_output_tokens: int = 2048
     vlm_timeout_seconds: int = 30
 
+    # Maps/Geocoding settings
+    maps_geocoding_provider: Literal["google_maps", "none"] = "google_maps"
+    maps_google_api_key: Optional[str] = None
+    maps_timeout_seconds: int = 15
+
+    # Pipeline logging
+    pipeline_log_details: bool = Field(default=False, alias="PIPELINE_LOG_DETAILS")
+    pipeline_reprocess_duplicates: bool = Field(default=False, alias="PIPELINE_REPROCESS_DUPLICATES")
+
     @model_validator(mode="before")
     @classmethod
     def _coerce_empty_strings(cls, values):
@@ -94,6 +103,7 @@ class Settings(BaseSettings):
             "ocr_google_api_key",
             "gemini_api_key",
             "ocr_language_hints_raw",
+            "maps_google_api_key",
         ):
             if values.get(key) == "":
                 values[key] = None

@@ -35,6 +35,10 @@ class IngestRequest(BaseModel):
     captured_at: Optional[datetime] = Field(default=None, description="Original capture timestamp")
     content_type: Optional[str] = Field(default=None, description="MIME type of the asset")
     original_filename: Optional[str] = Field(default=None, description="Original filename if available")
+    reprocess_duplicates: Optional[bool] = Field(
+        default=None,
+        description="Re-run expensive steps even if the item is a duplicate",
+    )
 
 
 class IngestResponse(BaseModel):
@@ -80,8 +84,7 @@ async def ingest_item(
     session.add(source_item)
     await session.commit()
 
-    task = process_item.delay(
-        {
+    payload = {
             "item_id": str(item_id),
             "storage_key": request.storage_key,
             "item_type": request.item_type.value,
@@ -89,7 +92,10 @@ async def ingest_item(
             "captured_at": request.captured_at.isoformat() if request.captured_at else None,
             "content_type": request.content_type,
             "original_filename": request.original_filename,
-        }
-    )
+    }
+    if request.reprocess_duplicates is not None:
+        payload["reprocess_duplicates"] = request.reprocess_duplicates
+
+    task = process_item.delay(payload)
 
     return IngestResponse(item_id=str(item_id), task_id=task.id)

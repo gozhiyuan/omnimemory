@@ -15,7 +15,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
 from ..config import get_settings
-from ..db.models import DEFAULT_TEST_USER_ID, DataConnection, ProcessedContent, ProcessedContext, SourceItem
+from ..db.models import (
+    DEFAULT_TEST_USER_ID,
+    DataConnection,
+    DerivedArtifact,
+    ProcessedContent,
+    ProcessedContext,
+    SourceItem,
+)
 from ..db.session import get_session
 from ..google_photos import get_valid_access_token
 from ..storage import get_storage_provider
@@ -40,6 +47,9 @@ class TimelineDay(BaseModel):
     date: date
     item_count: int
     items: List[TimelineItem]
+
+
+WEB_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 
 
 @router.get("/", response_model=list[TimelineDay])
@@ -71,6 +81,7 @@ async def get_timeline(
 
     captions: dict[UUID, str] = {}
     context_summaries: dict[UUID, str] = {}
+    preview_keys: dict[UUID, str] = {}
     if items:
         item_ids = [item.id for item in items]
         caption_stmt = select(ProcessedContent.item_id, ProcessedContent.data).where(
@@ -97,6 +108,16 @@ async def get_timeline(
                     continue
                 if source_id not in context_summaries or context.context_type == "activity_context":
                     context_summaries[source_id] = context.summary
+
+        preview_stmt = select(DerivedArtifact.source_item_id, DerivedArtifact.payload).where(
+            DerivedArtifact.source_item_id.in_(item_ids),
+            DerivedArtifact.artifact_type == "preview_image",
+        )
+        preview_rows = await session.execute(preview_stmt)
+        for row in preview_rows.fetchall():
+            payload = row.payload or {}
+            if payload.get("status") == "ok" and payload.get("storage_key"):
+                preview_keys[row.source_item_id] = payload["storage_key"]
 
     settings = get_settings()
     storage = get_storage_provider()
@@ -138,8 +159,8 @@ async def get_timeline(
                 if token:
                     tokens[conn.id] = token
 
-    async def download_url_for(item: SourceItem) -> Optional[str]:
-        storage_key = item.storage_key
+    async def download_url_for(item: SourceItem, storage_override: Optional[str]) -> Optional[str]:
+        storage_key = storage_override or item.storage_key
         if storage_key.startswith("http://") or storage_key.startswith("https://"):
             conn_id = getattr(item, "connection_id", None)
             token = tokens.get(conn_id) if conn_id else None
@@ -158,7 +179,15 @@ async def get_timeline(
 
     if items:
         signed_list = await asyncio.gather(
-            *(download_url_for(item) for item in items),
+            *(
+                download_url_for(
+                    item,
+                    preview_keys.get(item.id)
+                    if (item.content_type or "").lower() not in WEB_IMAGE_TYPES
+                    else None,
+                )
+                for item in items
+            ),
             return_exceptions=False,
         )
         download_urls = {item.id: url for item, url in zip(items, signed_list)}

@@ -495,11 +495,14 @@ class DedupStep:
     async def run(self, item: SourceItem, artifacts: PipelineArtifacts, config: PipelineConfig) -> None:
         content_hash = artifacts.get("content_hash") or item.content_hash
         if not content_hash:
+            if item.canonical_item_id is None:
+                item.canonical_item_id = item.id
             return
         reprocess_duplicates = config.payload.get("reprocess_duplicates")
         if reprocess_duplicates is None:
             reprocess_duplicates = config.settings.pipeline_reprocess_duplicates
         reprocess_duplicates = bool(reprocess_duplicates)
+        canonical_item_id: Optional[UUID] = None
 
         stmt = (
             select(SourceItem)
@@ -514,9 +517,12 @@ class DedupStep:
         result = await config.session.execute(stmt)
         duplicate = result.scalar_one_or_none()
         if duplicate:
+            canonical_item_id = duplicate.canonical_item_id or duplicate.id
+            if duplicate.canonical_item_id is None:
+                duplicate.canonical_item_id = canonical_item_id
             payload = {
                 "status": "exact_duplicate",
-                "canonical_item_id": str(duplicate.id),
+                "canonical_item_id": str(canonical_item_id),
                 "content_hash": content_hash,
                 "reprocess": reprocess_duplicates,
             }
@@ -529,14 +535,16 @@ class DedupStep:
                 payload=payload,
             )
             artifacts.set("dedupe", payload)
+            item.canonical_item_id = canonical_item_id
             if not reprocess_duplicates:
                 artifacts.skip_expensive = True
             return
 
         if item.item_type != "photo" or not item.phash or not item.event_time_utc:
+            item.canonical_item_id = item.id
             return
 
-        window = timedelta(minutes=10)
+        window = timedelta(minutes=config.settings.dedupe_near_window_minutes)
         start = item.event_time_utc - window
         end = item.event_time_utc + window
         stmt = select(SourceItem).where(
@@ -552,10 +560,13 @@ class DedupStep:
             distance = hamming_distance_hex(item.phash, candidate.phash or "")
             if distance is None:
                 continue
-            if distance <= 5:
+            if distance <= config.settings.dedupe_near_hamming_threshold:
+                canonical_item_id = candidate.canonical_item_id or candidate.id
+                if candidate.canonical_item_id is None:
+                    candidate.canonical_item_id = canonical_item_id
                 payload = {
                     "status": "near_duplicate",
-                    "canonical_item_id": str(candidate.id),
+                    "canonical_item_id": str(canonical_item_id),
                     "phash": item.phash,
                     "distance": distance,
                     "reprocess": reprocess_duplicates,
@@ -569,9 +580,12 @@ class DedupStep:
                     payload=payload,
                 )
                 artifacts.set("dedupe", payload)
+                item.canonical_item_id = canonical_item_id
                 if not reprocess_duplicates:
                     artifacts.skip_expensive = True
                 break
+        if item.canonical_item_id is None:
+            item.canonical_item_id = item.id
 
 
 class CaptionStep:
@@ -804,6 +818,42 @@ class ContextPersistStep:
                 }
             )
         if not contexts:
+            dedupe = artifacts.get("dedupe") or {}
+            canonical_id = dedupe.get("canonical_item_id")
+            if canonical_id and not dedupe.get("reprocess"):
+                try:
+                    canonical_uuid = UUID(str(canonical_id))
+                except ValueError:
+                    canonical_uuid = None
+                if canonical_uuid:
+                    stmt = select(ProcessedContext).where(
+                        ProcessedContext.user_id == item.user_id,
+                        ProcessedContext.is_episode.is_(False),
+                        ProcessedContext.source_item_ids.contains([canonical_uuid]),
+                    )
+                    result = await config.session.execute(stmt)
+                    canonical_contexts = result.scalars().all()
+                    if canonical_contexts:
+                        context_ids: list[str] = []
+                        for context in canonical_contexts:
+                            if item.id not in context.source_item_ids:
+                                context.source_item_ids = list(context.source_item_ids) + [item.id]
+                            context_ids.append(str(context.id))
+                        await config.session.flush()
+                        artifacts.set("context_ids", context_ids)
+                        artifacts.set("context_records", canonical_contexts)
+                        fingerprint = hash_parts([canonical_id, item.id, "reuse"])
+                        await artifacts.store.upsert(
+                            artifact_type="contexts",
+                            producer=self.name,
+                            producer_version=self.version,
+                            input_fingerprint=fingerprint,
+                            payload={
+                                "context_ids": context_ids,
+                                "canonical_item_id": str(canonical_id),
+                                "reused": True,
+                            },
+                        )
             return
         context_signature = hash_parts(
             [json.dumps(contexts, sort_keys=True), artifacts.get("content_hash")]
@@ -871,15 +921,16 @@ class ContextPersistStep:
 
 class EmbeddingStep:
     name = "embeddings"
-    version = "placeholder_v1"
+    version = "v2"
     is_expensive = True
 
     async def run(self, item: SourceItem, artifacts: PipelineArtifacts, config: PipelineConfig) -> None:
         context_ids = artifacts.get("context_ids") or []
         if not context_ids:
             return
-        fingerprint = hash_parts([self.version, ",".join(context_ids)])
-        existing = await artifacts.store.get("embeddings", self.name, self.version, fingerprint)
+        model = config.settings.embedding_model
+        fingerprint = hash_parts([model, ",".join(context_ids)])
+        existing = await artifacts.store.get("embeddings", self.name, model, fingerprint)
         if existing:
             return
         context_records = artifacts.get("context_records")
@@ -896,7 +947,7 @@ class EmbeddingStep:
         await artifacts.store.upsert(
             artifact_type="embeddings",
             producer=self.name,
-            producer_version=self.version,
+            producer_version=model,
             input_fingerprint=fingerprint,
             payload={"context_ids": context_ids},
         )

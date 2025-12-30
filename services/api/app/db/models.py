@@ -89,6 +89,9 @@ class SourceItem(Base):
     original_filename: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     provider: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     external_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    canonical_item_id: Mapped[Optional[UUID]] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("source_items.id", ondelete="SET NULL"), nullable=True
+    )
     captured_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     content_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     phash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
@@ -107,8 +110,16 @@ class SourceItem(Base):
 
     user: Mapped[User] = relationship(back_populates="items")
     connection: Mapped[Optional[DataConnection]] = relationship(back_populates="items")
-    processed_content: Mapped[list["ProcessedContent"]] = relationship(back_populates="item")
-    derived_artifacts: Mapped[list["DerivedArtifact"]] = relationship(back_populates="item")
+    processed_content: Mapped[list["ProcessedContent"]] = relationship(
+        back_populates="item",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    derived_artifacts: Mapped[list["DerivedArtifact"]] = relationship(
+        back_populates="item",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
 
 class ProcessedContent(Base):

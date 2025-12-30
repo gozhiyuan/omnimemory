@@ -226,6 +226,7 @@ Reference: `docs/minecontext/lifelog_ingestion_rag_design.md`
 5) **Dedup gates (cost control; required for future devices)**
    - [ ] Exact dedup: compute `content_hash` (SHA256); if duplicate, link to canonical and skip expensive steps.
    - [ ] Near-dup for images: compute `pHash` and compare within a rolling window; mark redundant items and skip VLM (configurable).
+   - [ ] Track `canonical_item_id` on `source_items` and reuse canonical contexts when duplicates are skipped.
 
 6) **Image pipeline v1 (multi-context extraction)**
    - [ ] OCR step (configurable backend; start with a placeholder or simple implementation).
@@ -238,7 +239,15 @@ Reference: `docs/minecontext/lifelog_ingestion_rag_design.md`
    - [ ] Store filterable payload: `user_id`, `context_type`, `event_time_utc`, `source_item_ids`, `entities`.
    - [ ] Update `/search` to search contexts (not raw items) and return context IDs + citations.
 
-8) **API/UI wiring validation**
+8) **Backfill + deletion tooling**
+   - [ ] Add backfill task to re-run pipeline steps for existing items (VLM/embeddings/Qdrant):
+     ```
+     uv run celery -A app.celery_app.celery_app call maintenance.backfill_pipeline \
+       --kwargs='{"limit":200,"missing_artifacts":["vlm_observations","embeddings"],"reprocess_duplicates":true}'
+     ```
+   - [ ] Add timeline delete endpoint + UI action to remove a memory and clean up storage + DB + Qdrant.
+
+9) **API/UI wiring validation**
    - [ ] Timeline uses `event_time_utc` and shows context-derived title/summary (fallback to legacy caption).
    - [ ] Add a small “processing inspector” view (optional): show derived artifacts + contexts per item for debugging.
 
@@ -1441,6 +1450,12 @@ User question: {query}"""
 4. Add most requested features
 
 ### Ingestion Expansion (Post-MVP)
+
+**Photo Pipeline Enhancements (Post-MVP)**
+- [ ] EXIF timezone fallback: infer timezone when OffsetTimeOriginal is missing (e.g., GPS/timezone database or user profile)
+- [ ] EXIF/XMP sidecar support for GPS/time when metadata is stored outside the image file
+- [ ] Preview/thumbnail generation for all photo formats (not just HEIF)
+- [ ] Geocode VLM-derived location names when GPS is missing (normalize to lat/lng + address)
 
 **Desktop Capture App (macOS first)**
 - [ ] Build a lightweight menubar app that captures screenshots every 30s while the screen is active (idle detection + pause toggle)

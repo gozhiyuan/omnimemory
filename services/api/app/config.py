@@ -36,8 +36,12 @@ class Settings(BaseSettings):
     # Storage + data services
     redis_url: str = Field(..., description="Redis connection URL")
     qdrant_url: AnyUrl = Field(..., description="Qdrant HTTP endpoint")
-    qdrant_collection: str = "lifelog-items"
-    embedding_dimension: int = Field(default=1536, ge=1, description="Embedding vector size")
+    qdrant_collection: str = "lifelog-items-v2"
+    embedding_dimension: int = Field(default=3072, ge=1, description="Embedding vector size")
+    embedding_provider: Literal["gemini", "none"] = "gemini"
+    embedding_model: str = "gemini-embedding-001"
+    embedding_batch_size: int = Field(default=16, ge=1)
+    embedding_timeout_seconds: int = 30
     postgres_host: str = "localhost"
     postgres_port: int = 5432
     postgres_db: str = "lifelog"
@@ -93,6 +97,12 @@ class Settings(BaseSettings):
     # Pipeline logging
     pipeline_log_details: bool = Field(default=False, alias="PIPELINE_LOG_DETAILS")
     pipeline_reprocess_duplicates: bool = Field(default=False, alias="PIPELINE_REPROCESS_DUPLICATES")
+    dedupe_near_window_minutes: int = Field(default=10, ge=1, alias="DEDUPE_NEAR_WINDOW_MINUTES")
+    dedupe_near_hamming_threshold: int = Field(
+        default=5,
+        ge=0,
+        alias="DEDUPE_NEAR_HAMMING_THRESHOLD",
+    )
 
     @model_validator(mode="before")
     @classmethod

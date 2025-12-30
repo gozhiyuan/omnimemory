@@ -8,7 +8,7 @@ import asyncio
 from typing import List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +26,7 @@ from ..db.models import (
 from ..db.session import get_session
 from ..google_photos import get_valid_access_token
 from ..storage import get_storage_provider
+from ..vectorstore import delete_context_embeddings, upsert_context_embeddings
 
 
 router = APIRouter()
@@ -47,6 +48,11 @@ class TimelineDay(BaseModel):
     date: date
     item_count: int
     items: List[TimelineItem]
+
+
+class DeleteResponse(BaseModel):
+    item_id: UUID
+    status: str
 
 
 WEB_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
@@ -223,3 +229,98 @@ async def get_timeline(
         )
 
     return timeline
+
+
+@router.delete("/items/{item_id}", response_model=DeleteResponse)
+async def delete_timeline_item(
+    item_id: UUID,
+    user_id: UUID = DEFAULT_TEST_USER_ID,
+    session: AsyncSession = Depends(get_session),
+) -> DeleteResponse:
+    item = await session.get(SourceItem, item_id)
+    if not item or item.user_id != user_id:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    storage = get_storage_provider()
+    storage_keys = []
+    if item.storage_key and not item.storage_key.startswith(("http://", "https://")):
+        storage_keys.append(item.storage_key)
+
+    preview_stmt = select(DerivedArtifact).where(
+        DerivedArtifact.source_item_id == item.id,
+        DerivedArtifact.artifact_type == "preview_image",
+    )
+    preview_rows = await session.execute(preview_stmt)
+    for preview in preview_rows.scalars().all():
+        if preview.storage_key:
+            storage_keys.append(preview.storage_key)
+
+    updated_contexts: list[ProcessedContext] = []
+    deleted_context_ids: list[str] = []
+    context_stmt = select(ProcessedContext).where(
+        ProcessedContext.user_id == user_id,
+        ProcessedContext.source_item_ids.contains([item.id]),
+    )
+    context_rows = await session.execute(context_stmt)
+    for context in context_rows.scalars().all():
+        remaining = [value for value in context.source_item_ids if value != item.id]
+        if not remaining:
+            deleted_context_ids.append(str(context.id))
+            await session.delete(context)
+        else:
+            context.source_item_ids = remaining
+            updated_contexts.append(context)
+
+    canonical_stmt = select(SourceItem).where(
+        SourceItem.user_id == user_id,
+        SourceItem.canonical_item_id == item.id,
+        SourceItem.id != item.id,
+    )
+    canonical_rows = await session.execute(canonical_stmt)
+    canonical_items = canonical_rows.scalars().all()
+
+    dup_items = []
+    if item.content_hash:
+        dup_stmt = (
+            select(SourceItem)
+            .where(
+                SourceItem.user_id == user_id,
+                SourceItem.content_hash == item.content_hash,
+                SourceItem.id != item.id,
+            )
+            .order_by(SourceItem.created_at.asc())
+        )
+        dup_rows = await session.execute(dup_stmt)
+        dup_items = dup_rows.scalars().all()
+        if dup_items:
+            canonical = dup_items[0].canonical_item_id or dup_items[0].id
+            for dup_item in dup_items:
+                dup_item.canonical_item_id = canonical
+
+    dup_ids = {dup_item.id for dup_item in dup_items}
+    for canonical_item in canonical_items:
+        if canonical_item.id in dup_ids:
+            continue
+        canonical_item.canonical_item_id = canonical_item.id
+
+    await session.delete(item)
+    await session.commit()
+
+    for key in storage_keys:
+        try:
+            storage.delete(key)
+        except Exception as exc:  # pragma: no cover - external storage dependency
+            logger.warning("Failed to delete storage key {}: {}", key, exc)
+
+    if deleted_context_ids:
+        try:
+            delete_context_embeddings(deleted_context_ids)
+        except Exception as exc:  # pragma: no cover - external service dependency
+            logger.warning("Failed to delete embeddings: {}", exc)
+    if updated_contexts:
+        try:
+            upsert_context_embeddings(updated_contexts)
+        except Exception as exc:  # pragma: no cover - external service dependency
+            logger.warning("Failed to refresh embeddings: {}", exc)
+
+    return DeleteResponse(item_id=item_id, status="deleted")

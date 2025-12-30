@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Calendar, Filter, Image as ImageIcon } from 'lucide-react';
-import { apiGet } from '../services/api';
+import { apiDelete, apiGet } from '../services/api';
 import { TimelineDay, TimelineItem } from '../types';
 
 const formatDate = (value?: string) => {
@@ -19,6 +19,7 @@ export const Timeline: React.FC = () => {
   const [days, setDays] = useState<TimelineDay[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -47,6 +48,32 @@ export const Timeline: React.FC = () => {
   }, []);
 
   const hasItems = useMemo(() => days.some(day => day.items.length > 0), [days]);
+
+  const removeItem = (itemId: string) => {
+    setDays((prev) =>
+      prev
+        .map((day) => {
+          const remaining = day.items.filter((item) => item.id !== itemId);
+          return { ...day, items: remaining, item_count: remaining.length };
+        })
+        .filter((day) => day.items.length > 0)
+    );
+  };
+
+  const handleDelete = async (itemId: string) => {
+    if (!confirm('Delete this memory? This will remove it from storage and search.')) {
+      return;
+    }
+    setDeletingId(itemId);
+    try {
+      await apiDelete(`/timeline/items/${itemId}`);
+      removeItem(itemId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to delete item.');
+    } finally {
+      setDeletingId(null);
+    }
+  };
 
   return (
     <div className="p-8 h-full overflow-y-auto">
@@ -113,6 +140,14 @@ export const Timeline: React.FC = () => {
                     <div className="absolute inset-0 bg-gradient-to-t from-black/50 to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex flex-col justify-end p-4">
                       <p className="text-white text-sm font-medium truncate">{buildLabel(item)}</p>
                     </div>
+                    <button
+                      type="button"
+                      onClick={() => handleDelete(item.id)}
+                      className="absolute right-3 top-3 rounded-full bg-white/90 px-2 py-1 text-xs font-medium text-slate-700 opacity-0 shadow-sm transition-opacity group-hover:opacity-100"
+                      disabled={deletingId === item.id}
+                    >
+                      {deletingId === item.id ? 'Deleting…' : 'Delete'}
+                    </button>
                   </div>
                   <div className="p-4">
                     <div className="flex items-center text-xs text-slate-500 mb-2">

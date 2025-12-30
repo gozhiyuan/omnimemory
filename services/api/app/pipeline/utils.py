@@ -35,6 +35,15 @@ def parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
     return dt
 
 
+def parse_exif_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
 def ensure_tz_aware(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)

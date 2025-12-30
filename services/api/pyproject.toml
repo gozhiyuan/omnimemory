@@ -19,6 +19,8 @@ dependencies = [
   "loguru~=0.7",
   "supabase~=2.4",
   "google-genai~=0.5",
+  "Pillow~=10.4",
+  "pillow-heif~=0.16",
   "sqlalchemy[asyncio]~=2.0",
   "asyncpg~=0.29"
 ]

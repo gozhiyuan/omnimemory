@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 import json
 from pathlib import Path
+import re
 from typing import Any, Optional
 from uuid import UUID
 
@@ -13,7 +15,7 @@ import httpx
 from loguru import logger
 from sqlalchemy import delete, select
 
-from ..ai import analyze_image_with_vlm, run_ocr
+from ..ai import analyze_image_with_vlm, reverse_geocode, run_ocr
 from ..ai.prompts import build_lifelog_image_prompt
 from ..db.models import DataConnection, ProcessedContent, ProcessedContext, SourceItem
 from ..google_photos import get_valid_access_token
@@ -28,6 +30,7 @@ from .utils import (
     hash_parts,
     parse_iso_datetime,
     hamming_distance_hex,
+    parse_exif_datetime,
 )
 
 
@@ -101,6 +104,9 @@ class MetadataStep:
     async def run(self, item: SourceItem, artifacts: PipelineArtifacts, config: PipelineConfig) -> None:
         blob = artifacts.get("blob") or b""
         payload = config.payload
+        provider_location = payload.get("provider_location")
+        if isinstance(provider_location, dict):
+            artifacts.set("provider_location", provider_location)
         if payload.get("content_type") and not item.content_type:
             item.content_type = payload.get("content_type")
         if payload.get("original_filename") and not item.original_filename:
@@ -119,6 +125,8 @@ class MetadataStep:
             "original_filename": item.original_filename,
             "processed_at": datetime.now(timezone.utc).isoformat(),
         }
+        if isinstance(provider_location, dict):
+            metadata["provider_location"] = provider_location
         fingerprint = hash_parts([artifacts.get("content_hash"), metadata.get("size_bytes"), item.content_type])
         await artifacts.store.upsert(
             artifact_type="metadata",
@@ -129,6 +137,277 @@ class MetadataStep:
         )
         await _upsert_content(config.session, item.id, "metadata", metadata)
         artifacts.set("metadata", metadata)
+
+
+class ExifStep:
+    name = "exif"
+    version = "v1"
+    is_expensive = False
+
+    async def run(self, item: SourceItem, artifacts: PipelineArtifacts, config: PipelineConfig) -> None:
+        if item.item_type != "photo":
+            return
+        blob = artifacts.get("blob")
+        if not blob:
+            return
+        content_hash = artifacts.get("content_hash")
+        fingerprint = hash_parts([content_hash, self.version])
+        existing = await artifacts.store.get("exif", self.name, self.version, fingerprint)
+        if existing:
+            artifacts.set("exif", existing.payload or {})
+            return
+
+        try:
+            from PIL import ExifTags, Image
+        except Exception:  # pragma: no cover - optional dependency
+            return
+
+        def _rational_to_float(value) -> float:
+            if hasattr(value, "numerator") and hasattr(value, "denominator"):
+                return float(value.numerator) / float(value.denominator)
+            if isinstance(value, tuple) and len(value) == 2:
+                return float(value[0]) / float(value[1])
+            return float(value)
+
+        def _convert_to_degrees(value) -> float:
+            degrees = _rational_to_float(value[0])
+            minutes = _rational_to_float(value[1])
+            seconds = _rational_to_float(value[2])
+            return degrees + (minutes / 60.0) + (seconds / 3600.0)
+
+        def _parse_offset(offset: str | None) -> int | None:
+            if not offset:
+                return None
+            match = re.match(r"^([+-])(\d{2}):?(\d{2})$", offset.strip())
+            if not match:
+                return None
+            sign = -1 if match.group(1) == "-" else 1
+            hours = int(match.group(2))
+            minutes = int(match.group(3))
+            return sign * (hours * 60 + minutes)
+
+
+        try:
+            image = Image.open(BytesIO(blob))
+            exif = image.getexif()
+        except Exception:
+            return
+
+        date_time_original = exif.get(36867) or exif.get(306)
+        offset_time = exif.get(36881) or exif.get(36880)
+        offset_minutes = _parse_offset(offset_time) if isinstance(offset_time, str) else None
+
+        event_time_utc = None
+        parsed_dt = parse_exif_datetime(date_time_original) if isinstance(date_time_original, str) else None
+        if parsed_dt and offset_minutes is not None:
+            tzinfo = timezone(timedelta(minutes=offset_minutes))
+            event_time_utc = parsed_dt.replace(tzinfo=tzinfo).astimezone(timezone.utc)
+
+        gps_info = None
+        if hasattr(exif, "get_ifd"):
+            try:
+                gps_ifd = ExifTags.IFD.GPSInfo if hasattr(ExifTags, "IFD") else 34853
+                gps_info = exif.get_ifd(gps_ifd)
+            except Exception:
+                gps_info = None
+        if not gps_info:
+            gps_info = exif.get(34853)
+        gps_payload = {}
+        lat = None
+        lng = None
+        gps_items = None
+        if isinstance(gps_info, dict):
+            gps_items = gps_info.items()
+        else:
+            try:
+                gps_items = dict(gps_info).items()
+            except Exception:
+                gps_items = None
+        if gps_items:
+            gps_tags = {}
+            for key, value in gps_items:
+                tag_name = ExifTags.GPSTAGS.get(key, key)
+                gps_tags[tag_name] = value
+            lat_ref = gps_tags.get("GPSLatitudeRef")
+            lat_val = gps_tags.get("GPSLatitude")
+            lon_ref = gps_tags.get("GPSLongitudeRef")
+            lon_val = gps_tags.get("GPSLongitude")
+            if lat_ref and lat_val and lon_ref and lon_val:
+                lat = _convert_to_degrees(lat_val)
+                if str(lat_ref).upper().startswith("S"):
+                    lat = -lat
+                lng = _convert_to_degrees(lon_val)
+                if str(lon_ref).upper().startswith("W"):
+                    lng = -lng
+            altitude = gps_tags.get("GPSAltitude")
+            if altitude is not None:
+                try:
+                    altitude = _rational_to_float(altitude)
+                except Exception:
+                    altitude = None
+            gps_payload = {
+                "latitude": lat,
+                "longitude": lng,
+                "altitude": altitude,
+            }
+
+        payload = {
+            "datetime_original": date_time_original if isinstance(date_time_original, str) else None,
+            "timezone_offset_minutes": offset_minutes,
+            "event_time_utc": event_time_utc.isoformat() if event_time_utc else None,
+            "gps": gps_payload if gps_payload else None,
+        }
+        await artifacts.store.upsert(
+            artifact_type="exif",
+            producer=self.name,
+            producer_version=self.version,
+            input_fingerprint=fingerprint,
+            payload=payload,
+        )
+        artifacts.set("exif", payload)
+
+
+class PreviewStep:
+    name = "preview"
+    version = "v1"
+    is_expensive = False
+
+    async def run(self, item: SourceItem, artifacts: PipelineArtifacts, config: PipelineConfig) -> None:
+        if item.item_type != "photo":
+            return
+        blob = artifacts.get("blob")
+        if not blob:
+            return
+        content_type = (item.content_type or "").lower()
+        filename = (item.original_filename or "").lower()
+        heif_types = {"image/heic", "image/heif", "image/heic-sequence", "image/heif-sequence"}
+        is_heif = content_type in heif_types or filename.endswith((".heic", ".heif"))
+        if not is_heif:
+            return
+
+        content_hash = artifacts.get("content_hash") or hash_bytes(blob)
+        fingerprint = hash_parts([content_hash, self.version, "jpeg_preview"])
+        existing = await artifacts.store.get("preview_image", self.name, self.version, fingerprint)
+        if existing:
+            artifacts.set("preview", existing.payload or {})
+            return
+
+        try:
+            from PIL import Image, ImageOps
+        except Exception:  # pragma: no cover - optional dependency
+            return
+        try:
+            from pillow_heif import register_heif_opener
+        except Exception as exc:  # pragma: no cover - optional dependency
+            logger.warning("HEIF preview skipped for item {}: {}", item.id, exc)
+            return
+
+        try:
+            register_heif_opener()
+            image = Image.open(BytesIO(blob))
+            image = ImageOps.exif_transpose(image)
+            image = image.convert("RGB")
+            image.thumbnail((1600, 1600))
+            output = BytesIO()
+            image.save(output, format="JPEG", quality=85, optimize=True)
+            preview_bytes = output.getvalue()
+        except Exception as exc:  # pragma: no cover - image decoding errors
+            logger.warning("Preview generation failed for item {}: {}", item.id, exc)
+            payload = {"status": "error", "error": str(exc)}
+            await artifacts.store.upsert(
+                artifact_type="preview_image",
+                producer=self.name,
+                producer_version=self.version,
+                input_fingerprint=fingerprint,
+                payload=payload,
+            )
+            artifacts.set("preview", payload)
+            return
+
+        preview_key = f"previews/{item.user_id}/{item.id}.jpg"
+        try:
+            await asyncio.to_thread(config.storage.store, preview_key, preview_bytes, "image/jpeg")
+        except Exception as exc:  # pragma: no cover - external storage dependency
+            logger.warning("Preview upload failed for item {}: {}", item.id, exc)
+            payload = {"status": "error", "error": str(exc)}
+            await artifacts.store.upsert(
+                artifact_type="preview_image",
+                producer=self.name,
+                producer_version=self.version,
+                input_fingerprint=fingerprint,
+                payload=payload,
+            )
+            artifacts.set("preview", payload)
+            return
+
+        payload = {
+            "status": "ok",
+            "storage_key": preview_key,
+            "content_type": "image/jpeg",
+            "width": image.width,
+            "height": image.height,
+            "source_content_type": item.content_type,
+        }
+        await artifacts.store.upsert(
+            artifact_type="preview_image",
+            producer=self.name,
+            producer_version=self.version,
+            input_fingerprint=fingerprint,
+            payload=payload,
+        )
+        artifacts.set("preview", payload)
+
+
+class GeoLocationStep:
+    name = "geocode"
+    version = "v1"
+    is_expensive = True
+
+    async def run(self, item: SourceItem, artifacts: PipelineArtifacts, config: PipelineConfig) -> None:
+        if item.item_type != "photo":
+            return
+        exif_payload = artifacts.get("exif") or {}
+        gps = exif_payload.get("gps") or {}
+        lat = gps.get("latitude")
+        lng = gps.get("longitude")
+        location_source = "exif"
+        provider_location = None
+        if lat is None or lng is None:
+            candidate = artifacts.get("provider_location") or config.payload.get("provider_location")
+            if isinstance(candidate, dict):
+                provider_location = candidate
+                lat = provider_location.get("latitude")
+                lng = provider_location.get("longitude")
+                location_source = provider_location.get("source") or "provider"
+        if lat is None or lng is None:
+            return
+        try:
+            lat = float(lat)
+            lng = float(lng)
+        except (TypeError, ValueError):
+            return
+        provider = config.settings.maps_geocoding_provider
+        fingerprint = hash_parts([provider, lat, lng, self.version])
+        existing = await artifacts.store.get("geocode", provider, self.version, fingerprint)
+        if existing:
+            artifacts.set("geo_location", existing.payload or {})
+            return
+        try:
+            payload = await reverse_geocode(lat, lng, config.settings)
+        except Exception as exc:  # pragma: no cover - external service dependency
+            logger.warning("Geocoding failed for item {}: {}", item.id, exc)
+            payload = {"status": "error", "error": str(exc), "lat": lat, "lng": lng}
+        payload.setdefault("source", location_source)
+        if provider_location is not None and "provider_location" not in payload:
+            payload["provider_location"] = provider_location
+        await artifacts.store.upsert(
+            artifact_type="geocode",
+            producer=provider,
+            producer_version=self.version,
+            input_fingerprint=fingerprint,
+            payload=payload,
+        )
+        artifacts.set("geo_location", payload)
 
 
 class PerceptualHashStep:
@@ -163,8 +442,10 @@ class EventTimeStep:
     is_expensive = False
 
     async def run(self, item: SourceItem, artifacts: PipelineArtifacts, config: PipelineConfig) -> None:
-        metadata = artifacts.get("metadata", {})
-        exif_time = parse_iso_datetime(metadata.get("exif_datetime"))
+        exif_payload = artifacts.get("exif") or {}
+        exif_time = parse_iso_datetime(exif_payload.get("event_time_utc"))
+        if not exif_time:
+            exif_time = parse_exif_datetime(exif_payload.get("datetime_original"))
 
         event_time: Optional[datetime] = None
         source = None
@@ -172,7 +453,7 @@ class EventTimeStep:
         if exif_time:
             event_time = exif_time
             source = "exif"
-            confidence = 0.9
+            confidence = 0.9 if exif_payload.get("event_time_utc") else 0.75
         elif item.captured_at:
             event_time = item.captured_at
             if item.provider and item.provider != "upload":
@@ -215,6 +496,10 @@ class DedupStep:
         content_hash = artifacts.get("content_hash") or item.content_hash
         if not content_hash:
             return
+        reprocess_duplicates = config.payload.get("reprocess_duplicates")
+        if reprocess_duplicates is None:
+            reprocess_duplicates = config.settings.pipeline_reprocess_duplicates
+        reprocess_duplicates = bool(reprocess_duplicates)
 
         stmt = (
             select(SourceItem)
@@ -233,6 +518,7 @@ class DedupStep:
                 "status": "exact_duplicate",
                 "canonical_item_id": str(duplicate.id),
                 "content_hash": content_hash,
+                "reprocess": reprocess_duplicates,
             }
             fingerprint = hash_parts([content_hash, "exact", duplicate.id])
             await artifacts.store.upsert(
@@ -243,7 +529,8 @@ class DedupStep:
                 payload=payload,
             )
             artifacts.set("dedupe", payload)
-            artifacts.skip_expensive = True
+            if not reprocess_duplicates:
+                artifacts.skip_expensive = True
             return
 
         if item.item_type != "photo" or not item.phash or not item.event_time_utc:
@@ -271,6 +558,7 @@ class DedupStep:
                     "canonical_item_id": str(candidate.id),
                     "phash": item.phash,
                     "distance": distance,
+                    "reprocess": reprocess_duplicates,
                 }
                 fingerprint = hash_parts([item.phash, "near", candidate.id, distance])
                 await artifacts.store.upsert(
@@ -281,7 +569,8 @@ class DedupStep:
                     payload=payload,
                 )
                 artifacts.set("dedupe", payload)
-                artifacts.skip_expensive = True
+                if not reprocess_duplicates:
+                    artifacts.skip_expensive = True
                 break
 
 
@@ -485,6 +774,35 @@ class ContextPersistStep:
 
     async def run(self, item: SourceItem, artifacts: PipelineArtifacts, config: PipelineConfig) -> None:
         contexts = artifacts.get("contexts") or []
+        geo_location = artifacts.get("geo_location") or {}
+        geo_info = {}
+        if geo_location.get("status") == "ok":
+            geo_info = {
+                "formatted_address": geo_location.get("formatted_address"),
+                "lat": geo_location.get("lat"),
+                "lng": geo_location.get("lng"),
+                "place_id": geo_location.get("place_id"),
+                "components": geo_location.get("components") or {},
+            }
+        if geo_info and not any(
+            isinstance(context, dict) and context.get("context_type") == "location_context"
+            for context in contexts
+        ):
+            title = geo_info.get("formatted_address") or "Location"
+            summary = geo_info.get("formatted_address") or "Captured location"
+            keywords = extract_keywords(summary)
+            contexts.append(
+                {
+                    "context_type": "location_context",
+                    "title": title,
+                    "summary": summary,
+                    "keywords": keywords,
+                    "entities": [],
+                    "location": geo_info,
+                    "vector_text": build_vector_text(title, summary, keywords),
+                    "processor_versions": {"geocode": GeoLocationStep.version},
+                }
+            )
         if not contexts:
             return
         context_signature = hash_parts(
@@ -515,7 +833,7 @@ class ContextPersistStep:
                 summary=context.get("summary") or "",
                 keywords=context.get("keywords") or [],
                 entities=context.get("entities") or [],
-                location=context.get("location") or {},
+                location=context.get("location") or (geo_info if geo_info else {}),
                 event_time_utc=event_time,
                 start_time_utc=None,
                 end_time_utc=None,
@@ -588,9 +906,12 @@ COMMON_STEPS: list[PipelineStep] = [
     FetchBlobStep(),
     ContentHashStep(),
     MetadataStep(),
+    ExifStep(),
+    PreviewStep(),
     PerceptualHashStep(),
     EventTimeStep(),
     DedupStep(),
+    GeoLocationStep(),
     CaptionStep(),
 ]
 

@@ -46,6 +46,15 @@ def _step_details(step_name: str, item: SourceItem, artifacts: PipelineArtifacts
             "original_filename": _shorten(metadata.get("original_filename")),
             "provider_location": location,
         }
+    if step_name == "media_metadata":
+        metadata = artifacts.get("media_metadata") or {}
+        return {
+            "duration_sec": metadata.get("duration_sec"),
+            "width": metadata.get("width"),
+            "height": metadata.get("height"),
+            "fps": metadata.get("fps"),
+            "captured_at": metadata.get("captured_at"),
+        }
     if step_name == "exif":
         exif = artifacts.get("exif") or {}
         gps = exif.get("gps") or {}
@@ -98,6 +107,16 @@ def _step_details(step_name: str, item: SourceItem, artifacts: PipelineArtifacts
     if step_name == "ocr":
         ocr_text = artifacts.get("ocr_text") or ""
         return {"ocr_chars": len(ocr_text)}
+    if step_name == "transcription":
+        transcript = artifacts.get("transcript_text") or ""
+        return {"transcript_chars": len(transcript)}
+    if step_name == "media_chunk_understanding":
+        contexts = artifacts.get("contexts") or []
+        transcript = artifacts.get("transcript_text") or ""
+        return {"contexts": len(contexts), "transcript_chars": len(transcript)}
+    if step_name == "keyframes":
+        frames = artifacts.get("keyframes") or []
+        return {"frames": len(frames)}
     if step_name == "vlm":
         contexts = artifacts.get("contexts") or []
         context_types: list[str] = []
@@ -108,6 +127,12 @@ def _step_details(step_name: str, item: SourceItem, artifacts: PipelineArtifacts
                     if context_type and context_type not in context_types:
                         context_types.append(context_type)
         return {"contexts": len(contexts), "context_types": context_types[:5]}
+    if step_name == "transcript_context":
+        contexts = artifacts.get("contexts") or []
+        return {"contexts": len(contexts)}
+    if step_name == "media_summary":
+        contexts = artifacts.get("contexts") or []
+        return {"contexts": len(contexts)}
     if step_name == "contexts":
         context_ids = artifacts.get("context_ids") or []
         return {"context_ids": len(context_ids)}

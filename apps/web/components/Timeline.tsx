@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Calendar, Filter, Image as ImageIcon } from 'lucide-react';
+import { Calendar, Filter, Image as ImageIcon, Mic, Play, Video, X } from 'lucide-react';
 import { apiDelete, apiGet } from '../services/api';
 import { TimelineDay, TimelineItem } from '../types';
 
@@ -15,11 +15,68 @@ const formatDate = (value?: string) => {
 const buildLabel = (item: TimelineItem) =>
   item.caption || item.original_filename || `${item.item_type} upload`;
 
+const renderMedia = (item: TimelineItem, onOpen: (item: TimelineItem) => void) => {
+  if (item.item_type === 'video') {
+    const poster = item.poster_url || null;
+    return (
+      <button
+        type="button"
+        onClick={() => onOpen(item)}
+        className="w-full h-full relative focus:outline-none"
+      >
+        {poster ? (
+          <img
+            src={poster}
+            alt={buildLabel(item)}
+            className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500"
+          />
+        ) : (
+          <div className="w-full h-full flex items-center justify-center text-slate-400 bg-slate-100">
+            <Video className="w-8 h-8" />
+          </div>
+        )}
+        <div className="absolute inset-0 flex items-center justify-center">
+          <span className="flex items-center justify-center w-12 h-12 rounded-full bg-black/60 text-white">
+            <Play className="w-5 h-5" />
+          </span>
+        </div>
+      </button>
+    );
+  }
+  if (item.item_type === 'audio') {
+    return (
+      <button
+        type="button"
+        onClick={() => onOpen(item)}
+        className="w-full h-full flex flex-col items-center justify-center gap-3 p-4 text-slate-500 focus:outline-none"
+      >
+        <Mic className="w-8 h-8" />
+        <span className="text-xs font-medium uppercase tracking-wide">Play audio</span>
+      </button>
+    );
+  }
+  if (item.download_url) {
+    return (
+      <img
+        src={item.download_url}
+        alt={buildLabel(item)}
+        className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500"
+      />
+    );
+  }
+  return (
+    <div className="w-full h-full flex items-center justify-center text-slate-400">
+      <ImageIcon className="w-8 h-8" />
+    </div>
+  );
+};
+
 export const Timeline: React.FC = () => {
   const [days, setDays] = useState<TimelineDay[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [activeItem, setActiveItem] = useState<TimelineItem | null>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -75,6 +132,14 @@ export const Timeline: React.FC = () => {
     }
   };
 
+  const openMedia = (item: TimelineItem) => {
+    if (item.item_type === 'video' || item.item_type === 'audio') {
+      setActiveItem(item);
+    }
+  };
+
+  const closeMedia = () => setActiveItem(null);
+
   return (
     <div className="p-8 h-full overflow-y-auto">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between mb-8 gap-4">
@@ -126,18 +191,8 @@ export const Timeline: React.FC = () => {
                   className="group bg-white rounded-xl overflow-hidden shadow-sm hover:shadow-lg transition-all duration-300 border border-slate-100"
                 >
                   <div className="relative aspect-[4/3] overflow-hidden bg-slate-100">
-                    {item.download_url ? (
-                      <img
-                        src={item.download_url}
-                        alt={buildLabel(item)}
-                        className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500"
-                      />
-                    ) : (
-                      <div className="w-full h-full flex items-center justify-center text-slate-400">
-                        <ImageIcon className="w-8 h-8" />
-                      </div>
-                    )}
-                    <div className="absolute inset-0 bg-gradient-to-t from-black/50 to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex flex-col justify-end p-4">
+                    {renderMedia(item, openMedia)}
+                    <div className="absolute inset-0 bg-gradient-to-t from-black/50 to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex flex-col justify-end p-4 pointer-events-none">
                       <p className="text-white text-sm font-medium truncate">{buildLabel(item)}</p>
                     </div>
                     <button
@@ -173,6 +228,55 @@ export const Timeline: React.FC = () => {
           </div>
         ))}
       </div>
+
+      {activeItem && (
+        <div
+          className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-6"
+          onClick={closeMedia}
+        >
+          <div
+            className="bg-white rounded-xl shadow-xl w-full max-w-4xl overflow-hidden"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200">
+              <div className="text-sm font-medium text-slate-800 truncate">
+                {buildLabel(activeItem)}
+              </div>
+              <button
+                type="button"
+                onClick={closeMedia}
+                className="p-1 text-slate-500 hover:text-slate-700"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="bg-black/95 flex items-center justify-center">
+              {activeItem.item_type === 'video' ? (
+                activeItem.download_url ? (
+                  <video
+                    src={activeItem.download_url}
+                    className="w-full max-h-[70vh]"
+                    controls
+                    preload="metadata"
+                    poster={activeItem.poster_url || undefined}
+                    playsInline
+                  />
+                ) : (
+                  <div className="p-8 text-slate-200">Video unavailable.</div>
+                )
+              ) : activeItem.item_type === 'audio' ? (
+                activeItem.download_url ? (
+                  <div className="w-full p-6 bg-white">
+                    <audio src={activeItem.download_url} controls className="w-full" preload="metadata" />
+                  </div>
+                ) : (
+                  <div className="p-8 text-slate-200">Audio unavailable.</div>
+                )
+              ) : null}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

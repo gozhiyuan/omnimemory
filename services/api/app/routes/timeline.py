@@ -42,6 +42,7 @@ class TimelineItem(BaseModel):
     original_filename: Optional[str]
     caption: Optional[str]
     download_url: Optional[str]
+    poster_url: Optional[str] = None
 
 
 class TimelineDay(BaseModel):
@@ -88,6 +89,7 @@ async def get_timeline(
     captions: dict[UUID, str] = {}
     context_summaries: dict[UUID, str] = {}
     preview_keys: dict[UUID, str] = {}
+    keyframe_keys: dict[UUID, str] = {}
     if items:
         item_ids = [item.id for item in items]
         caption_stmt = select(ProcessedContent.item_id, ProcessedContent.data).where(
@@ -125,6 +127,25 @@ async def get_timeline(
             if payload.get("status") == "ok" and payload.get("storage_key"):
                 preview_keys[row.source_item_id] = payload["storage_key"]
 
+        keyframe_stmt = select(DerivedArtifact.source_item_id, DerivedArtifact.payload).where(
+            DerivedArtifact.source_item_id.in_(item_ids),
+            DerivedArtifact.artifact_type == "keyframes",
+        )
+        keyframe_rows = await session.execute(keyframe_stmt)
+        for row in keyframe_rows.fetchall():
+            payload = row.payload or {}
+            if not isinstance(payload, dict):
+                continue
+            poster = payload.get("poster")
+            if isinstance(poster, dict) and poster.get("storage_key"):
+                keyframe_keys[row.source_item_id] = poster["storage_key"]
+                continue
+            frames = payload.get("frames")
+            if isinstance(frames, list) and frames:
+                first = frames[0]
+                if isinstance(first, dict) and first.get("storage_key"):
+                    keyframe_keys[row.source_item_id] = first["storage_key"]
+
     settings = get_settings()
     storage = get_storage_provider()
 
@@ -141,6 +162,7 @@ async def get_timeline(
         return signed.get("url") if signed else None
 
     download_urls: dict[UUID, Optional[str]] = {}
+    poster_urls: dict[UUID, Optional[str]] = {}
     connections: dict[UUID, DataConnection] = {}
     tokens: dict[UUID, str] = {}
     if items:
@@ -189,7 +211,8 @@ async def get_timeline(
                 download_url_for(
                     item,
                     preview_keys.get(item.id)
-                    if (item.content_type or "").lower() not in WEB_IMAGE_TYPES
+                    if item.item_type == "photo"
+                    and (item.content_type or "").lower() not in WEB_IMAGE_TYPES
                     else None,
                 )
                 for item in items
@@ -197,6 +220,20 @@ async def get_timeline(
             return_exceptions=False,
         )
         download_urls = {item.id: url for item, url in zip(items, signed_list)}
+
+    poster_candidates = [
+        (item.id, keyframe_keys.get(item.id))
+        for item in items
+        if item.item_type == "video" and keyframe_keys.get(item.id)
+    ]
+    if poster_candidates:
+        poster_signed = await asyncio.gather(
+            *(sign_url(key) for _, key in poster_candidates),
+            return_exceptions=False,
+        )
+        poster_urls = {
+            item_id: url for (item_id, _), url in zip(poster_candidates, poster_signed)
+        }
 
     grouped: dict[date, list[SourceItem]] = defaultdict(list)
     for item in items:
@@ -222,6 +259,7 @@ async def get_timeline(
                         original_filename=item.original_filename,
                         caption=context_summaries.get(item.id) or captions.get(item.id),
                         download_url=download_urls.get(item.id),
+                        poster_url=poster_urls.get(item.id),
                     )
                     for item in day_items
                 ],
@@ -248,12 +286,22 @@ async def delete_timeline_item(
 
     preview_stmt = select(DerivedArtifact).where(
         DerivedArtifact.source_item_id == item.id,
-        DerivedArtifact.artifact_type == "preview_image",
+        DerivedArtifact.artifact_type.in_(["preview_image", "keyframes", "video_preview"]),
     )
     preview_rows = await session.execute(preview_stmt)
     for preview in preview_rows.scalars().all():
         if preview.storage_key:
             storage_keys.append(preview.storage_key)
+        payload = preview.payload or {}
+        if preview.artifact_type == "keyframes":
+            frames = payload.get("frames") if isinstance(payload, dict) else None
+            if isinstance(frames, list):
+                for frame in frames:
+                    if isinstance(frame, dict) and frame.get("storage_key"):
+                        storage_keys.append(frame["storage_key"])
+            poster = payload.get("poster") if isinstance(payload, dict) else None
+            if isinstance(poster, dict) and poster.get("storage_key"):
+                storage_keys.append(poster["storage_key"])
 
     updated_contexts: list[ProcessedContext] = []
     deleted_context_ids: list[str] = []

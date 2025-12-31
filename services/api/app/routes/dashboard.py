@@ -15,7 +15,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
 from ..config import get_settings
-from ..db.models import DEFAULT_TEST_USER_ID, DataConnection, ProcessedContent, ProcessedContext, SourceItem
+from ..db.models import (
+    DEFAULT_TEST_USER_ID,
+    DataConnection,
+    DerivedArtifact,
+    ProcessedContent,
+    ProcessedContext,
+    SourceItem,
+)
 from ..db.session import get_session
 from ..google_photos import get_valid_access_token
 from ..storage import get_storage_provider
@@ -39,6 +46,7 @@ class DashboardRecentItem(BaseModel):
     original_filename: Optional[str] = None
     caption: Optional[str] = None
     download_url: Optional[str] = None
+    poster_url: Optional[str] = None
 
 
 class DashboardStats(BaseModel):
@@ -120,6 +128,7 @@ async def get_dashboard_stats(
 
     captions: dict[UUID, str] = {}
     context_summaries: dict[UUID, str] = {}
+    keyframe_keys: dict[UUID, str] = {}
     if recent_items:
         recent_ids = [item.id for item in recent_items]
         caption_stmt = select(ProcessedContent.item_id, ProcessedContent.data).where(
@@ -146,6 +155,25 @@ async def get_dashboard_stats(
                     continue
                 if source_id not in context_summaries or context.context_type == "activity_context":
                     context_summaries[source_id] = context.summary
+
+        keyframe_stmt = select(DerivedArtifact.source_item_id, DerivedArtifact.payload).where(
+            DerivedArtifact.source_item_id.in_(recent_ids),
+            DerivedArtifact.artifact_type == "keyframes",
+        )
+        keyframe_rows = await session.execute(keyframe_stmt)
+        for row in keyframe_rows.fetchall():
+            payload = row.payload or {}
+            if not isinstance(payload, dict):
+                continue
+            poster = payload.get("poster")
+            if isinstance(poster, dict) and poster.get("storage_key"):
+                keyframe_keys[row.source_item_id] = poster["storage_key"]
+                continue
+            frames = payload.get("frames")
+            if isinstance(frames, list) and frames:
+                first = frames[0]
+                if isinstance(first, dict) and first.get("storage_key"):
+                    keyframe_keys[row.source_item_id] = first["storage_key"]
 
     settings = get_settings()
     storage = get_storage_provider()
@@ -179,13 +207,40 @@ async def get_dashboard_stats(
             return None
         return signed.get("url") if signed else None
 
+    async def sign_storage_key(storage_key: str) -> Optional[str]:
+        if storage_key.startswith("http://") or storage_key.startswith("https://"):
+            return storage_key
+        try:
+            signed = await asyncio.to_thread(
+                storage.get_presigned_download, storage_key, settings.presigned_url_ttl_seconds
+            )
+        except Exception as exc:  # pragma: no cover - external service dependency
+            logger.warning("Failed to sign download URL for {}: {}", storage_key, exc)
+            return None
+        return signed.get("url") if signed else None
+
     download_urls: dict[UUID, Optional[str]] = {}
+    poster_urls: dict[UUID, Optional[str]] = {}
     if recent_items:
         signed_list = await asyncio.gather(
             *(build_url(item) for item in recent_items),
             return_exceptions=False,
         )
         download_urls = {item.id: url for item, url in zip(recent_items, signed_list)}
+
+        poster_candidates = [
+            (item.id, keyframe_keys.get(item.id))
+            for item in recent_items
+            if item.item_type == "video" and keyframe_keys.get(item.id)
+        ]
+        if poster_candidates:
+            poster_signed = await asyncio.gather(
+                *(sign_storage_key(key) for _, key in poster_candidates),
+                return_exceptions=False,
+            )
+            poster_urls = {
+                item_id: url for (item_id, _), url in zip(poster_candidates, poster_signed)
+            }
 
     activity_rows = await session.execute(activity_stmt)
     activity_by_day = {row.day: row[1] for row in activity_rows.fetchall()}
@@ -212,6 +267,7 @@ async def get_dashboard_stats(
                 original_filename=item.original_filename,
                 caption=context_summaries.get(item.id) or captions.get(item.id),
                 download_url=download_urls.get(item.id),
+                poster_url=poster_urls.get(item.id),
             )
             for item in recent_items
         ],

@@ -60,6 +60,14 @@ def _infer_filename(media_id: str, filename: Optional[str], mime_type: Optional[
     return _safe_filename(media_id + ext)
 
 
+def _build_download_url(base_url: str, mime_type: Optional[str]) -> str:
+    if not base_url:
+        return base_url
+    suffix = "dv" if mime_type and mime_type.startswith("video/") else "d"
+    base = base_url.split("=", 1)[0]
+    return f"{base}={suffix}"
+
+
 async def _fetch_media_items(access_token: str, session_id: str) -> list[dict[str, Any]]:
     items = await fetch_picker_media_items(access_token, session_id)
     return [item for item in items if isinstance(item, dict)]
@@ -98,7 +106,7 @@ async def _ingest_media_item(
             session_id,
         )
         return None
-    download_url = f"{base_url}=d"
+    download_url = _build_download_url(base_url, mime_type)
     storage_key = f"google_photos/{connection.user_id}/{media_id}/{_infer_filename(media_id, filename, mime_type)}"
     mime_type = mime_type or "application/octet-stream"
     captured_at = parse_google_timestamp(creation_time)
@@ -162,7 +170,7 @@ async def _ingest_media_item(
     # Download and store the media in our storage to survive token revocation.
     headers = {"Authorization": f"Bearer {access_token}"}
     async with httpx.AsyncClient(timeout=60) as client:
-        response = await client.get(download_url, headers=headers)
+        response = await client.get(download_url, headers=headers, follow_redirects=True)
         response.raise_for_status()
         blob = response.content
     storage.store(storage_key, blob, mime_type)

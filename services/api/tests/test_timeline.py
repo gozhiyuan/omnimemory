@@ -32,6 +32,11 @@ class FakeResult:
     def scalar_one(self):
         return self._scalar
 
+    def one(self):
+        if self._rows:
+            return self._rows[0]
+        return self._scalar
+
 
 class FakeSession:
     def __init__(self, results):
@@ -69,6 +74,8 @@ def test_timeline_groups_items_and_signs_urls(monkeypatch):
             FakeResult(scalars=[]),
             FakeResult(rows=[]),
             FakeResult(rows=[]),
+            FakeResult(scalars=[]),
+            FakeResult(scalars=[]),
         ]
     )
 

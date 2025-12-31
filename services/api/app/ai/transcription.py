@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any, Dict
+from uuid import UUID
 
 from google import genai
 from google.genai import types
@@ -11,6 +12,7 @@ from loguru import logger
 
 from ..config import Settings
 from .prompts import build_lifelog_transcription_prompt
+from .usage import log_usage_from_response
 
 
 def _build_contents(prompt: str, media_bytes: bytes, mime_type: str) -> list[types.Content]:
@@ -33,6 +35,10 @@ async def _call_gemini(
     model: str,
     temperature: float,
     timeout_seconds: int,
+    *,
+    user_id: UUID | str | None,
+    item_id: UUID | str | None,
+    step_name: str,
 ) -> Dict[str, Any]:
     api_key = settings.gemini_api_key
     if not api_key:
@@ -64,6 +70,14 @@ async def _call_gemini(
         return {"status": "error", "error": str(exc), "text": ""}
 
     raw_text = getattr(response, "text", "") or ""
+    log_usage_from_response(
+        response,
+        user_id=user_id,
+        item_id=item_id,
+        provider="gemini",
+        model=model,
+        step_name=step_name,
+    )
     return {"status": "ok", "text": raw_text.strip()}
 
 
@@ -72,6 +86,10 @@ async def transcribe_media(
     settings: Settings,
     content_type: str | None = None,
     media_kind: str = "audio",
+    *,
+    user_id: UUID | str | None = None,
+    item_id: UUID | str | None = None,
+    step_name: str = "transcription",
 ) -> Dict[str, Any]:
     if media_kind == "video":
         provider = settings.video_understanding_provider
@@ -97,4 +115,7 @@ async def transcribe_media(
         model,
         temperature,
         timeout_seconds,
+        user_id=user_id,
+        item_id=item_id,
+        step_name=step_name,
     )

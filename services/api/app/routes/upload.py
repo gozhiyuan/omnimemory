@@ -38,6 +38,10 @@ class IngestRequest(BaseModel):
     original_filename: Optional[str] = Field(default=None, description="Original filename if available")
     size_bytes: Optional[int] = Field(default=None, ge=1, description="Asset size in bytes")
     duration_sec: Optional[float] = Field(default=None, ge=0, description="Duration in seconds")
+    client_tz_offset_minutes: Optional[int] = Field(
+        default=None,
+        description="Client timezone offset in minutes (Date.getTimezoneOffset)",
+    )
     event_time_window_start: Optional[datetime] = Field(
         default=None,
         description="Optional window start for manual time overrides",
@@ -131,6 +135,8 @@ async def ingest_item(
         "size_bytes": request.size_bytes,
         "duration_sec": request.duration_sec,
     }
+    if request.client_tz_offset_minutes is not None:
+        payload["client_tz_offset_minutes"] = request.client_tz_offset_minutes
     if request.event_time_window_start:
         payload["event_time_window_start"] = request.event_time_window_start.isoformat()
     if request.event_time_window_end:

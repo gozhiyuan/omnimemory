@@ -6,6 +6,7 @@ import hashlib
 import random
 from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional
+from uuid import UUID
 
 from google import genai
 from loguru import logger
@@ -13,6 +14,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
 from .config import get_settings
+from .ai.usage import log_usage_from_response
 
 
 @lru_cache(maxsize=1)
@@ -111,7 +113,13 @@ def _deterministic_text_vector(text: str, size: int) -> List[float]:
     return _deterministic_vector(seed, size)
 
 
-def embed_texts(texts: List[str]) -> List[List[float]]:
+def embed_texts(
+    texts: List[str],
+    *,
+    user_id: UUID | str | None = None,
+    item_id: UUID | str | None = None,
+    step_name: str = "embeddings",
+) -> List[List[float]]:
     settings = get_settings()
     if settings.embedding_provider == "none":
         return [_deterministic_text_vector(text, settings.embedding_dimension) for text in texts]
@@ -125,6 +133,14 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
             model=settings.embedding_model,
             contents=batch,
         )
+        log_usage_from_response(
+            response,
+            user_id=user_id,
+            item_id=item_id,
+            provider="gemini",
+            model=settings.embedding_model,
+            step_name=step_name,
+        )
         embeddings = _extract_embeddings(response)
         if len(embeddings) != len(batch):
             raise RuntimeError("Embedding response length mismatch.")
@@ -132,8 +148,14 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
     return vectors
 
 
-def embed_text(text: str) -> List[float]:
-    return embed_texts([text])[0]
+def embed_text(
+    text: str,
+    *,
+    user_id: UUID | str | None = None,
+    item_id: UUID | str | None = None,
+    step_name: str = "embeddings",
+) -> List[float]:
+    return embed_texts([text], user_id=user_id, item_id=item_id, step_name=step_name)[0]
 
 
 def upsert_context_embeddings(contexts: Iterable[Any]) -> None:
@@ -148,7 +170,20 @@ def upsert_context_embeddings(contexts: Iterable[Any]) -> None:
         vector_texts.append(getattr(context, "vector_text", "") or "")
     if not vector_texts:
         return
-    vectors = embed_texts(vector_texts)
+    unique_user_ids = {getattr(context, "user_id", None) for context in context_list}
+    resolved_user = next(iter(unique_user_ids)) if len(unique_user_ids) == 1 else None
+    unique_source_ids = set()
+    for context in context_list:
+        source_ids = getattr(context, "source_item_ids", None)
+        if isinstance(source_ids, list):
+            unique_source_ids.update(source_ids)
+    resolved_item = next(iter(unique_source_ids)) if len(unique_source_ids) == 1 else None
+    vectors = embed_texts(
+        vector_texts,
+        user_id=resolved_user,
+        item_id=resolved_item,
+        step_name="embeddings",
+    )
     vector_size = len(vectors[0]) if vectors else settings.embedding_dimension
     ensure_collection(vector_size)
     if settings.embedding_provider == "gemini" and settings.embedding_dimension != vector_size:
@@ -212,7 +247,7 @@ def search_contexts(
 
     settings = get_settings()
     client = get_qdrant_client()
-    vector = embed_text(query)
+    vector = embed_text(query, user_id=user_id, step_name="search_embedding")
     ensure_collection(len(vector))
     results = client.search(
         collection_name=settings.qdrant_collection,

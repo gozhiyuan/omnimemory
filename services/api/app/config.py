@@ -89,6 +89,47 @@ class Settings(BaseSettings):
     vlm_max_output_tokens: int = 2048
     vlm_timeout_seconds: int = 30
 
+    # Chunked transcript + context output sizing
+    transcription_max_output_tokens: int = 4096
+    transcription_storage_max_bytes: int = Field(default=500_000, ge=1)
+
+    # Video/audio understanding settings
+    video_understanding_provider: Literal["gemini", "none"] = "gemini"
+    video_understanding_model: str = "gemini-2.5-flash-lite"
+    video_understanding_temperature: float = 0.2
+    video_understanding_timeout_seconds: int = 60
+    video_understanding_max_bytes: int = Field(default=19_000_000, ge=1)
+    video_understanding_max_duration_sec: int = Field(default=20 * 60, ge=1)
+
+    audio_understanding_provider: Literal["gemini", "none"] = "gemini"
+    audio_understanding_model: str = "gemini-2.5-flash-lite"
+    audio_understanding_temperature: float = 0.2
+    audio_understanding_timeout_seconds: int = 60
+    audio_understanding_max_bytes: int = Field(default=19_000_000, ge=1)
+
+    # Media extraction settings
+    media_max_bytes: int = Field(default=1_000_000_000, ge=1)
+    media_chunk_target_bytes: int = Field(default=10_000_000, ge=1)
+    media_chunk_max_chunks: int = Field(default=240, ge=1)
+    video_max_duration_sec: int = Field(default=5 * 60, ge=1)
+    audio_max_duration_sec: int = Field(default=60 * 60, ge=1)
+    video_chunk_duration_sec: int = Field(default=60, ge=1)
+    audio_chunk_duration_sec: int = Field(default=300, ge=1)
+    audio_sample_rate_hz: int = Field(default=16000, ge=8000)
+    audio_channels: int = Field(default=1, ge=1)
+    video_keyframe_mode: Literal["scene", "interval"] = "scene"
+    video_scene_threshold: float = Field(default=0.3, ge=0.0)
+    video_keyframe_interval_sec: int = Field(default=5, ge=1)
+    video_max_keyframes: int = Field(default=60, ge=1)
+    video_vlm_max_frames: int = Field(default=24, ge=1)
+    video_keyframes_always: bool = True
+    video_vlm_concurrency: int = Field(default=2, ge=1)
+    video_preview_enabled: bool = False
+    video_preview_duration_sec: int = Field(default=8, ge=1)
+    video_preview_max_width: int = Field(default=640, ge=64)
+    video_preview_fps: int = Field(default=12, ge=1)
+    video_preview_bitrate_kbps: int = Field(default=600, ge=50)
+
     # Maps/Geocoding settings
     maps_geocoding_provider: Literal["google_maps", "none"] = "google_maps"
     maps_google_api_key: Optional[str] = None

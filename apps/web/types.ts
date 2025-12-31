@@ -36,6 +36,7 @@ export interface TimelineItem {
   original_filename?: string | null;
   caption?: string | null;
   download_url?: string | null;
+  poster_url?: string | null;
 }
 
 export interface TimelineDay {
@@ -59,6 +60,7 @@ export interface DashboardRecentItem {
   original_filename?: string | null;
   caption?: string | null;
   download_url?: string | null;
+  poster_url?: string | null;
 }
 
 export interface DashboardStatsResponse {

@@ -67,6 +67,8 @@ def test_timeline_groups_items_and_signs_urls(monkeypatch):
             FakeResult(scalars=[item]),
             FakeResult(rows=[caption_row]),
             FakeResult(scalars=[]),
+            FakeResult(rows=[]),
+            FakeResult(rows=[]),
         ]
     )
 

@@ -8,6 +8,7 @@ from io import BytesIO
 import json
 from pathlib import Path
 import re
+import tempfile
 from typing import Any, Optional
 from uuid import UUID
 
@@ -15,11 +16,33 @@ import httpx
 from loguru import logger
 from sqlalchemy import delete, select
 
-from ..ai import analyze_image_with_vlm, reverse_geocode, run_ocr
-from ..ai.prompts import build_lifelog_image_prompt
+from ..ai import (
+    analyze_audio_with_gemini,
+    analyze_image_with_vlm,
+    analyze_video_with_gemini,
+    reverse_geocode,
+    run_ocr,
+)
+from ..ai.prompts import (
+    build_lifelog_audio_chunk_prompt,
+    build_lifelog_image_prompt,
+    build_lifelog_video_chunk_prompt,
+)
 from ..db.models import DataConnection, ProcessedContent, ProcessedContext, SourceItem
 from ..google_photos import get_valid_access_token
 from ..vectorstore import upsert_context_embeddings
+from .media_utils import (
+    MediaToolError,
+    create_video_preview,
+    extract_single_frame,
+    extract_keyframes,
+    ffmpeg_available,
+    parse_fraction,
+    parse_iso6709,
+    probe_media,
+    segment_audio,
+    segment_video,
+)
 from .types import PipelineArtifacts, PipelineConfig, PipelineStep
 from .utils import (
     build_vector_text,
@@ -32,6 +55,37 @@ from .utils import (
     hamming_distance_hex,
     parse_exif_datetime,
 )
+
+
+def _truncate_text(value: str, limit: int) -> str:
+    cleaned = value.strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[:limit].rstrip() + "..."
+
+
+def _normalize_context_entry(
+    entry: dict[str, Any],
+    *,
+    default_title: str,
+    provider_versions: dict[str, Any],
+) -> dict[str, Any]:
+    context_type = entry.get("context_type") or "activity_context"
+    title = entry.get("title") or default_title
+    summary = entry.get("summary") or ""
+    keywords = entry.get("keywords") or extract_keywords(summary)
+    entities = entry.get("entities") or []
+    location = entry.get("location") or {}
+    return {
+        "context_type": context_type,
+        "title": title,
+        "summary": summary,
+        "keywords": keywords,
+        "entities": entities,
+        "location": location,
+        "vector_text": build_vector_text(title, summary, keywords),
+        "processor_versions": provider_versions,
+    }
 
 
 async def _upsert_content(
@@ -137,6 +191,247 @@ class MetadataStep:
         )
         await _upsert_content(config.session, item.id, "metadata", metadata)
         artifacts.set("metadata", metadata)
+
+
+class MediaMetadataStep:
+    name = "media_metadata"
+    version = "v2"
+    is_expensive = False
+
+    def _parse_duration_value(self, value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if cleaned.endswith("s"):
+                cleaned = cleaned[:-1].strip()
+            try:
+                return float(cleaned)
+            except ValueError:
+                pass
+            match = re.match(r"^(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)$", cleaned)
+            if match:
+                hours = int(match.group(1) or 0)
+                minutes = int(match.group(2))
+                seconds = float(match.group(3))
+                return hours * 3600 + minutes * 60 + seconds
+        return None
+
+    def _duration_from_timebase(self, stream: dict[str, Any]) -> Optional[float]:
+        if not isinstance(stream, dict):
+            return None
+        duration_ts = stream.get("duration_ts")
+        time_base = parse_fraction(stream.get("time_base"))
+        if duration_ts is None or time_base is None or time_base <= 0:
+            return None
+        try:
+            return float(duration_ts) * float(time_base)
+        except (TypeError, ValueError):
+            return None
+
+    def _duration_from_frames(self, stream: dict[str, Any]) -> Optional[float]:
+        if not isinstance(stream, dict):
+            return None
+        fps = parse_fraction(stream.get("avg_frame_rate") or stream.get("r_frame_rate"))
+        nb_frames = stream.get("nb_frames")
+        if fps is None or fps <= 0 or nb_frames is None:
+            return None
+        try:
+            return float(nb_frames) / fps
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
+
+    def _duration_from_tags(self, *tag_sets: dict[str, Any]) -> Optional[float]:
+        for tags in tag_sets:
+            if not isinstance(tags, dict):
+                continue
+            for key in ("duration", "DURATION", "DURATION-eng"):
+                duration = self._parse_duration_value(tags.get(key))
+                if duration:
+                    return duration
+        return None
+
+    async def run(self, item: SourceItem, artifacts: PipelineArtifacts, config: PipelineConfig) -> None:
+        if item.item_type not in {"video", "audio"}:
+            return
+        content_hash = artifacts.get("content_hash")
+        fingerprint = hash_parts([content_hash, self.version])
+        existing = await artifacts.store.get("media_metadata", self.name, self.version, fingerprint)
+        if existing:
+            payload = existing.payload or {}
+            artifacts.set("media_metadata", payload)
+            location = payload.get("location") or {}
+            if isinstance(location, dict) and location.get("latitude") is not None:
+                artifacts.set(
+                    "provider_location",
+                    {
+                        "latitude": location.get("latitude"),
+                        "longitude": location.get("longitude"),
+                        "altitude": location.get("altitude"),
+                        "source": "metadata",
+                    },
+                )
+            captured_at = payload.get("captured_at")
+            parsed = parse_iso_datetime(captured_at) if isinstance(captured_at, str) else None
+            if parsed and not item.captured_at:
+                item.captured_at = parsed
+            return
+
+        if not ffmpeg_available():
+            payload = {"status": "skipped", "reason": "missing_ffmpeg"}
+            await artifacts.store.upsert(
+                artifact_type="media_metadata",
+                producer=self.name,
+                producer_version=self.version,
+                input_fingerprint=fingerprint,
+                payload=payload,
+            )
+            artifacts.set("media_metadata", payload)
+            return
+
+        blob = artifacts.get("blob") or b""
+        if not blob:
+            return
+        if config.settings.media_max_bytes and len(blob) > config.settings.media_max_bytes:
+            raise ValueError(
+                f"Media size {len(blob)} bytes exceeds {config.settings.media_max_bytes} bytes"
+            )
+
+        suffix = Path(item.original_filename or "").suffix
+        if not suffix:
+            suffix = ".mp4" if item.item_type == "video" else ".wav"
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                media_path = Path(tmpdir) / f"source{suffix}"
+                media_path.write_bytes(blob)
+                info = probe_media(str(media_path))
+        except MediaToolError as exc:
+            payload = {"status": "error", "error": str(exc)}
+            await artifacts.store.upsert(
+                artifact_type="media_metadata",
+                producer=self.name,
+                producer_version=self.version,
+                input_fingerprint=fingerprint,
+                payload=payload,
+            )
+            artifacts.set("media_metadata", payload)
+            return
+
+        format_info = info.get("format") or {}
+        tags = format_info.get("tags") or {}
+        streams = info.get("streams") or []
+        video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), None)
+        audio_stream = next((stream for stream in streams if stream.get("codec_type") == "audio"), None)
+        stream_tags = (video_stream or {}).get("tags") or {}
+        audio_tags = (audio_stream or {}).get("tags") or {}
+
+        creation_time = (
+            tags.get("creation_time")
+            or tags.get("com.apple.quicktime.creationdate")
+            or tags.get("com.apple.quicktime.creation_time")
+            or stream_tags.get("creation_time")
+            or stream_tags.get("com.apple.quicktime.creationdate")
+        )
+        location_tag = (
+            tags.get("com.apple.quicktime.location.ISO6709")
+            or tags.get("location")
+            or tags.get("com.apple.quicktime.location")
+            or tags.get("com.android.location")
+            or tags.get("location-eng")
+            or stream_tags.get("com.apple.quicktime.location.ISO6709")
+            or stream_tags.get("location")
+            or stream_tags.get("com.android.location")
+            or stream_tags.get("location-eng")
+        )
+        location = parse_iso6709(location_tag) if isinstance(location_tag, str) else None
+
+        duration = self._parse_duration_value(format_info.get("duration"))
+        duration_source = "format" if duration else None
+        if duration is None:
+            duration = self._parse_duration_value((video_stream or {}).get("duration")) or self._parse_duration_value(
+                (audio_stream or {}).get("duration")
+            )
+            duration_source = "stream" if duration else duration_source
+        if duration is None:
+            duration = self._duration_from_timebase(video_stream or {}) or self._duration_from_timebase(
+                audio_stream or {}
+            )
+            duration_source = "time_base" if duration else duration_source
+        if duration is None:
+            duration = self._duration_from_frames(video_stream or {})
+            duration_source = "frames" if duration else duration_source
+        if duration is None:
+            duration = self._duration_from_tags(tags, stream_tags, audio_tags)
+            duration_source = "tags" if duration else duration_source
+        if duration is None:
+            duration = self._parse_duration_value(config.payload.get("duration_sec"))
+            duration_source = "client" if duration else duration_source
+        if item.item_type == "video" and isinstance(duration, (int, float)):
+            max_duration = min(
+                config.settings.video_max_duration_sec,
+                config.settings.video_understanding_max_duration_sec,
+            )
+            if duration > max_duration:
+                raise ValueError(
+                    f"Video duration {duration:.1f}s exceeds {max_duration}s"
+                )
+        if item.item_type == "audio" and isinstance(duration, (int, float)):
+            if duration > config.settings.audio_max_duration_sec:
+                raise ValueError(
+                    f"Audio duration {duration:.1f}s exceeds {config.settings.audio_max_duration_sec}s"
+                )
+
+        fps = parse_fraction((video_stream or {}).get("avg_frame_rate") or (video_stream or {}).get("r_frame_rate"))
+        bit_rate = self._parse_duration_value(format_info.get("bit_rate"))
+        if bit_rate is None:
+            bit_rate = self._parse_duration_value((video_stream or {}).get("bit_rate")) or self._parse_duration_value(
+                (audio_stream or {}).get("bit_rate")
+            )
+        rotation = None
+        if isinstance(stream_tags, dict):
+            rotation = stream_tags.get("rotate")
+
+        payload = {
+            "status": "ok",
+            "size_bytes": len(blob),
+            "bit_rate": bit_rate,
+            "duration_sec": duration,
+            "duration_source": duration_source,
+            "width": (video_stream or {}).get("width"),
+            "height": (video_stream or {}).get("height"),
+            "fps": fps,
+            "rotation": rotation,
+            "format_name": format_info.get("format_name"),
+            "video_codec": (video_stream or {}).get("codec_name"),
+            "audio_codec": (audio_stream or {}).get("codec_name"),
+            "audio_sample_rate": (audio_stream or {}).get("sample_rate"),
+            "audio_channels": (audio_stream or {}).get("channels"),
+            "captured_at": creation_time,
+            "location": location,
+        }
+        await artifacts.store.upsert(
+            artifact_type="media_metadata",
+            producer=self.name,
+            producer_version=self.version,
+            input_fingerprint=fingerprint,
+            payload=payload,
+        )
+        artifacts.set("media_metadata", payload)
+        parsed = parse_iso_datetime(creation_time) if isinstance(creation_time, str) else None
+        if parsed and not item.captured_at:
+            item.captured_at = parsed
+        if location:
+            artifacts.set(
+                "provider_location",
+                {
+                    "latitude": location.get("latitude"),
+                    "longitude": location.get("longitude"),
+                    "altitude": location.get("altitude"),
+                    "source": "metadata",
+                },
+            )
 
 
 class ExifStep:
@@ -364,7 +659,7 @@ class GeoLocationStep:
     is_expensive = True
 
     async def run(self, item: SourceItem, artifacts: PipelineArtifacts, config: PipelineConfig) -> None:
-        if item.item_type != "photo":
+        if item.item_type not in {"photo", "video", "audio"}:
             return
         exif_payload = artifacts.get("exif") or {}
         gps = exif_payload.get("gps") or {}
@@ -446,6 +741,10 @@ class EventTimeStep:
         exif_time = parse_iso_datetime(exif_payload.get("event_time_utc"))
         if not exif_time:
             exif_time = parse_exif_datetime(exif_payload.get("datetime_original"))
+        media_metadata = artifacts.get("media_metadata") or {}
+        media_time = None
+        if isinstance(media_metadata, dict):
+            media_time = parse_iso_datetime(media_metadata.get("captured_at"))
 
         event_time: Optional[datetime] = None
         source = None
@@ -454,6 +753,10 @@ class EventTimeStep:
             event_time = exif_time
             source = "exif"
             confidence = 0.9 if exif_payload.get("event_time_utc") else 0.75
+        elif media_time:
+            event_time = media_time
+            source = "metadata"
+            confidence = 0.8
         elif item.captured_at:
             event_time = item.captured_at
             if item.provider and item.provider != "upload":
@@ -653,7 +956,7 @@ class OcrStep:
 
 class VlmStep:
     name = "vlm"
-    version = "lifelog_image_analysis_v1"
+    version = "lifelog_image_analysis_v2"
     is_expensive = True
 
     async def run(self, item: SourceItem, artifacts: PipelineArtifacts, config: PipelineConfig) -> None:
@@ -751,6 +1054,598 @@ class VlmStep:
         artifacts.set("contexts", contexts)
 
 
+class MediaChunkUnderstandingStep:
+    name = "media_chunk_understanding"
+    version = "v2"
+    is_expensive = True
+
+    def _compute_video_chunk_duration(self, metadata: dict[str, Any], config: PipelineConfig) -> int:
+        bit_rate = metadata.get("bit_rate")
+        fallback = config.settings.video_chunk_duration_sec
+        target_bytes = config.settings.media_chunk_target_bytes
+        duration = fallback
+        if isinstance(bit_rate, (int, float)) and bit_rate > 0:
+            derived = int((target_bytes * 8) / bit_rate)
+            if derived > 0:
+                duration = min(fallback, derived)
+        return max(1, duration)
+
+    def _compute_audio_chunk_duration(self, config: PipelineConfig) -> int:
+        bytes_per_sec = config.settings.audio_sample_rate_hz * config.settings.audio_channels * 2
+        fallback = config.settings.audio_chunk_duration_sec
+        if bytes_per_sec <= 0:
+            return fallback
+        derived = int(config.settings.media_chunk_target_bytes / bytes_per_sec)
+        if derived <= 0:
+            return fallback
+        return max(1, min(fallback, derived))
+
+    async def run(self, item: SourceItem, artifacts: PipelineArtifacts, config: PipelineConfig) -> None:
+        if item.item_type not in {"video", "audio"}:
+            return
+        blob = artifacts.get("blob")
+        if not blob:
+            return
+        if not ffmpeg_available():
+            payload = {"status": "skipped", "reason": "missing_ffmpeg"}
+            await artifacts.store.upsert(
+                artifact_type="media_chunk_analysis",
+                producer=self.name,
+                producer_version=self.version,
+                input_fingerprint=hash_parts([artifacts.get("content_hash"), self.version]),
+                payload=payload,
+            )
+            artifacts.set("contexts", [])
+            artifacts.set("transcript_text", "")
+            artifacts.set("transcript_segments", [])
+            return
+
+        media_metadata = artifacts.get("media_metadata") or {}
+        duration_sec = media_metadata.get("duration_sec")
+        if item.item_type == "video" and isinstance(duration_sec, (int, float)):
+            max_duration = min(
+                config.settings.video_max_duration_sec,
+                config.settings.video_understanding_max_duration_sec,
+            )
+            if duration_sec > max_duration:
+                raise ValueError(
+                    f"Video duration {duration_sec:.1f}s exceeds {max_duration}s"
+                )
+        if item.item_type == "audio" and isinstance(duration_sec, (int, float)):
+            if duration_sec > config.settings.audio_max_duration_sec:
+                raise ValueError(
+                    f"Audio duration {duration_sec:.1f}s exceeds {config.settings.audio_max_duration_sec}s"
+                )
+
+        provider = (
+            config.settings.video_understanding_provider
+            if item.item_type == "video"
+            else config.settings.audio_understanding_provider
+        )
+        model = (
+            config.settings.video_understanding_model
+            if item.item_type == "video"
+            else config.settings.audio_understanding_model
+        )
+        if provider == "none":
+            payload = {"status": "disabled", "reason": "provider_disabled"}
+            await artifacts.store.upsert(
+                artifact_type="media_chunk_analysis",
+                producer=provider,
+                producer_version=model,
+                input_fingerprint=hash_parts([artifacts.get("content_hash"), self.version, "disabled"]),
+                payload=payload,
+            )
+            artifacts.set("contexts", [])
+            artifacts.set("transcript_text", "")
+            artifacts.set("transcript_segments", [])
+            return
+        chunk_duration = (
+            self._compute_video_chunk_duration(media_metadata, config)
+            if item.item_type == "video"
+            else self._compute_audio_chunk_duration(config)
+        )
+        fingerprint = hash_parts(
+            [
+                artifacts.get("content_hash"),
+                provider,
+                model,
+                self.version,
+                chunk_duration,
+                config.settings.media_chunk_target_bytes,
+            ]
+        )
+        existing = await artifacts.store.get("media_chunk_analysis", provider, model, fingerprint)
+        if existing:
+            payload = existing.payload or {}
+            artifacts.set("contexts", payload.get("contexts") or [])
+            artifacts.set("transcript_text", payload.get("transcript_text") or "")
+            artifacts.set("transcript_segments", payload.get("segments") or [])
+            return
+
+        suffix = Path(item.original_filename or "").suffix
+        if not suffix:
+            suffix = ".mp4" if item.item_type == "video" else ".wav"
+
+        transcript_segments: list[dict[str, Any]] = []
+        transcript_lines: list[str] = []
+        contexts: list[dict[str, Any]] = []
+        errors: list[str] = []
+        max_chunks = config.settings.media_chunk_max_chunks
+        chunk_count = 0
+        max_contexts = 80
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                media_path = Path(tmpdir) / f"source{suffix}"
+                media_path.write_bytes(blob)
+                if item.item_type == "video":
+                    chunk_paths = segment_video(
+                        str(media_path),
+                        tmpdir,
+                        chunk_duration_sec=chunk_duration,
+                        output_ext=suffix or ".mp4",
+                    )
+                    prompt = build_lifelog_video_chunk_prompt()
+                    max_bytes = config.settings.video_understanding_max_bytes
+                    content_type = item.content_type or "video/mp4"
+                else:
+                    chunk_paths = segment_audio(
+                        str(media_path),
+                        tmpdir,
+                        chunk_duration_sec=chunk_duration,
+                        sample_rate_hz=config.settings.audio_sample_rate_hz,
+                        channels=config.settings.audio_channels,
+                    )
+                    prompt = build_lifelog_audio_chunk_prompt()
+                    max_bytes = config.settings.audio_understanding_max_bytes
+                    content_type = "audio/wav"
+
+                if not chunk_paths:
+                    raise MediaToolError("no media chunks produced")
+
+                for idx, chunk_path in enumerate(chunk_paths):
+                    if idx >= max_chunks:
+                        break
+                    chunk_file = Path(chunk_path)
+                    if not chunk_file.exists():
+                        continue
+                    chunk_bytes = chunk_file.read_bytes()
+                    start_ms = int(idx * chunk_duration * 1000)
+                    end_bound = (idx + 1) * chunk_duration
+                    if isinstance(duration_sec, (int, float)):
+                        end_bound = min(duration_sec, end_bound)
+                    end_ms = int(end_bound * 1000)
+                    if max_bytes and len(chunk_bytes) > max_bytes:
+                        errors.append("chunk_too_large")
+                        transcript_segments.append(
+                            {
+                                "start_ms": start_ms,
+                                "end_ms": end_ms,
+                                "text": "",
+                                "status": "skipped",
+                                "error": "max_bytes",
+                            }
+                        )
+                        continue
+
+                    if item.item_type == "video":
+                        response = await analyze_video_with_gemini(
+                            chunk_bytes, prompt, config.settings, content_type
+                        )
+                    else:
+                        response = await analyze_audio_with_gemini(
+                            chunk_bytes, prompt, config.settings, content_type
+                        )
+
+                    parsed = response.get("parsed") or {}
+                    transcript = ""
+                    contexts_in = []
+                    if isinstance(parsed, dict):
+                        raw_transcript = parsed.get("transcript")
+                        if isinstance(raw_transcript, str):
+                            transcript = raw_transcript.strip()
+                        contexts_in = parsed.get("contexts") or []
+                    if transcript:
+                        transcript_lines.append(transcript)
+
+                    transcript_segments.append(
+                        {
+                            "start_ms": start_ms,
+                            "end_ms": end_ms,
+                            "text": transcript,
+                            "status": response.get("status"),
+                            "error": response.get("error"),
+                        }
+                    )
+
+                    provider_versions = {
+                        "media_chunk": self.version,
+                        "provider": provider,
+                        "model": model,
+                        "chunk_index": idx,
+                        "chunk_start_ms": start_ms,
+                    }
+                    if isinstance(contexts_in, list):
+                        for entry in contexts_in[:5]:
+                            if len(contexts) >= max_contexts:
+                                break
+                            if isinstance(entry, dict):
+                                contexts.append(
+                                    _normalize_context_entry(
+                                        entry,
+                                        default_title=f"{item.item_type.title()} moment",
+                                        provider_versions=provider_versions,
+                                    )
+                                )
+                    if response.get("status") != "ok":
+                        errors.append(response.get("error") or "error")
+                    chunk_count += 1
+        except MediaToolError as exc:
+            payload = {"status": "error", "error": str(exc)}
+            await artifacts.store.upsert(
+                artifact_type="media_chunk_analysis",
+                producer=provider,
+                producer_version=model,
+                input_fingerprint=fingerprint,
+                payload=payload,
+            )
+            artifacts.set("contexts", [])
+            artifacts.set("transcript_text", "")
+            artifacts.set("transcript_segments", [])
+            return
+
+        transcript_text = "\n".join(transcript_lines).strip()
+        status = "ok" if transcript_text or contexts else "skipped"
+        if errors:
+            status = "partial"
+
+        transcript_payload = {
+            "status": status,
+            "error": errors[0] if errors else None,
+            "chunk_duration_sec": chunk_duration,
+            "chunk_count": len(transcript_segments),
+            "text": transcript_text,
+            "segments": transcript_segments,
+        }
+        transcript_bytes = json.dumps(transcript_payload, ensure_ascii=True).encode("utf-8")
+        transcript_storage_key = None
+        if len(transcript_bytes) > config.settings.transcription_storage_max_bytes:
+            transcript_storage_key = f"users/{item.user_id}/derived/{item.id}/transcript/transcript.json"
+            try:
+                await asyncio.to_thread(
+                    config.storage.store, transcript_storage_key, transcript_bytes, "application/json"
+                )
+            except Exception as exc:  # pragma: no cover - external storage dependency
+                logger.warning("Transcript storage failed for item {}: {}", item.id, exc)
+            transcript_payload = {
+                "status": status,
+                "error": errors[0] if errors else None,
+                "chunk_duration_sec": chunk_duration,
+                "chunk_count": len(transcript_segments),
+                "storage_key": transcript_storage_key,
+                "text": _truncate_text(transcript_text, 4000),
+            }
+
+        await artifacts.store.upsert(
+            artifact_type="transcription",
+            producer=provider,
+            producer_version=model,
+            input_fingerprint=fingerprint,
+            payload=transcript_payload,
+            storage_key=transcript_storage_key,
+        )
+        await _upsert_content(config.session, item.id, "transcription", transcript_payload)
+
+        analysis_payload = {
+            "status": status,
+            "error": errors[0] if errors else None,
+            "chunk_duration_sec": chunk_duration,
+            "chunk_count": chunk_count,
+            "contexts": contexts,
+            "transcript_text": _truncate_text(transcript_text, 6000),
+            "segments": transcript_segments[:200],
+        }
+        await artifacts.store.upsert(
+            artifact_type="media_chunk_analysis",
+            producer=provider,
+            producer_version=model,
+            input_fingerprint=fingerprint,
+            payload=analysis_payload,
+        )
+
+        artifacts.set("contexts", contexts)
+        artifacts.set(
+            "transcript_text",
+            _truncate_text(transcript_text, 6000) if transcript_storage_key else transcript_text,
+        )
+        artifacts.set("transcript_segments", transcript_segments)
+
+
+class KeyframeExtractionStep:
+    name = "keyframes"
+    version = "v4"
+    is_expensive = True
+
+    async def run(self, item: SourceItem, artifacts: PipelineArtifacts, config: PipelineConfig) -> None:
+        if item.item_type != "video":
+            return
+        if not config.settings.video_keyframes_always:
+            return
+
+        content_hash = artifacts.get("content_hash")
+        fingerprint = hash_parts(
+            [
+                content_hash,
+                self.version,
+                config.settings.video_keyframe_mode,
+                config.settings.video_keyframe_interval_sec,
+                config.settings.video_scene_threshold,
+                config.settings.video_max_keyframes,
+            ]
+        )
+        existing = await artifacts.store.get("keyframes", self.name, self.version, fingerprint)
+        if existing:
+            payload = existing.payload or {}
+            artifacts.set("keyframes", payload.get("frames") or [])
+            return
+
+        if not ffmpeg_available():
+            payload = {"status": "skipped", "reason": "missing_ffmpeg"}
+            await artifacts.store.upsert(
+                artifact_type="keyframes",
+                producer=self.name,
+                producer_version=self.version,
+                input_fingerprint=fingerprint,
+                payload=payload,
+            )
+            artifacts.set("keyframes", [])
+            return
+
+        blob = artifacts.get("blob") or b""
+        if not blob:
+            return
+        suffix = Path(item.original_filename or "").suffix or ".mp4"
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                media_path = Path(tmpdir) / f"source{suffix}"
+                media_path.write_bytes(blob)
+                frames, mode, _times = extract_keyframes(
+                    str(media_path),
+                    tmpdir,
+                    mode=config.settings.video_keyframe_mode,
+                    interval_sec=config.settings.video_keyframe_interval_sec,
+                    scene_threshold=config.settings.video_scene_threshold,
+                    max_frames=config.settings.video_max_keyframes,
+                )
+                if not frames and config.settings.video_keyframe_mode == "scene":
+                    frames, mode, _times = extract_keyframes(
+                        str(media_path),
+                        tmpdir,
+                        mode="interval",
+                        interval_sec=config.settings.video_keyframe_interval_sec,
+                        scene_threshold=config.settings.video_scene_threshold,
+                        max_frames=max(1, min(config.settings.video_max_keyframes, 4)),
+                    )
+                poster_path = Path(tmpdir) / "poster.jpg"
+                try:
+                    extract_single_frame(str(media_path), str(poster_path), timestamp_sec=0.0)
+                except MediaToolError as exc:
+                    logger.warning("Poster extraction failed for item {}: {}", item.id, exc)
+                    poster_path = None
+                stored_frames: list[dict[str, Any]] = []
+                poster_storage_key = None
+                if poster_path and poster_path.exists():
+                    poster_storage_key = f"users/{item.user_id}/derived/{item.id}/poster/poster.jpg"
+                    poster_bytes = poster_path.read_bytes()
+                    await asyncio.to_thread(
+                        config.storage.store, poster_storage_key, poster_bytes, "image/jpeg"
+                    )
+                for idx, frame in enumerate(frames):
+                    frame_path = Path(frame["path"])
+                    if not frame_path.exists():
+                        continue
+                    t_sec = frame.get("t_sec")
+                    time_label = f"{t_sec:.2f}".replace(".", "p") if isinstance(t_sec, (int, float)) else f"{idx}"
+                    storage_key = (
+                        f"users/{item.user_id}/derived/{item.id}/keyframes/{idx:04d}_{time_label}.jpg"
+                    )
+                    frame_bytes = frame_path.read_bytes()
+                    await asyncio.to_thread(config.storage.store, storage_key, frame_bytes, "image/jpeg")
+                    stored_frames.append({"t_sec": t_sec, "storage_key": storage_key})
+        except MediaToolError as exc:
+            payload = {"status": "error", "error": str(exc)}
+            await artifacts.store.upsert(
+                artifact_type="keyframes",
+                producer=self.name,
+                producer_version=self.version,
+                input_fingerprint=fingerprint,
+                payload=payload,
+            )
+            artifacts.set("keyframes", [])
+            return
+
+        payload = {
+            "status": "ok",
+            "mode": mode,
+            "interval_sec": config.settings.video_keyframe_interval_sec,
+            "scene_threshold": config.settings.video_scene_threshold,
+            "frames": stored_frames,
+            "poster": {
+                "t_sec": 0.0,
+                "storage_key": poster_storage_key,
+            }
+            if poster_storage_key
+            else None,
+        }
+        await artifacts.store.upsert(
+            artifact_type="keyframes",
+            producer=self.name,
+            producer_version=self.version,
+            input_fingerprint=fingerprint,
+            payload=payload,
+        )
+        artifacts.set("keyframes", stored_frames)
+
+
+class VideoPreviewStep:
+    name = "video_preview"
+    version = "v1"
+    is_expensive = True
+
+    async def run(self, item: SourceItem, artifacts: PipelineArtifacts, config: PipelineConfig) -> None:
+        if item.item_type != "video":
+            return
+        if not config.settings.video_preview_enabled:
+            return
+        if not ffmpeg_available():
+            payload = {"status": "skipped", "reason": "missing_ffmpeg"}
+            await artifacts.store.upsert(
+                artifact_type="video_preview",
+                producer=self.name,
+                producer_version=self.version,
+                input_fingerprint=hash_parts([artifacts.get("content_hash"), self.version, "missing_ffmpeg"]),
+                payload=payload,
+            )
+            return
+
+        blob = artifacts.get("blob") or b""
+        if not blob:
+            return
+
+        content_hash = artifacts.get("content_hash")
+        fingerprint = hash_parts(
+            [
+                content_hash,
+                self.version,
+                config.settings.video_preview_duration_sec,
+                config.settings.video_preview_max_width,
+                config.settings.video_preview_fps,
+                config.settings.video_preview_bitrate_kbps,
+            ]
+        )
+        existing = await artifacts.store.get("video_preview", self.name, self.version, fingerprint)
+        if existing:
+            return
+
+        duration_sec = config.settings.video_preview_duration_sec
+        media_metadata = artifacts.get("media_metadata") or {}
+        meta_duration = media_metadata.get("duration_sec")
+        if isinstance(meta_duration, (int, float)) and meta_duration > 0:
+            duration_sec = min(duration_sec, int(meta_duration))
+
+        suffix = Path(item.original_filename or "").suffix or ".mp4"
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                media_path = Path(tmpdir) / f"source{suffix}"
+                media_path.write_bytes(blob)
+                preview_path = Path(tmpdir) / "preview.mp4"
+                create_video_preview(
+                    str(media_path),
+                    str(preview_path),
+                    duration_sec=duration_sec,
+                    max_width=config.settings.video_preview_max_width,
+                    fps=config.settings.video_preview_fps,
+                    bitrate_kbps=config.settings.video_preview_bitrate_kbps,
+                )
+                preview_bytes = preview_path.read_bytes()
+        except MediaToolError as exc:
+            payload = {"status": "error", "error": str(exc)}
+            await artifacts.store.upsert(
+                artifact_type="video_preview",
+                producer=self.name,
+                producer_version=self.version,
+                input_fingerprint=fingerprint,
+                payload=payload,
+            )
+            return
+
+        preview_key = f"users/{item.user_id}/derived/{item.id}/preview/preview.mp4"
+        try:
+            await asyncio.to_thread(
+                config.storage.store,
+                preview_key,
+                preview_bytes,
+                "video/mp4",
+            )
+        except Exception as exc:  # pragma: no cover - external storage dependency
+            logger.warning("Preview upload failed for item {}: {}", item.id, exc)
+            payload = {"status": "error", "error": str(exc)}
+            await artifacts.store.upsert(
+                artifact_type="video_preview",
+                producer=self.name,
+                producer_version=self.version,
+                input_fingerprint=fingerprint,
+                payload=payload,
+            )
+            return
+
+        payload = {
+            "status": "ok",
+            "storage_key": preview_key,
+            "content_type": "video/mp4",
+            "duration_sec": duration_sec,
+        }
+        await artifacts.store.upsert(
+            artifact_type="video_preview",
+            producer=self.name,
+            producer_version=self.version,
+            input_fingerprint=fingerprint,
+            payload=payload,
+            storage_key=preview_key,
+        )
+
+
+class MediaSummaryContextStep:
+    name = "media_summary"
+    version = "v1"
+    is_expensive = False
+
+    async def run(self, item: SourceItem, artifacts: PipelineArtifacts, config: PipelineConfig) -> None:
+        if item.item_type not in {"video", "audio"}:
+            return
+        contexts = artifacts.get("contexts") or []
+        transcript_text = (artifacts.get("transcript_text") or "").strip()
+        if not contexts and not transcript_text:
+            return
+        if any(
+            isinstance(context, dict) and context.get("processor_versions", {}).get("media_summary") == self.version
+            for context in contexts
+        ):
+            return
+
+        summary_parts: list[str] = []
+        for entry in contexts:
+            if isinstance(entry, dict):
+                summary = entry.get("summary")
+                if summary:
+                    summary_parts.append(summary)
+            if len(summary_parts) >= 3:
+                break
+        if not summary_parts and transcript_text:
+            summary_parts.append(_truncate_text(transcript_text, 400))
+        summary = _truncate_text(" ".join(summary_parts).strip(), 600)
+        if transcript_text and transcript_text not in summary:
+            summary = _truncate_text(f"{summary} Transcript: {_truncate_text(transcript_text, 300)}", 800)
+
+        title = f"{item.item_type.title()} summary"
+        keywords = extract_keywords(summary)
+        summary_context = {
+            "context_type": "activity_context",
+            "title": title,
+            "summary": summary,
+            "keywords": keywords,
+            "entities": [],
+            "location": {},
+            "vector_text": build_vector_text(title, summary, keywords),
+            "processor_versions": {"media_summary": self.version},
+        }
+        contexts = [summary_context] + list(contexts)
+        artifacts.set("contexts", contexts)
+
+
+
+
 class GenericContextStep:
     name = "generic_context"
     version = "v1"
@@ -763,6 +1658,8 @@ class GenericContextStep:
 
     async def run(self, item: SourceItem, artifacts: PipelineArtifacts, config: PipelineConfig) -> None:
         if item.item_type == "photo":
+            return
+        if artifacts.get("contexts"):
             return
         caption = artifacts.get("caption") or f"{item.item_type} upload"
         context_type = self._context_type(item)
@@ -779,6 +1676,66 @@ class GenericContextStep:
             "processor_versions": {"generic": self.version},
         }
         artifacts.set("contexts", [context])
+
+
+class TranscriptContextStep:
+    name = "transcript_context"
+    version = "v1"
+    is_expensive = False
+
+    def _context_type(self, item: SourceItem) -> str:
+        if item.item_type == "audio":
+            return "knowledge_context"
+        return "activity_context"
+
+    async def run(self, item: SourceItem, artifacts: PipelineArtifacts, config: PipelineConfig) -> None:
+        if item.item_type not in {"audio", "video"}:
+            return
+        transcript_text = (artifacts.get("transcript_text") or "").strip()
+        if not transcript_text:
+            return
+        caption = artifacts.get("caption") or f"{item.item_type} upload"
+        snippet = _truncate_text(transcript_text, 400)
+        summary = snippet
+        if caption and caption not in snippet:
+            summary = f"{caption}. Transcript: {snippet}"
+        title = f"{item.item_type.title()} transcript"
+        keywords = extract_keywords(transcript_text)
+        vector_text = build_vector_text(
+            title,
+            _truncate_text(transcript_text, 2000),
+            keywords,
+        )
+        provider = (
+            config.settings.video_understanding_provider
+            if item.item_type == "video"
+            else config.settings.audio_understanding_provider
+        )
+        model = (
+            config.settings.video_understanding_model
+            if item.item_type == "video"
+            else config.settings.audio_understanding_model
+        )
+        context = {
+            "context_type": self._context_type(item),
+            "title": title,
+            "summary": summary,
+            "keywords": keywords,
+            "entities": [],
+            "location": {},
+            "vector_text": vector_text,
+            "processor_versions": {
+                "transcription_step": self.version,
+                "transcription_provider": provider,
+                "transcription_model": model,
+            },
+        }
+        contexts = artifacts.get("contexts") or []
+        if isinstance(contexts, list):
+            contexts.append(context)
+        else:
+            contexts = [context]
+        artifacts.set("contexts", contexts)
 
 
 class ContextPersistStep:
@@ -957,6 +1914,7 @@ COMMON_STEPS: list[PipelineStep] = [
     FetchBlobStep(),
     ContentHashStep(),
     MetadataStep(),
+    MediaMetadataStep(),
     ExifStep(),
     PreviewStep(),
     PerceptualHashStep(),
@@ -973,6 +1931,26 @@ IMAGE_STEPS: list[PipelineStep] = [
     EmbeddingStep(),
 ]
 
+VIDEO_STEPS: list[PipelineStep] = [
+    KeyframeExtractionStep(),
+    VideoPreviewStep(),
+    MediaChunkUnderstandingStep(),
+    MediaSummaryContextStep(),
+    TranscriptContextStep(),
+    GenericContextStep(),
+    ContextPersistStep(),
+    EmbeddingStep(),
+]
+
+AUDIO_STEPS: list[PipelineStep] = [
+    MediaChunkUnderstandingStep(),
+    MediaSummaryContextStep(),
+    TranscriptContextStep(),
+    GenericContextStep(),
+    ContextPersistStep(),
+    EmbeddingStep(),
+]
+
 GENERIC_STEPS: list[PipelineStep] = [
     GenericContextStep(),
     ContextPersistStep(),
@@ -983,4 +1961,8 @@ GENERIC_STEPS: list[PipelineStep] = [
 def get_pipeline_steps(item_type: str) -> list[PipelineStep]:
     if item_type == "photo":
         return COMMON_STEPS + IMAGE_STEPS
+    if item_type == "video":
+        return COMMON_STEPS + VIDEO_STEPS
+    if item_type == "audio":
+        return COMMON_STEPS + AUDIO_STEPS
     return COMMON_STEPS + GENERIC_STEPS

@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts';
-import { HardDrive, Image as ImageIcon, Link as LinkIcon, Activity, Calendar } from 'lucide-react';
+import { HardDrive, Image as ImageIcon, Link as LinkIcon, Activity, Calendar, Mic, Play, Video } from 'lucide-react';
 import { apiGet } from '../services/api';
 import { DashboardRecentItem, DashboardStatsResponse } from '../types';
 
@@ -25,35 +25,49 @@ const formatDate = (value?: string) => {
 const buildLabel = (item: DashboardRecentItem) =>
   item.caption || item.original_filename || `${item.item_type} upload`;
 
-const RecentActivityItem: React.FC<{ item: DashboardRecentItem }> = ({ item }) => (
-  <div className="flex items-center space-x-4 p-3 hover:bg-slate-50 rounded-lg transition-colors cursor-pointer group">
-    {item.download_url ? (
-      <img
-        src={item.download_url}
-        alt={buildLabel(item)}
-        className="w-12 h-12 rounded-lg object-cover shadow-sm group-hover:scale-105 transition-transform"
-      />
-    ) : (
-      <div className="w-12 h-12 rounded-lg bg-slate-100 flex items-center justify-center text-slate-400">
-        <ImageIcon className="w-5 h-5" />
+const RecentActivityItem: React.FC<{ item: DashboardRecentItem }> = ({ item }) => {
+  const isVideo = item.item_type === 'video';
+  const isAudio = item.item_type === 'audio';
+  const thumbnailUrl = isVideo ? item.poster_url : item.download_url;
+  return (
+    <div className="flex items-center space-x-4 p-3 hover:bg-slate-50 rounded-lg transition-colors cursor-pointer group">
+      {thumbnailUrl ? (
+        <div className="relative w-12 h-12">
+          <img
+            src={thumbnailUrl}
+            alt={buildLabel(item)}
+            className="w-12 h-12 rounded-lg object-cover shadow-sm group-hover:scale-105 transition-transform"
+          />
+          {isVideo && (
+            <span className="absolute inset-0 flex items-center justify-center text-white">
+              <span className="flex items-center justify-center w-6 h-6 rounded-full bg-black/60">
+                <Play className="w-3 h-3" />
+              </span>
+            </span>
+          )}
+        </div>
+      ) : (
+        <div className="w-12 h-12 rounded-lg bg-slate-100 flex items-center justify-center text-slate-400">
+          {isVideo ? <Video className="w-5 h-5" /> : isAudio ? <Mic className="w-5 h-5" /> : <ImageIcon className="w-5 h-5" />}
+        </div>
+      )}
+      <div className="flex-1 min-w-0">
+        <p className="text-sm font-medium text-slate-900 truncate">{buildLabel(item)}</p>
+        <div className="flex items-center text-xs text-slate-500 mt-0.5">
+          <Calendar className="w-3 h-3 mr-1" />
+          <span>{formatDate(item.captured_at)}</span>
+        </div>
       </div>
-    )}
-    <div className="flex-1 min-w-0">
-      <p className="text-sm font-medium text-slate-900 truncate">{buildLabel(item)}</p>
-      <div className="flex items-center text-xs text-slate-500 mt-0.5">
-        <Calendar className="w-3 h-3 mr-1" />
-        <span>{formatDate(item.captured_at)}</span>
+      <div
+        className={`text-xs font-medium px-2 py-1 rounded-full ${
+          item.processed ? 'text-green-600 bg-green-50' : 'text-slate-600 bg-slate-100'
+        }`}
+      >
+        {item.processed ? 'Processed' : 'Processing'}
       </div>
     </div>
-    <div
-      className={`text-xs font-medium px-2 py-1 rounded-full ${
-        item.processed ? 'text-green-600 bg-green-50' : 'text-slate-600 bg-slate-100'
-      }`}
-    >
-      {item.processed ? 'Processed' : 'Processing'}
-    </div>
-  </div>
-);
+  );
+};
 
 export const Dashboard: React.FC = () => {
   const [stats, setStats] = useState<DashboardStatsResponse | null>(null);

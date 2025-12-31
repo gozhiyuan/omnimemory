@@ -80,6 +80,7 @@ def test_dashboard_stats_returns_activity_and_recent_items(monkeypatch):
             FakeResult(scalars=[item]),
             FakeResult(rows=[caption_row]),
             FakeResult(scalars=[]),
+            FakeResult(rows=[]),
             FakeResult(rows=[ActivityRow(day=date.today(), count=4)]),
         ]
     )
@@ -129,6 +130,7 @@ def test_dashboard_handles_signing_failures(monkeypatch):
             FakeResult(scalars=[item]),
             FakeResult(rows=[]),
             FakeResult(scalars=[]),
+            FakeResult(rows=[]),
             FakeResult(rows=[ActivityRow(day=date.today(), count=1)]),
         ]
     )

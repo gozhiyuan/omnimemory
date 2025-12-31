@@ -31,16 +31,85 @@ export interface TimelineItem {
   item_type: 'photo' | 'video' | 'audio' | 'document';
   captured_at?: string;
   processed: boolean;
+  processing_status?: string;
   storage_key: string;
   content_type?: string | null;
   original_filename?: string | null;
   caption?: string | null;
   download_url?: string | null;
+  poster_url?: string | null;
 }
 
 export interface TimelineDay {
   date: string;
   item_count: number;
+  items: TimelineItem[];
+  episodes?: TimelineEpisode[];
+  daily_summary?: TimelineDailySummary | null;
+}
+
+export interface TimelineEpisode {
+  episode_id: string;
+  title: string;
+  summary: string;
+  context_type: string;
+  start_time_utc?: string | null;
+  end_time_utc?: string | null;
+  item_count: number;
+  source_item_ids: string[];
+  context_ids: string[];
+  preview_url?: string | null;
+}
+
+export interface TimelineDailySummary {
+  context_id: string;
+  summary_date: string;
+  title: string;
+  summary: string;
+  keywords: string[];
+}
+
+export interface TimelineContext {
+  context_type: string;
+  title: string;
+  summary: string;
+  keywords: string[];
+  entities: Array<Record<string, unknown>>;
+  location: Record<string, unknown>;
+  processor_versions: Record<string, unknown>;
+}
+
+export interface TranscriptSegment {
+  start_ms: number;
+  end_ms: number;
+  text: string;
+  status?: string | null;
+  error?: string | null;
+}
+
+export interface TimelineItemDetail extends TimelineItem {
+  contexts: TimelineContext[];
+  transcript_text?: string | null;
+  transcript_segments?: TranscriptSegment[];
+}
+
+export type TimelineViewMode = 'day' | 'week' | 'month' | 'year' | 'all';
+
+export interface TimelineFocus {
+  viewMode?: TimelineViewMode;
+  anchorDate?: string;
+  itemId?: string;
+}
+
+export interface TimelineEpisodeDetail {
+  episode_id: string;
+  title: string;
+  summary: string;
+  context_type: string;
+  start_time_utc?: string | null;
+  end_time_utc?: string | null;
+  source_item_ids: string[];
+  contexts: TimelineContext[];
   items: TimelineItem[];
 }
 
@@ -59,6 +128,7 @@ export interface DashboardRecentItem {
   original_filename?: string | null;
   caption?: string | null;
   download_url?: string | null;
+  poster_url?: string | null;
 }
 
 export interface DashboardStatsResponse {
@@ -70,6 +140,45 @@ export interface DashboardStatsResponse {
   storage_used_bytes: number;
   recent_items: DashboardRecentItem[];
   activity: DashboardActivityPoint[];
+  usage_this_week: UsageTotals;
+  usage_all_time: UsageTotals;
+  usage_daily: UsageDailyPoint[];
+}
+
+export interface UsageTotals {
+  prompt_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+}
+
+export interface UsageDailyPoint {
+  date: string;
+  total_tokens: number;
+  cost_usd: number;
+}
+
+export interface TimelineItemsResponse {
+  items: TimelineItem[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface SearchResult {
+  context_id: string;
+  score?: number | null;
+  context_type?: string | null;
+  title?: string | null;
+  summary?: string | null;
+  event_time_utc?: string | null;
+  source_item_ids: string[];
+  payload?: Record<string, unknown> | null;
+}
+
+export interface SearchResponse {
+  query: string;
+  results: SearchResult[];
 }
 
 export interface UploadUrlResponse {

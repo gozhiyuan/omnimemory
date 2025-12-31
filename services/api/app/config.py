@@ -1,6 +1,7 @@
 """Application configuration using pydantic-settings."""
 
 from functools import lru_cache
+import json
 from typing import Literal, Optional
 
 from pydantic import AnyUrl, Field, field_validator, model_validator
@@ -25,6 +26,7 @@ class Settings(BaseSettings):
         env_file=_env_paths,
         env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
     # App metadata
@@ -34,8 +36,12 @@ class Settings(BaseSettings):
     # Storage + data services
     redis_url: str = Field(..., description="Redis connection URL")
     qdrant_url: AnyUrl = Field(..., description="Qdrant HTTP endpoint")
-    qdrant_collection: str = "lifelog-items"
-    embedding_dimension: int = Field(default=1536, ge=1, description="Embedding vector size")
+    qdrant_collection: str = "lifelog-items-v2"
+    embedding_dimension: int = Field(default=3072, ge=1, description="Embedding vector size")
+    embedding_provider: Literal["gemini", "none"] = "gemini"
+    embedding_model: str = "gemini-embedding-001"
+    embedding_batch_size: int = Field(default=16, ge=1)
+    embedding_timeout_seconds: int = 30
     postgres_host: str = "localhost"
     postgres_port: int = 5432
     postgres_db: str = "lifelog"
@@ -69,10 +75,94 @@ class Settings(BaseSettings):
         ]
     )
 
+    # OCR settings
+    ocr_provider: Literal["google_cloud_vision", "none"] = "google_cloud_vision"
+    ocr_google_api_key: Optional[str] = None
+    ocr_language_hints_raw: str = Field(default="", alias="OCR_LANGUAGE_HINTS")
+    ocr_timeout_seconds: int = 15
+
+    # VLM settings
+    vlm_provider: Literal["gemini", "none"] = "gemini"
+    gemini_api_key: Optional[str] = None
+    gemini_model: str = "gemini-2.5-flash-lite"
+    vlm_temperature: float = 0.2
+    vlm_max_output_tokens: int = 2048
+    vlm_timeout_seconds: int = 30
+
+    # Chunked transcript + context output sizing
+    transcription_max_output_tokens: int = 4096
+    transcription_storage_max_bytes: int = Field(default=500_000, ge=1)
+
+    # Video/audio understanding settings
+    video_understanding_provider: Literal["gemini", "none"] = "gemini"
+    video_understanding_model: str = "gemini-2.5-flash-lite"
+    video_understanding_temperature: float = 0.2
+    video_understanding_timeout_seconds: int = 60
+    video_understanding_max_bytes: int = Field(default=19_000_000, ge=1)
+    video_understanding_max_duration_sec: int = Field(default=20 * 60, ge=1)
+
+    audio_understanding_provider: Literal["gemini", "none"] = "gemini"
+    audio_understanding_model: str = "gemini-2.5-flash-lite"
+    audio_understanding_temperature: float = 0.2
+    audio_understanding_timeout_seconds: int = 60
+    audio_understanding_max_bytes: int = Field(default=19_000_000, ge=1)
+
+    # Media extraction settings
+    media_max_bytes: int = Field(default=1_000_000_000, ge=1)
+    media_chunk_target_bytes: int = Field(default=10_000_000, ge=1)
+    media_chunk_max_chunks: int = Field(default=240, ge=1)
+    video_max_duration_sec: int = Field(default=5 * 60, ge=1)
+    audio_max_duration_sec: int = Field(default=60 * 60, ge=1)
+    video_chunk_duration_sec: int = Field(default=60, ge=1)
+    audio_chunk_duration_sec: int = Field(default=300, ge=1)
+    audio_sample_rate_hz: int = Field(default=16000, ge=8000)
+    audio_channels: int = Field(default=1, ge=1)
+    video_keyframe_mode: Literal["scene", "interval"] = "scene"
+    video_scene_threshold: float = Field(default=0.3, ge=0.0)
+    video_keyframe_interval_sec: int = Field(default=5, ge=1)
+    video_max_keyframes: int = Field(default=60, ge=1)
+    video_vlm_max_frames: int = Field(default=24, ge=1)
+    video_keyframes_always: bool = True
+    video_vlm_concurrency: int = Field(default=2, ge=1)
+    video_preview_enabled: bool = False
+    video_preview_duration_sec: int = Field(default=8, ge=1)
+    video_preview_max_width: int = Field(default=640, ge=64)
+    video_preview_fps: int = Field(default=12, ge=1)
+    video_preview_bitrate_kbps: int = Field(default=600, ge=50)
+
+    # Episode merge + semantic merge settings
+    semantic_merge_enabled: bool = True
+    semantic_merge_min_jaccard: float = Field(default=0.6, ge=0.0, le=1.0)
+    episode_merge_enabled: bool = True
+    episode_merge_max_gap_minutes: int = Field(default=90, ge=1)
+    episode_merge_similarity_threshold: float = Field(default=0.78, ge=0.0, le=1.0)
+
+    # Maps/Geocoding settings
+    maps_geocoding_provider: Literal["google_maps", "none"] = "google_maps"
+    maps_google_api_key: Optional[str] = None
+    maps_timeout_seconds: int = 15
+
+    # Pipeline logging
+    pipeline_log_details: bool = Field(default=False, alias="PIPELINE_LOG_DETAILS")
+    pipeline_reprocess_duplicates: bool = Field(default=False, alias="PIPELINE_REPROCESS_DUPLICATES")
+    dedupe_near_window_minutes: int = Field(default=10, ge=1, alias="DEDUPE_NEAR_WINDOW_MINUTES")
+    dedupe_near_hamming_threshold: int = Field(
+        default=5,
+        ge=0,
+        alias="DEDUPE_NEAR_HAMMING_THRESHOLD",
+    )
+
     @model_validator(mode="before")
     @classmethod
     def _coerce_empty_strings(cls, values):
-        for key in ("supabase_url", "supabase_service_role_key"):
+        for key in (
+            "supabase_url",
+            "supabase_service_role_key",
+            "ocr_google_api_key",
+            "gemini_api_key",
+            "ocr_language_hints_raw",
+            "maps_google_api_key",
+        ):
             if values.get(key) == "":
                 values[key] = None
         return values
@@ -90,6 +180,19 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return [origin.strip() for origin in value.split(",") if origin.strip()]
         return value
+
+    @property
+    def ocr_language_hints(self) -> list[str]:
+        raw = (self.ocr_language_hints_raw or "").strip()
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        except json.JSONDecodeError:
+            pass
+        return [lang.strip() for lang in raw.split(",") if lang.strip()]
 
 
 @lru_cache(maxsize=1)

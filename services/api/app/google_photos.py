@@ -5,8 +5,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
-import httpx
 from loguru import logger
+
+import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -49,6 +50,77 @@ def extract_picker_media_fields(item: dict) -> tuple[Optional[str], Optional[str
         or gpm.get("createTime")
     )
     return base_url, filename, mime_type, creation_time
+
+
+def _find_lat_lng(value: object) -> tuple[Optional[float], Optional[float]]:
+    if isinstance(value, dict):
+        lat = value.get("latitude") or value.get("lat")
+        lng = value.get("longitude") or value.get("lng") or value.get("lon")
+        if lat is None and "latitudeE7" in value:
+            lat = value.get("latitudeE7")
+        if lng is None and "longitudeE7" in value:
+            lng = value.get("longitudeE7")
+        if lat is not None and lng is not None:
+            try:
+                lat_val = float(lat)
+                lng_val = float(lng)
+                if abs(lat_val) > 1000 or abs(lng_val) > 1000:
+                    lat_val /= 1e7
+                    lng_val /= 1e7
+                return lat_val, lng_val
+            except (TypeError, ValueError):
+                return None, None
+        for nested in value.values():
+            lat_val, lng_val = _find_lat_lng(nested)
+            if lat_val is not None and lng_val is not None:
+                return lat_val, lng_val
+    elif isinstance(value, list):
+        for entry in value:
+            lat_val, lng_val = _find_lat_lng(entry)
+            if lat_val is not None and lng_val is not None:
+                return lat_val, lng_val
+    return None, None
+
+
+def extract_picker_location(item: dict) -> Optional[dict]:
+    """Return a normalized location payload if lat/lng found in the picker item."""
+    candidates = [
+        item,
+        item.get("googlePhotosMediaItem") if isinstance(item, dict) else None,
+        item.get("mediaItem") if isinstance(item, dict) else None,
+        item.get("mediaFile") if isinstance(item, dict) else None,
+    ]
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        metadata = candidate.get("mediaMetadata") or {}
+        lat_val, lng_val = _find_lat_lng(metadata)
+        if lat_val is None or lng_val is None:
+            lat_val, lng_val = _find_lat_lng(candidate)
+        if lat_val is None or lng_val is None:
+            continue
+        altitude = (
+            candidate.get("altitude")
+            or metadata.get("altitude")
+            or candidate.get("altitudeMeters")
+            or metadata.get("altitudeMeters")
+        )
+        accuracy = (
+            candidate.get("accuracy")
+            or metadata.get("accuracy")
+            or candidate.get("accuracyMeters")
+            or metadata.get("accuracyMeters")
+        )
+        name = candidate.get("locationName") or metadata.get("locationName")
+        return {
+            "latitude": lat_val,
+            "longitude": lng_val,
+            "altitude": altitude,
+            "accuracy": accuracy,
+            "name": name,
+            "source": "google_photos",
+        }
+    return None
 
 
 async def store_google_photos_tokens(

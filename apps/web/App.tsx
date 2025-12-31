@@ -4,7 +4,7 @@ import { Dashboard } from './components/Dashboard';
 import { ChatInterface } from './components/ChatInterface';
 import { Timeline } from './components/Timeline';
 import { UploadManager } from './components/UploadManager';
-import { View } from './types';
+import { TimelineFocus, View } from './types';
 
 const getInitialView = (): View => {
   const params = new URLSearchParams(window.location.search);
@@ -16,15 +16,28 @@ const getInitialView = (): View => {
 
 const App: React.FC = () => {
   const [currentView, setCurrentView] = useState<View>(getInitialView);
+  const [timelineFocus, setTimelineFocus] = useState<TimelineFocus | null>(null);
 
   const renderContent = () => {
     switch (currentView) {
       case 'dashboard':
-        return <Dashboard />;
+        return (
+          <Dashboard
+            onOpenTimeline={(focus) => {
+              setTimelineFocus(focus);
+              setCurrentView('timeline');
+            }}
+          />
+        );
       case 'chat':
         return <ChatInterface />;
       case 'timeline':
-        return <Timeline />;
+        return (
+          <Timeline
+            focus={timelineFocus}
+            onFocusHandled={() => setTimelineFocus(null)}
+          />
+        );
       case 'upload':
         return <UploadManager />;
       case 'settings':

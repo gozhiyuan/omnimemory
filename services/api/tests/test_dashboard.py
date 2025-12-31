@@ -33,6 +33,11 @@ class FakeResult:
     def scalar_one(self):
         return self._scalar
 
+    def one(self):
+        if self._rows:
+            return self._rows[0]
+        return self._scalar
+
 
 class FakeSession:
     def __init__(self, results):
@@ -59,6 +64,7 @@ def test_dashboard_stats_returns_activity_and_recent_items(monkeypatch):
         id=item_id,
         item_type="photo",
         captured_at=created_at,
+        event_time_utc=created_at,
         created_at=created_at,
         processing_status="completed",
         storage_key="uploads/ui/example.png",
@@ -67,6 +73,7 @@ def test_dashboard_stats_returns_activity_and_recent_items(monkeypatch):
     )
     caption_row = SimpleNamespace(item_id=item_id, data={"text": "Example caption"})
     ActivityRow = namedtuple("ActivityRow", ["day", "count"])
+    UsageRow = SimpleNamespace(prompt_tokens=10, output_tokens=5, total_tokens=15, cost_usd=0.0012)
 
     fake_session = FakeSession(
         [
@@ -76,9 +83,14 @@ def test_dashboard_stats_returns_activity_and_recent_items(monkeypatch):
             FakeResult(scalar=0),
             FakeResult(scalar=3),
             FakeResult(scalar=4285357),
+            FakeResult(rows=[UsageRow]),
+            FakeResult(rows=[UsageRow]),
             FakeResult(scalars=[item]),
             FakeResult(rows=[caption_row]),
+            FakeResult(scalars=[]),
+            FakeResult(rows=[]),
             FakeResult(rows=[ActivityRow(day=date.today(), count=4)]),
+            FakeResult(rows=[]),
         ]
     )
 
@@ -107,6 +119,7 @@ def test_dashboard_handles_signing_failures(monkeypatch):
         id=item_id,
         item_type="photo",
         captured_at=created_at,
+        event_time_utc=created_at,
         created_at=created_at,
         processing_status="completed",
         storage_key="uploads/ui/example.png",
@@ -114,6 +127,7 @@ def test_dashboard_handles_signing_failures(monkeypatch):
         original_filename="example.png",
     )
     ActivityRow = namedtuple("ActivityRow", ["day", "count"])
+    UsageRow = SimpleNamespace(prompt_tokens=0, output_tokens=0, total_tokens=0, cost_usd=0.0)
 
     fake_session = FakeSession(
         [
@@ -123,9 +137,14 @@ def test_dashboard_handles_signing_failures(monkeypatch):
             FakeResult(scalar=0),
             FakeResult(scalar=1),
             FakeResult(scalar=0),
+            FakeResult(rows=[UsageRow]),
+            FakeResult(rows=[UsageRow]),
             FakeResult(scalars=[item]),
             FakeResult(rows=[]),
+            FakeResult(scalars=[]),
+            FakeResult(rows=[]),
             FakeResult(rows=[ActivityRow(day=date.today(), count=1)]),
+            FakeResult(rows=[]),
         ]
     )
 

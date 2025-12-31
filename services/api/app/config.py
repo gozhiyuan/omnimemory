@@ -130,6 +130,13 @@ class Settings(BaseSettings):
     video_preview_fps: int = Field(default=12, ge=1)
     video_preview_bitrate_kbps: int = Field(default=600, ge=50)
 
+    # Episode merge + semantic merge settings
+    semantic_merge_enabled: bool = True
+    semantic_merge_min_jaccard: float = Field(default=0.6, ge=0.0, le=1.0)
+    episode_merge_enabled: bool = True
+    episode_merge_max_gap_minutes: int = Field(default=90, ge=1)
+    episode_merge_similarity_threshold: float = Field(default=0.78, ge=0.0, le=1.0)
+
     # Maps/Geocoding settings
     maps_geocoding_provider: Literal["google_maps", "none"] = "google_maps"
     maps_google_api_key: Optional[str] = None

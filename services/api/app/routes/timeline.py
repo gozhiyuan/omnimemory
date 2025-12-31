@@ -15,6 +15,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
+from ..celery_app import celery_app
 from ..config import get_settings
 from ..db.models import (
     DEFAULT_TEST_USER_ID,
@@ -28,6 +29,7 @@ from ..db.session import get_session
 from ..google_photos import get_valid_access_token
 from ..storage import get_storage_provider
 from ..vectorstore import delete_context_embeddings, upsert_context_embeddings
+from ..pipeline.utils import build_vector_text, ensure_tz_aware
 
 
 router = APIRouter()
@@ -51,6 +53,8 @@ class TimelineDay(BaseModel):
     date: date
     item_count: int
     items: List[TimelineItem]
+    episodes: list["TimelineEpisode"] = []
+    daily_summary: Optional["TimelineDailySummary"] = None
 
 
 class TimelineContext(BaseModel):
@@ -86,6 +90,46 @@ class TimelineItemDetail(BaseModel):
     contexts: list[TimelineContext]
     transcript_text: Optional[str] = None
     transcript_segments: list[TranscriptSegment] = []
+
+
+class TimelineEpisode(BaseModel):
+    episode_id: str
+    title: str
+    summary: str
+    context_type: str
+    start_time_utc: Optional[str]
+    end_time_utc: Optional[str]
+    item_count: int
+    source_item_ids: list[str]
+    context_ids: list[str]
+    preview_url: Optional[str] = None
+
+
+class TimelineDailySummary(BaseModel):
+    context_id: str
+    summary_date: date
+    title: str
+    summary: str
+    keywords: list[str]
+
+
+class TimelineEpisodeDetail(BaseModel):
+    episode_id: str
+    title: str
+    summary: str
+    context_type: str
+    start_time_utc: Optional[str]
+    end_time_utc: Optional[str]
+    source_item_ids: list[str]
+    contexts: list[TimelineContext]
+    items: list[TimelineItem]
+
+
+class EpisodeUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    summary: Optional[str] = None
+    keywords: Optional[list[str]] = None
+    context_type: str = "activity_context"
 
 
 class DeleteResponse(BaseModel):
@@ -285,6 +329,125 @@ async def get_timeline(
             item_id: url for (item_id, _), url in zip(poster_candidates, poster_signed)
         }
 
+    item_by_id = {item.id: item for item in items}
+
+    def episode_preview(source_ids: list[str]) -> Optional[str]:
+        candidates: list[tuple[datetime, SourceItem]] = []
+        for source_id in source_ids:
+            try:
+                item_id = UUID(source_id)
+            except Exception:
+                continue
+            item = item_by_id.get(item_id)
+            if not item:
+                continue
+            time_value = item.event_time_utc or item.captured_at or item.created_at
+            if time_value:
+                time_value = ensure_tz_aware(time_value)
+            else:
+                time_value = datetime.min.replace(tzinfo=timezone.utc)
+            candidates.append((time_value, item))
+        candidates.sort(key=lambda pair: pair[0])
+        for _, item in candidates:
+            if item.item_type == "photo":
+                url = download_urls.get(item.id)
+            elif item.item_type == "video":
+                url = poster_urls.get(item.id)
+            else:
+                url = None
+            if url:
+                return url
+        return None
+
+    episodes_by_date: dict[date, list[TimelineEpisode]] = defaultdict(list)
+    episode_stmt = select(ProcessedContext).where(
+        ProcessedContext.user_id == user_id,
+        ProcessedContext.is_episode.is_(True),
+        ProcessedContext.context_type != "daily_summary",
+    )
+    episode_time_expr = func.coalesce(ProcessedContext.start_time_utc, ProcessedContext.event_time_utc)
+    if start_date:
+        start_dt = datetime.combine(start_date, time.min, tzinfo=timezone.utc) + offset
+        episode_stmt = episode_stmt.where(episode_time_expr >= start_dt)
+    if end_date:
+        end_dt = datetime.combine(end_date, time.min, tzinfo=timezone.utc) + offset + timedelta(days=1)
+        episode_stmt = episode_stmt.where(episode_time_expr < end_dt)
+    episode_rows = await session.execute(episode_stmt)
+    episode_contexts = list(episode_rows.scalars().all())
+    episode_groups: dict[str, list[ProcessedContext]] = defaultdict(list)
+    for context in episode_contexts:
+        versions = context.processor_versions or {}
+        episode_id = None
+        if isinstance(versions, dict):
+            episode_id = versions.get("episode_id")
+        episode_key = str(episode_id) if episode_id else str(context.id)
+        episode_groups[episode_key].append(context)
+
+    for episode_id, contexts in episode_groups.items():
+        if not contexts:
+            continue
+        primary = next((ctx for ctx in contexts if ctx.context_type == "activity_context"), contexts[0])
+        start_times = [
+            ensure_tz_aware(ctx.start_time_utc or ctx.event_time_utc or ctx.created_at)
+            for ctx in contexts
+        ]
+        end_times = [
+            ensure_tz_aware(ctx.end_time_utc or ctx.event_time_utc or ctx.created_at)
+            for ctx in contexts
+        ]
+        start_time = min(start_times)
+        end_time = max(end_times)
+        source_item_ids: list[str] = []
+        for ctx in contexts:
+            for source_id in ctx.source_item_ids:
+                source_item_ids.append(str(source_id))
+        source_item_ids = list(dict.fromkeys(source_item_ids))
+        preview_url = episode_preview(source_item_ids)
+        local_start = start_time - offset
+        item_date = local_start.date()
+        episodes_by_date[item_date].append(
+            TimelineEpisode(
+                episode_id=episode_id,
+                title=primary.title,
+                summary=primary.summary,
+                context_type=primary.context_type,
+                start_time_utc=start_time.isoformat(),
+                end_time_utc=end_time.isoformat(),
+                item_count=len(source_item_ids),
+                source_item_ids=source_item_ids,
+                context_ids=[str(ctx.id) for ctx in contexts],
+                preview_url=preview_url,
+            )
+        )
+
+    daily_summaries_by_date: dict[date, TimelineDailySummary] = {}
+    daily_stmt = select(ProcessedContext).where(
+        ProcessedContext.user_id == user_id,
+        ProcessedContext.is_episode.is_(True),
+        ProcessedContext.context_type == "daily_summary",
+    )
+    daily_time_expr = func.coalesce(ProcessedContext.start_time_utc, ProcessedContext.event_time_utc)
+    if start_date:
+        start_dt = datetime.combine(start_date, time.min, tzinfo=timezone.utc) + offset
+        daily_stmt = daily_stmt.where(daily_time_expr >= start_dt)
+    if end_date:
+        end_dt = datetime.combine(end_date, time.min, tzinfo=timezone.utc) + offset + timedelta(days=1)
+        daily_stmt = daily_stmt.where(daily_time_expr < end_dt)
+    daily_stmt = daily_stmt.order_by(ProcessedContext.created_at.desc())
+    daily_rows = await session.execute(daily_stmt)
+    for context in daily_rows.scalars().all():
+        base_time = ensure_tz_aware(context.start_time_utc or context.event_time_utc or context.created_at)
+        local_date = (base_time - offset).date()
+        if local_date in daily_summaries_by_date:
+            continue
+        daily_summaries_by_date[local_date] = TimelineDailySummary(
+            context_id=str(context.id),
+            summary_date=local_date,
+            title=context.title or "Daily summary",
+            summary=context.summary or "",
+            keywords=context.keywords or [],
+        )
+
     grouped: dict[date, list[SourceItem]] = defaultdict(list)
     for item in items:
         event_time = item.event_time_utc or item.captured_at or item.created_at
@@ -317,6 +480,12 @@ async def get_timeline(
                     )
                     for item in day_items
                 ],
+                episodes=sorted(
+                    episodes_by_date.get(day, []),
+                    key=lambda episode: episode.start_time_utc or "",
+                    reverse=False,
+                ),
+                daily_summary=daily_summaries_by_date.get(day),
             )
         )
 
@@ -504,6 +673,248 @@ async def get_timeline_item_detail(
     )
 
 
+@router.get("/episodes/{episode_id}", response_model=TimelineEpisodeDetail)
+async def get_timeline_episode_detail(
+    episode_id: str,
+    user_id: UUID = DEFAULT_TEST_USER_ID,
+    session: AsyncSession = Depends(get_session),
+) -> TimelineEpisodeDetail:
+    episode_stmt = select(ProcessedContext).where(
+        ProcessedContext.user_id == user_id,
+        ProcessedContext.is_episode.is_(True),
+        ProcessedContext.processor_versions["episode_id"].astext == episode_id,
+    )
+    episode_rows = await session.execute(episode_stmt)
+    episode_contexts = list(episode_rows.scalars().all())
+    if not episode_contexts:
+        try:
+            episode_uuid = UUID(episode_id)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=404, detail="Episode not found")
+        fallback = await session.get(ProcessedContext, episode_uuid)
+        if not fallback or not fallback.is_episode or fallback.user_id != user_id:
+            raise HTTPException(status_code=404, detail="Episode not found")
+        episode_contexts = [fallback]
+
+    primary = next(
+        (ctx for ctx in episode_contexts if ctx.context_type == "activity_context"),
+        episode_contexts[0],
+    )
+    start_time = min(
+        ensure_tz_aware(ctx.start_time_utc or ctx.event_time_utc or ctx.created_at)
+        for ctx in episode_contexts
+    )
+    end_time = max(
+        ensure_tz_aware(ctx.end_time_utc or ctx.event_time_utc or ctx.created_at)
+        for ctx in episode_contexts
+    )
+    source_item_ids: list[UUID] = []
+    for ctx in episode_contexts:
+        for source_id in ctx.source_item_ids:
+            source_item_ids.append(source_id)
+    source_item_ids = list(dict.fromkeys(source_item_ids))
+
+    settings = get_settings()
+    storage = get_storage_provider()
+
+    async def sign_url(storage_key: str) -> Optional[str]:
+        if storage_key.startswith("http://") or storage_key.startswith("https://"):
+            return storage_key
+        try:
+            signed = await asyncio.to_thread(
+                storage.get_presigned_download, storage_key, settings.presigned_url_ttl_seconds
+            )
+        except Exception as exc:  # pragma: no cover - external service dependency
+            logger.warning("Failed to sign download URL for {}: {}", storage_key, exc)
+            return None
+        return signed.get("url") if signed else None
+
+    items: list[SourceItem] = []
+    if source_item_ids:
+        item_stmt = select(SourceItem).where(SourceItem.id.in_(source_item_ids))
+        item_rows = await session.execute(item_stmt)
+        items = list(item_rows.scalars().all())
+
+    download_urls: dict[UUID, Optional[str]] = {}
+    poster_urls: dict[UUID, Optional[str]] = {}
+    preview_keys: dict[UUID, str] = {}
+    keyframe_keys: dict[UUID, str] = {}
+
+    if items:
+        item_ids = [item.id for item in items]
+        preview_stmt = select(DerivedArtifact.source_item_id, DerivedArtifact.payload).where(
+            DerivedArtifact.source_item_id.in_(item_ids),
+            DerivedArtifact.artifact_type == "preview_image",
+        )
+        preview_rows = await session.execute(preview_stmt)
+        for row in preview_rows.fetchall():
+            payload = row.payload or {}
+            if payload.get("status") == "ok" and payload.get("storage_key"):
+                preview_keys[row.source_item_id] = payload["storage_key"]
+
+        keyframe_stmt = select(DerivedArtifact.source_item_id, DerivedArtifact.payload).where(
+            DerivedArtifact.source_item_id.in_(item_ids),
+            DerivedArtifact.artifact_type == "keyframes",
+        )
+        keyframe_rows = await session.execute(keyframe_stmt)
+        for row in keyframe_rows.fetchall():
+            payload = row.payload or {}
+            if not isinstance(payload, dict):
+                continue
+            poster = payload.get("poster")
+            if isinstance(poster, dict) and poster.get("storage_key"):
+                keyframe_keys[row.source_item_id] = poster["storage_key"]
+                continue
+            frames = payload.get("frames")
+            if isinstance(frames, list) and frames:
+                first = frames[0]
+                if isinstance(first, dict) and first.get("storage_key"):
+                    keyframe_keys[row.source_item_id] = first["storage_key"]
+
+    connections: dict[UUID, DataConnection] = {}
+    tokens: dict[UUID, str] = {}
+    if items:
+        connection_ids = [getattr(item, "connection_id", None) for item in items if getattr(item, "connection_id", None)]
+        if connection_ids:
+            conn_rows = await session.execute(select(DataConnection).where(DataConnection.id.in_(connection_ids)))
+            connections = {conn.id: conn for conn in conn_rows.scalars().all()}
+            http_connection_ids = {
+                item.connection_id
+                for item in items
+                if item.connection_id
+                and item.storage_key
+                and item.storage_key.startswith(("http://", "https://"))
+            }
+            google_photos_connections = [
+                connections[conn_id]
+                for conn_id in http_connection_ids
+                if conn_id in connections and connections[conn_id].provider == "google_photos"
+            ]
+            for conn in google_photos_connections:
+                token = await get_valid_access_token(session, conn)
+                if token:
+                    tokens[conn.id] = token
+
+    async def download_url_for(item: SourceItem) -> Optional[str]:
+        if item.item_type == "photo" and (item.content_type or "").lower() not in WEB_IMAGE_TYPES:
+            preview_key = preview_keys.get(item.id)
+            if preview_key:
+                preview_url = await sign_url(preview_key)
+                if preview_url:
+                    return preview_url
+        storage_key = item.storage_key
+        if storage_key.startswith("http://") or storage_key.startswith("https://"):
+            conn_id = getattr(item, "connection_id", None)
+            token = tokens.get(conn_id) if conn_id else None
+            if token:
+                sep = "&" if "?" in storage_key else "?"
+                return f"{storage_key}{sep}access_token={token}"
+            return storage_key
+        return await sign_url(storage_key)
+
+    if items:
+        signed_list = await asyncio.gather(*(download_url_for(item) for item in items))
+        download_urls = {item.id: url for item, url in zip(items, signed_list)}
+
+    poster_candidates = [
+        (item.id, keyframe_keys.get(item.id))
+        for item in items
+        if item.item_type == "video" and keyframe_keys.get(item.id)
+    ]
+    if poster_candidates:
+        poster_signed = await asyncio.gather(*(sign_url(key) for _, key in poster_candidates))
+        poster_urls = {item_id: url for (item_id, _), url in zip(poster_candidates, poster_signed)}
+
+    contexts = [
+        TimelineContext(
+            context_type=context.context_type,
+            title=context.title,
+            summary=context.summary,
+            keywords=context.keywords or [],
+            entities=context.entities or [],
+            location=context.location or {},
+            processor_versions=context.processor_versions or {},
+        )
+        for context in episode_contexts
+    ]
+
+    item_payloads = [
+        TimelineItem(
+            id=item.id,
+            item_type=item.item_type,
+            captured_at=(item.event_time_utc or item.captured_at or item.created_at).isoformat(),
+            processed=item.processing_status == "completed",
+            processing_status=item.processing_status,
+            storage_key=item.storage_key,
+            content_type=item.content_type,
+            original_filename=item.original_filename,
+            caption=None,
+            download_url=download_urls.get(item.id),
+            poster_url=poster_urls.get(item.id),
+        )
+        for item in items
+    ]
+
+    return TimelineEpisodeDetail(
+        episode_id=episode_id,
+        title=primary.title,
+        summary=primary.summary,
+        context_type=primary.context_type,
+        start_time_utc=start_time.isoformat(),
+        end_time_utc=end_time.isoformat(),
+        source_item_ids=[str(value) for value in source_item_ids],
+        contexts=contexts,
+        items=item_payloads,
+    )
+
+
+@router.patch("/episodes/{episode_id}", response_model=TimelineEpisodeDetail)
+async def update_episode_detail(
+    episode_id: str,
+    payload: EpisodeUpdateRequest,
+    user_id: UUID = DEFAULT_TEST_USER_ID,
+    session: AsyncSession = Depends(get_session),
+) -> TimelineEpisodeDetail:
+    context_stmt = select(ProcessedContext).where(
+        ProcessedContext.user_id == user_id,
+        ProcessedContext.is_episode.is_(True),
+        ProcessedContext.context_type == payload.context_type,
+        ProcessedContext.processor_versions["episode_id"].astext == episode_id,
+    )
+    context_rows = await session.execute(context_stmt)
+    context = context_rows.scalar_one_or_none()
+    if context is None:
+        raise HTTPException(status_code=404, detail="Episode context not found")
+
+    if payload.title is not None:
+        context.title = payload.title
+    if payload.summary is not None:
+        context.summary = payload.summary
+    if payload.keywords is not None:
+        context.keywords = payload.keywords
+    context.vector_text = build_vector_text(context.title, context.summary, context.keywords or [])
+    processor_versions = context.processor_versions or {}
+    if isinstance(processor_versions, dict):
+        processor_versions["edited_by_user"] = True
+    context.processor_versions = processor_versions
+    await session.flush()
+    try:
+        upsert_context_embeddings([context])
+    except Exception as exc:  # pragma: no cover - external service dependency
+        logger.warning("Episode embedding update failed for {}: {}", episode_id, exc)
+    await session.commit()
+
+    summary_time = context.start_time_utc or context.event_time_utc or context.created_at
+    if summary_time:
+        summary_date = ensure_tz_aware(summary_time).date()
+        celery_app.send_task(
+            "episodes.update_daily_summary",
+            args=[str(user_id), summary_date.isoformat()],
+        )
+
+    return await get_timeline_episode_detail(episode_id, user_id, session)
+
+
 @router.delete("/items/{item_id}", response_model=DeleteResponse)
 async def delete_timeline_item(
     item_id: UUID,
@@ -518,6 +929,12 @@ async def delete_timeline_item(
     storage_keys = []
     if item.storage_key and not item.storage_key.startswith(("http://", "https://")):
         storage_keys.append(item.storage_key)
+
+    affected_episode_items: dict[str, UUID] = {}
+    affected_dates: set[date] = set()
+    event_time = item.event_time_utc or item.captured_at or item.created_at
+    if event_time:
+        affected_dates.add(ensure_tz_aware(event_time).date())
 
     preview_stmt = select(DerivedArtifact).where(
         DerivedArtifact.source_item_id == item.id,
@@ -547,12 +964,19 @@ async def delete_timeline_item(
     context_rows = await session.execute(context_stmt)
     for context in context_rows.scalars().all():
         remaining = [value for value in context.source_item_ids if value != item.id]
+        if context.is_episode and context.start_time_utc:
+            affected_dates.add(ensure_tz_aware(context.start_time_utc).date())
         if not remaining:
             deleted_context_ids.append(str(context.id))
             await session.delete(context)
         else:
             context.source_item_ids = remaining
             updated_contexts.append(context)
+            if context.is_episode and context.context_type != "daily_summary":
+                versions = context.processor_versions or {}
+                episode_id = versions.get("episode_id") if isinstance(versions, dict) else None
+                episode_key = str(episode_id) if episode_id else str(context.id)
+                affected_episode_items.setdefault(episode_key, remaining[0])
 
     canonical_stmt = select(SourceItem).where(
         SourceItem.user_id == user_id,
@@ -588,6 +1012,14 @@ async def delete_timeline_item(
 
     await session.delete(item)
     await session.commit()
+
+    for remaining_item_id in affected_episode_items.values():
+        celery_app.send_task("episodes.update_for_item", args=[str(remaining_item_id)])
+    for summary_date in affected_dates:
+        celery_app.send_task(
+            "episodes.update_daily_summary",
+            args=[str(user_id), summary_date.isoformat()],
+        )
 
     for key in storage_keys:
         try:

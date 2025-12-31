@@ -162,6 +162,7 @@ def upsert_context_embeddings(contexts: Iterable[Any]) -> None:
             "context_id": str(context.id),
             "user_id": str(context.user_id),
             "context_type": getattr(context, "context_type", None),
+            "is_episode": bool(getattr(context, "is_episode", False)),
             "event_time_utc": getattr(context, "event_time_utc", None).isoformat()
             if getattr(context, "event_time_utc", None)
             else None,
@@ -181,15 +182,32 @@ def upsert_context_embeddings(contexts: Iterable[Any]) -> None:
     )
 
 
-def _user_filter(user_id: Optional[str]) -> Optional[qmodels.Filter]:
-    if not user_id:
+def _build_filter(
+    user_id: Optional[str],
+    *,
+    is_episode: Optional[bool] = None,
+    context_type: Optional[str] = None,
+) -> Optional[qmodels.Filter]:
+    must: list[qmodels.FieldCondition] = []
+    if user_id:
+        must.append(qmodels.FieldCondition(key="user_id", match=qmodels.MatchValue(value=user_id)))
+    if is_episode is not None:
+        must.append(qmodels.FieldCondition(key="is_episode", match=qmodels.MatchValue(value=is_episode)))
+    if context_type:
+        must.append(qmodels.FieldCondition(key="context_type", match=qmodels.MatchValue(value=context_type)))
+    if not must:
         return None
-    return qmodels.Filter(
-        must=[qmodels.FieldCondition(key="user_id", match=qmodels.MatchValue(value=user_id))]
-    )
+    return qmodels.Filter(must=must)
 
 
-def search_contexts(query: str, limit: int = 5, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+def search_contexts(
+    query: str,
+    limit: int = 5,
+    user_id: Optional[str] = None,
+    *,
+    is_episode: Optional[bool] = None,
+    context_type: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Query Qdrant using the configured embedding model."""
 
     settings = get_settings()
@@ -201,7 +219,7 @@ def search_contexts(query: str, limit: int = 5, user_id: Optional[str] = None) -
         query_vector=vector,
         limit=limit,
         with_payload=True,
-        query_filter=_user_filter(user_id),
+        query_filter=_build_filter(user_id, is_episode=is_episode, context_type=context_type),
     )
     return [
         {

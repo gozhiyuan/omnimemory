@@ -227,3 +227,46 @@ Context rules:
 
 def build_lifelog_audio_chunk_prompt() -> str:
     return LIFELOG_AUDIO_CHUNK_PROMPT
+
+
+LIFELOG_EPISODE_SUMMARY_PROMPT = """\
+You are summarizing a personal lifelog episode for the user (the camera-holder).
+Use the provided per-item summaries and context fields to produce ONE episode-level title and summary.
+
+Episode info:
+- item_count: {ITEM_COUNT}
+- time_range: {TIME_RANGE}
+- omitted_items: {OMITTED_COUNT}
+
+Items (JSON):
+{EPISODE_ITEMS}
+
+Output JSON ONLY:
+{{
+  "title": "...",
+  "summary": "...",
+  "keywords": ["..."]
+}}
+
+Guidelines:
+- title: 5-12 words, user-centric (what the user was doing/experiencing).
+- summary: 2-4 sentences, factual, cover the full episode; mention shifts if multiple activities.
+- keywords: 5-12 lowercase phrases that capture the episode.
+- Do not invent names, relationships, locations, or emotions not present in the items.
+- If inputs are sparse, be generic but accurate.
+"""
+
+
+def build_lifelog_episode_summary_prompt(
+    items_json: str,
+    *,
+    item_count: int,
+    time_range: str,
+    omitted_count: int = 0,
+) -> str:
+    return LIFELOG_EPISODE_SUMMARY_PROMPT.format(
+        ITEM_COUNT=item_count,
+        TIME_RANGE=time_range,
+        OMITTED_COUNT=omitted_count,
+        EPISODE_ITEMS=items_json.strip() or "[]",
+    )

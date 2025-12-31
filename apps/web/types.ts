@@ -44,6 +44,29 @@ export interface TimelineDay {
   date: string;
   item_count: number;
   items: TimelineItem[];
+  episodes?: TimelineEpisode[];
+  daily_summary?: TimelineDailySummary | null;
+}
+
+export interface TimelineEpisode {
+  episode_id: string;
+  title: string;
+  summary: string;
+  context_type: string;
+  start_time_utc?: string | null;
+  end_time_utc?: string | null;
+  item_count: number;
+  source_item_ids: string[];
+  context_ids: string[];
+  preview_url?: string | null;
+}
+
+export interface TimelineDailySummary {
+  context_id: string;
+  summary_date: string;
+  title: string;
+  summary: string;
+  keywords: string[];
 }
 
 export interface TimelineContext {
@@ -68,6 +91,18 @@ export interface TimelineItemDetail extends TimelineItem {
   contexts: TimelineContext[];
   transcript_text?: string | null;
   transcript_segments?: TranscriptSegment[];
+}
+
+export interface TimelineEpisodeDetail {
+  episode_id: string;
+  title: string;
+  summary: string;
+  context_type: string;
+  start_time_utc?: string | null;
+  end_time_utc?: string | null;
+  source_item_ids: string[];
+  contexts: TimelineContext[];
+  items: TimelineItem[];
 }
 
 export interface DashboardActivityPoint {
@@ -97,6 +132,22 @@ export interface DashboardStatsResponse {
   storage_used_bytes: number;
   recent_items: DashboardRecentItem[];
   activity: DashboardActivityPoint[];
+}
+
+export interface SearchResult {
+  context_id: string;
+  score?: number | null;
+  context_type?: string | null;
+  title?: string | null;
+  summary?: string | null;
+  event_time_utc?: string | null;
+  source_item_ids: string[];
+  payload?: Record<string, unknown> | null;
+}
+
+export interface SearchResponse {
+  query: string;
+  results: SearchResult[];
 }
 
 export interface UploadUrlResponse {

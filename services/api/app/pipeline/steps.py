@@ -88,6 +88,111 @@ def _normalize_context_entry(
     }
 
 
+def _tokenize_text(value: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", value.lower()))
+
+
+def _context_signature(context: dict[str, Any]) -> set[str]:
+    title = str(context.get("title") or "")
+    summary = str(context.get("summary") or "")
+    keywords = context.get("keywords") or []
+    keyword_text = " ".join(str(word) for word in keywords if word)
+    return _tokenize_text(f"{title} {summary} {keyword_text}")
+
+
+def _jaccard_similarity(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    intersection = left.intersection(right)
+    union = left.union(right)
+    if not union:
+        return 0.0
+    return len(intersection) / len(union)
+
+
+def _merge_unique_list(values: list[Any]) -> list[Any]:
+    seen = set()
+    merged: list[Any] = []
+    for value in values:
+        key = json.dumps(value, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(value)
+    return merged
+
+
+def _should_merge_contexts(
+    primary: dict[str, Any],
+    candidate: dict[str, Any],
+    min_similarity: float,
+) -> bool:
+    if primary.get("context_type") != candidate.get("context_type"):
+        return False
+    primary_versions = primary.get("processor_versions") or {}
+    candidate_versions = candidate.get("processor_versions") or {}
+    primary_chunk = primary_versions.get("chunk_index")
+    candidate_chunk = candidate_versions.get("chunk_index")
+    if isinstance(primary_chunk, int) and isinstance(candidate_chunk, int) and primary_chunk != candidate_chunk:
+        return False
+    primary_title = str(primary.get("title") or "").strip().lower()
+    candidate_title = str(candidate.get("title") or "").strip().lower()
+    if primary_title and primary_title == candidate_title:
+        return True
+    primary_summary = str(primary.get("summary") or "").strip().lower()
+    candidate_summary = str(candidate.get("summary") or "").strip().lower()
+    if primary_summary and candidate_summary:
+        if primary_summary in candidate_summary or candidate_summary in primary_summary:
+            return True
+    similarity = _jaccard_similarity(_context_signature(primary), _context_signature(candidate))
+    return similarity >= min_similarity
+
+
+def _merge_contexts(
+    contexts: list[dict[str, Any]],
+    min_similarity: float,
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    for context in contexts:
+        if not isinstance(context, dict):
+            continue
+        inserted = False
+        for target in merged:
+            if _should_merge_contexts(target, context, min_similarity):
+                target_title = str(target.get("title") or "")
+                incoming_title = str(context.get("title") or "")
+                if len(incoming_title) > len(target_title):
+                    target["title"] = incoming_title
+                target_summary = str(target.get("summary") or "")
+                incoming_summary = str(context.get("summary") or "")
+                if incoming_summary and incoming_summary not in target_summary:
+                    if target_summary and target_summary not in incoming_summary:
+                        target_summary = f"{target_summary} / {incoming_summary}"
+                    else:
+                        target_summary = incoming_summary
+                    target["summary"] = target_summary
+                target_keywords = (target.get("keywords") or []) + (context.get("keywords") or [])
+                target["keywords"] = _merge_unique_list(target_keywords)
+                target_entities = (target.get("entities") or []) + (context.get("entities") or [])
+                target["entities"] = _merge_unique_list(target_entities)
+                if not target.get("location") and context.get("location"):
+                    target["location"] = context.get("location")
+                processor_versions = target.get("processor_versions") or {}
+                processor_versions["semantic_merge"] = "v1"
+                processor_versions["merged_count"] = int(processor_versions.get("merged_count") or 1) + 1
+                target["processor_versions"] = processor_versions
+                target["vector_text"] = build_vector_text(
+                    target.get("title") or "Memory context",
+                    target.get("summary") or "",
+                    target.get("keywords") or [],
+                )
+                inserted = True
+                break
+        if not inserted:
+            merged.append(context)
+    return merged
+
+
 async def _upsert_content(
     session, item_id: UUID, role: str, data: dict[str, Any]
 ) -> None:
@@ -179,6 +284,14 @@ class MetadataStep:
             "original_filename": item.original_filename,
             "processed_at": datetime.now(timezone.utc).isoformat(),
         }
+        if payload.get("duration_sec") is not None:
+            metadata["duration_sec"] = payload.get("duration_sec")
+        window_start = payload.get("event_time_window_start")
+        window_end = payload.get("event_time_window_end")
+        if window_start:
+            metadata["event_time_window_start"] = window_start
+        if window_end:
+            metadata["event_time_window_end"] = window_end
         if isinstance(provider_location, dict):
             metadata["provider_location"] = provider_location
         fingerprint = hash_parts([artifacts.get("content_hash"), metadata.get("size_bytes"), item.content_type])
@@ -1821,6 +1934,9 @@ class ContextPersistStep:
                             },
                         )
             return
+        if config.settings.semantic_merge_enabled and isinstance(contexts, list):
+            contexts = _merge_contexts(contexts, config.settings.semantic_merge_min_jaccard)
+            artifacts.set("contexts", contexts)
         context_signature = hash_parts(
             [json.dumps(contexts, sort_keys=True), artifacts.get("content_hash")]
         )
@@ -1919,6 +2035,21 @@ class EmbeddingStep:
         )
 
 
+class EpisodeEnqueueStep:
+    name = "episode_merge"
+    version = "v1"
+    is_expensive = False
+
+    async def run(self, item: SourceItem, artifacts: PipelineArtifacts, config: PipelineConfig) -> None:
+        if not config.settings.episode_merge_enabled:
+            return
+        try:
+            from ..celery_app import celery_app
+        except Exception:  # pragma: no cover - import guard
+            return
+        celery_app.send_task("episodes.update_for_item", args=[str(item.id)])
+
+
 COMMON_STEPS: list[PipelineStep] = [
     FetchBlobStep(),
     ContentHashStep(),
@@ -1938,6 +2069,7 @@ IMAGE_STEPS: list[PipelineStep] = [
     VlmStep(),
     ContextPersistStep(),
     EmbeddingStep(),
+    EpisodeEnqueueStep(),
 ]
 
 VIDEO_STEPS: list[PipelineStep] = [
@@ -1949,6 +2081,7 @@ VIDEO_STEPS: list[PipelineStep] = [
     GenericContextStep(),
     ContextPersistStep(),
     EmbeddingStep(),
+    EpisodeEnqueueStep(),
 ]
 
 AUDIO_STEPS: list[PipelineStep] = [
@@ -1958,12 +2091,14 @@ AUDIO_STEPS: list[PipelineStep] = [
     GenericContextStep(),
     ContextPersistStep(),
     EmbeddingStep(),
+    EpisodeEnqueueStep(),
 ]
 
 GENERIC_STEPS: list[PipelineStep] = [
     GenericContextStep(),
     ContextPersistStep(),
     EmbeddingStep(),
+    EpisodeEnqueueStep(),
 ]
 
 

@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime, time, timedelta, timezone
 import asyncio
+import json
 from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
@@ -37,6 +38,7 @@ class TimelineItem(BaseModel):
     item_type: str
     captured_at: Optional[str]
     processed: bool
+    processing_status: str
     storage_key: str
     content_type: Optional[str]
     original_filename: Optional[str]
@@ -49,6 +51,41 @@ class TimelineDay(BaseModel):
     date: date
     item_count: int
     items: List[TimelineItem]
+
+
+class TimelineContext(BaseModel):
+    context_type: str
+    title: str
+    summary: str
+    keywords: list[str]
+    entities: list
+    location: dict
+    processor_versions: dict
+
+
+class TranscriptSegment(BaseModel):
+    start_ms: int
+    end_ms: int
+    text: str
+    status: Optional[str] = None
+    error: Optional[str] = None
+
+
+class TimelineItemDetail(BaseModel):
+    id: UUID
+    item_type: str
+    captured_at: Optional[str]
+    processed: bool
+    processing_status: str
+    storage_key: str
+    content_type: Optional[str]
+    original_filename: Optional[str]
+    caption: Optional[str]
+    download_url: Optional[str]
+    poster_url: Optional[str] = None
+    contexts: list[TimelineContext]
+    transcript_text: Optional[str] = None
+    transcript_segments: list[TranscriptSegment] = []
 
 
 class DeleteResponse(BaseModel):
@@ -65,6 +102,9 @@ async def get_timeline(
     session: AsyncSession = Depends(get_session),
     limit: int = 200,
     provider: Optional[str] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    tz_offset_minutes: Optional[int] = None,
 ) -> list[TimelineDay]:
     """Return a grouped timeline of items for the user.
 
@@ -73,10 +113,20 @@ async def get_timeline(
     for UI rendering while still surfacing recent activity.
     """
 
+    offset_minutes = tz_offset_minutes or 0
+    offset = timedelta(minutes=offset_minutes)
+
     stmt = select(SourceItem).where(
         SourceItem.user_id == user_id,
         SourceItem.processing_status == "completed",
     )
+    event_time_expr = func.coalesce(SourceItem.event_time_utc, SourceItem.created_at)
+    if start_date:
+        start_dt = datetime.combine(start_date, time.min, tzinfo=timezone.utc) + offset
+        stmt = stmt.where(event_time_expr >= start_dt)
+    if end_date:
+        end_dt = datetime.combine(end_date, time.min, tzinfo=timezone.utc) + offset + timedelta(days=1)
+        stmt = stmt.where(event_time_expr < end_dt)
     if provider:
         stmt = (
             stmt.join(DataConnection, SourceItem.connection_id == DataConnection.id)
@@ -238,7 +288,10 @@ async def get_timeline(
     grouped: dict[date, list[SourceItem]] = defaultdict(list)
     for item in items:
         event_time = item.event_time_utc or item.captured_at or item.created_at
-        item_date = event_time.date()
+        if event_time.tzinfo is None:
+            event_time = event_time.replace(tzinfo=timezone.utc)
+        local_time = event_time - offset
+        item_date = local_time.date()
         grouped[item_date].append(item)
 
     timeline: list[TimelineDay] = []
@@ -254,6 +307,7 @@ async def get_timeline(
                         item_type=item.item_type,
                         captured_at=(item.event_time_utc or item.captured_at or item.created_at).isoformat(),
                         processed=item.processing_status == "completed",
+                        processing_status=item.processing_status,
                         storage_key=item.storage_key,
                         content_type=item.content_type,
                         original_filename=item.original_filename,
@@ -267,6 +321,187 @@ async def get_timeline(
         )
 
     return timeline
+
+
+@router.get("/items/{item_id}", response_model=TimelineItemDetail)
+async def get_timeline_item_detail(
+    item_id: UUID,
+    user_id: UUID = DEFAULT_TEST_USER_ID,
+    session: AsyncSession = Depends(get_session),
+) -> TimelineItemDetail:
+    item = await session.get(SourceItem, item_id)
+    if not item or item.user_id != user_id:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    settings = get_settings()
+    storage = get_storage_provider()
+
+    async def sign_url(storage_key: str) -> Optional[str]:
+        if storage_key.startswith("http://") or storage_key.startswith("https://"):
+            return storage_key
+        try:
+            signed = await asyncio.to_thread(
+                storage.get_presigned_download, storage_key, settings.presigned_url_ttl_seconds
+            )
+        except Exception as exc:  # pragma: no cover - external service dependency
+            logger.warning("Failed to sign download URL for {}: {}", storage_key, exc)
+            return None
+        return signed.get("url") if signed else None
+
+    download_url: Optional[str] = None
+    storage_key = item.storage_key
+    if storage_key.startswith(("http://", "https://")):
+        token = None
+        if item.connection_id:
+            connection = await session.get(DataConnection, item.connection_id)
+            if connection and connection.provider == "google_photos":
+                token = await get_valid_access_token(session, connection)
+        if token:
+            sep = "&" if "?" in storage_key else "?"
+            download_url = f"{storage_key}{sep}access_token={token}"
+        else:
+            download_url = storage_key
+    else:
+        download_url = await sign_url(storage_key)
+
+    if item.item_type == "photo" and (item.content_type or "").lower() not in WEB_IMAGE_TYPES:
+        preview_stmt = (
+            select(DerivedArtifact.payload)
+            .where(
+                DerivedArtifact.source_item_id == item.id,
+                DerivedArtifact.artifact_type == "preview_image",
+            )
+            .order_by(DerivedArtifact.created_at.desc())
+            .limit(1)
+        )
+        preview_row = await session.execute(preview_stmt)
+        preview_payload = preview_row.scalar_one_or_none()
+        if isinstance(preview_payload, dict):
+            preview_key = preview_payload.get("storage_key")
+            if preview_payload.get("status") == "ok" and preview_key:
+                preview_url = await sign_url(preview_key)
+                if preview_url:
+                    download_url = preview_url
+
+    poster_url: Optional[str] = None
+    keyframe_stmt = (
+        select(DerivedArtifact.payload)
+        .where(
+            DerivedArtifact.source_item_id == item.id,
+            DerivedArtifact.artifact_type == "keyframes",
+        )
+        .order_by(DerivedArtifact.created_at.desc())
+        .limit(1)
+    )
+    keyframe_row = await session.execute(keyframe_stmt)
+    keyframe_payload = keyframe_row.scalar_one_or_none()
+    if isinstance(keyframe_payload, dict):
+        poster = keyframe_payload.get("poster")
+        if isinstance(poster, dict) and poster.get("storage_key"):
+            poster_url = await sign_url(poster["storage_key"])
+        elif keyframe_payload.get("frames"):
+            frames = keyframe_payload.get("frames") or []
+            first = frames[0] if frames else None
+            if isinstance(first, dict) and first.get("storage_key"):
+                poster_url = await sign_url(first["storage_key"])
+
+    caption = None
+    caption_stmt = select(ProcessedContent.data).where(
+        ProcessedContent.item_id == item.id,
+        ProcessedContent.content_role == "caption",
+    )
+    caption_row = await session.execute(caption_stmt)
+    caption_payload = caption_row.scalar_one_or_none()
+    if isinstance(caption_payload, dict):
+        caption = caption_payload.get("text")
+
+    context_stmt = select(ProcessedContext).where(
+        ProcessedContext.user_id == user_id,
+        ProcessedContext.is_episode.is_(False),
+        ProcessedContext.source_item_ids.contains([item.id]),
+    )
+    context_rows = await session.execute(context_stmt)
+    context_records = list(context_rows.scalars().all())
+
+    def context_sort_key(context: ProcessedContext) -> tuple[int, int]:
+        versions = context.processor_versions or {}
+        if isinstance(versions, dict) and versions.get("media_summary"):
+            return (0, -1)
+        chunk_index = None
+        if isinstance(versions, dict):
+            chunk_index = versions.get("chunk_index")
+        if isinstance(chunk_index, int):
+            return (1, chunk_index)
+        return (2, 0)
+
+    context_records.sort(key=context_sort_key)
+    contexts = [
+        TimelineContext(
+            context_type=context.context_type,
+            title=context.title,
+            summary=context.summary,
+            keywords=context.keywords or [],
+            entities=context.entities or [],
+            location=context.location or {},
+            processor_versions=context.processor_versions or {},
+        )
+        for context in context_records
+    ]
+
+    transcript_text: Optional[str] = None
+    transcript_segments: list[TranscriptSegment] = []
+    transcript_stmt = (
+        select(DerivedArtifact)
+        .where(
+            DerivedArtifact.source_item_id == item.id,
+            DerivedArtifact.artifact_type == "transcription",
+        )
+        .order_by(DerivedArtifact.created_at.desc())
+        .limit(1)
+    )
+    transcript_row = await session.execute(transcript_stmt)
+    transcript_artifact = transcript_row.scalar_one_or_none()
+    transcript_payload = transcript_artifact.payload if transcript_artifact else None
+    if isinstance(transcript_payload, dict):
+        storage_key = transcript_payload.get("storage_key")
+        if storage_key:
+            try:
+                raw = await asyncio.to_thread(storage.fetch, storage_key)
+                transcript_payload = json.loads(raw.decode("utf-8"))
+            except Exception as exc:  # pragma: no cover - external storage dependency
+                logger.warning("Transcript fetch failed for item {}: {}", item.id, exc)
+        transcript_text = transcript_payload.get("text") if isinstance(transcript_payload, dict) else None
+        segments = transcript_payload.get("segments") if isinstance(transcript_payload, dict) else None
+        if isinstance(segments, list):
+            for segment in segments:
+                if not isinstance(segment, dict):
+                    continue
+                transcript_segments.append(
+                    TranscriptSegment(
+                        start_ms=int(segment.get("start_ms") or 0),
+                        end_ms=int(segment.get("end_ms") or 0),
+                        text=str(segment.get("text") or ""),
+                        status=segment.get("status"),
+                        error=segment.get("error"),
+                    )
+                )
+
+    return TimelineItemDetail(
+        id=item.id,
+        item_type=item.item_type,
+        captured_at=(item.event_time_utc or item.captured_at or item.created_at).isoformat(),
+        processed=item.processing_status == "completed",
+        processing_status=item.processing_status,
+        storage_key=item.storage_key,
+        content_type=item.content_type,
+        original_filename=item.original_filename,
+        caption=caption,
+        download_url=download_url,
+        poster_url=poster_url,
+        contexts=contexts,
+        transcript_text=transcript_text,
+        transcript_segments=transcript_segments,
+    )
 
 
 @router.delete("/items/{item_id}", response_model=DeleteResponse)

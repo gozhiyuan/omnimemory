@@ -1,7 +1,17 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Calendar, ChevronLeft, ChevronRight, FileText, Image as ImageIcon, Mic, Play, UploadCloud, Video, X } from 'lucide-react';
-import { apiDelete, apiGet, apiPost } from '../services/api';
-import { IngestResponse, TimelineDay, TimelineItem, TimelineItemDetail, UploadUrlResponse } from '../types';
+import { Calendar, ChevronLeft, ChevronRight, FileText, Image as ImageIcon, Mic, Play, Search, UploadCloud, Video, X } from 'lucide-react';
+import { apiDelete, apiGet, apiPatch, apiPost } from '../services/api';
+import {
+  IngestResponse,
+  SearchResponse,
+  SearchResult,
+  TimelineDay,
+  TimelineEpisode,
+  TimelineEpisodeDetail,
+  TimelineItem,
+  TimelineItemDetail,
+  UploadUrlResponse,
+} from '../types';
 
 type ViewMode = 'day' | 'week' | 'month' | 'year';
 
@@ -29,6 +39,11 @@ const formatTime = (value?: string) => {
     hour: 'numeric',
     minute: '2-digit',
   });
+};
+
+const formatTimeRange = (start?: string | null, end?: string | null) => {
+  if (!start || !end) return 'Time window unknown';
+  return `${formatTime(start)} - ${formatTime(end)}`;
 };
 
 const formatDuration = (ms: number) => {
@@ -154,6 +169,8 @@ const VIEW_LABELS: Record<ViewMode, string> = {
   year: 'Year',
 };
 
+const EPISODES_PAGE_SIZE = 6;
+
 export const Timeline: React.FC = () => {
   const [days, setDays] = useState<TimelineDay[]>([]);
   const [loading, setLoading] = useState(true);
@@ -162,9 +179,19 @@ export const Timeline: React.FC = () => {
   const [viewMode, setViewMode] = useState<ViewMode>('day');
   const [anchorDate, setAnchorDate] = useState<Date>(() => new Date());
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
+  const [selectedEpisodeId, setSelectedEpisodeId] = useState<string | null>(null);
   const [detail, setDetail] = useState<TimelineItemDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
+  const [episodeDetail, setEpisodeDetail] = useState<TimelineEpisodeDetail | null>(null);
+  const [episodeLoading, setEpisodeLoading] = useState(false);
+  const [episodeError, setEpisodeError] = useState<string | null>(null);
+  const [episodeEditOpen, setEpisodeEditOpen] = useState(false);
+  const [episodeEditTitle, setEpisodeEditTitle] = useState('');
+  const [episodeEditSummary, setEpisodeEditSummary] = useState('');
+  const [episodeEditSaving, setEpisodeEditSaving] = useState(false);
+  const [episodeEditError, setEpisodeEditError] = useState<string | null>(null);
+  const [episodeVisibleCount, setEpisodeVisibleCount] = useState(EPISODES_PAGE_SIZE);
   const [uploadOpen, setUploadOpen] = useState(false);
   const [uploadFiles, setUploadFiles] = useState<File[]>([]);
   const [timeMode, setTimeMode] = useState<'file' | 'window'>('file');
@@ -176,6 +203,11 @@ export const Timeline: React.FC = () => {
   const [uploadedCount, setUploadedCount] = useState(0);
   const [pendingUploadIds, setPendingUploadIds] = useState<string[]>([]);
   const [reloadKey, setReloadKey] = useState(0);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const [pendingSelection, setPendingSelection] = useState<{ itemId?: string; episodeContextId?: string } | null>(null);
 
   const range = useMemo(() => {
     if (viewMode === 'day') {
@@ -239,6 +271,20 @@ export const Timeline: React.FC = () => {
     return dayLookup.get(dayKey)?.items ?? [];
   }, [dayLookup, dayKey, viewMode]);
 
+  const dayEpisodes = useMemo(() => {
+    if (viewMode !== 'day') {
+      return [];
+    }
+    return dayLookup.get(dayKey)?.episodes ?? [];
+  }, [dayLookup, dayKey, viewMode]);
+
+  const daySummary = useMemo(() => {
+    if (viewMode !== 'day') {
+      return null;
+    }
+    return dayLookup.get(dayKey)?.daily_summary ?? null;
+  }, [dayLookup, dayKey, viewMode]);
+
   useEffect(() => {
     setUploadOpen(false);
     setUploadFiles([]);
@@ -247,6 +293,10 @@ export const Timeline: React.FC = () => {
     setUploadedCount(0);
     setTimeMode('file');
   }, [dayKey]);
+
+  useEffect(() => {
+    setEpisodeVisibleCount(EPISODES_PAGE_SIZE);
+  }, [dayKey, viewMode]);
 
   const uploadStart = useMemo(
     () => buildDateWithTime(anchorDate, uploadStartTime),
@@ -258,15 +308,43 @@ export const Timeline: React.FC = () => {
     [uploadStart, durationHours]
   );
 
+  const episodeItemIds = useMemo(() => {
+    const ids = new Set<string>();
+    dayEpisodes.forEach((episode) => {
+      episode.source_item_ids.forEach((itemId) => ids.add(itemId));
+    });
+    return ids;
+  }, [dayEpisodes]);
+
   const sortedDayItems = useMemo(() => {
-    const items = [...dayItems];
+    const items = dayItems.filter((item) => !episodeItemIds.has(item.id));
     items.sort((a, b) => {
       const aTime = a.captured_at ? new Date(a.captured_at).getTime() : 0;
       const bTime = b.captured_at ? new Date(b.captured_at).getTime() : 0;
       return aTime - bTime;
     });
     return items;
-  }, [dayItems]);
+  }, [dayItems, episodeItemIds]);
+
+  const sortedDayEpisodes = useMemo(() => {
+    const episodes = [...dayEpisodes];
+    episodes.sort((a, b) => {
+      const aTime = a.start_time_utc ? new Date(a.start_time_utc).getTime() : 0;
+      const bTime = b.start_time_utc ? new Date(b.start_time_utc).getTime() : 0;
+      return aTime - bTime;
+    });
+    return episodes;
+  }, [dayEpisodes]);
+
+  const visibleDayEpisodes = useMemo(
+    () => sortedDayEpisodes.slice(0, episodeVisibleCount),
+    [sortedDayEpisodes, episodeVisibleCount]
+  );
+
+  const hasMoreEpisodes = useMemo(
+    () => sortedDayEpisodes.length > episodeVisibleCount,
+    [sortedDayEpisodes.length, episodeVisibleCount]
+  );
 
   const dayStats = useMemo(() => {
     const totals: Record<string, number> = {
@@ -275,11 +353,16 @@ export const Timeline: React.FC = () => {
       audio: 0,
       document: 0,
     };
-    sortedDayItems.forEach((item) => {
+    dayItems.forEach((item) => {
       totals[item.item_type] = (totals[item.item_type] ?? 0) + 1;
     });
     return totals;
-  }, [sortedDayItems]);
+  }, [dayItems]);
+
+  const memoryCount = useMemo(
+    () => sortedDayEpisodes.length + sortedDayItems.length,
+    [sortedDayEpisodes.length, sortedDayItems.length]
+  );
 
   const hasItems = useMemo(() => days.some(day => day.items.length > 0), [days]);
   const rangeDates = useMemo(() => buildDateRange(range.start, range.end), [range]);
@@ -330,6 +413,61 @@ export const Timeline: React.FC = () => {
     }
   };
 
+  useEffect(() => {
+    const trimmed = searchQuery.trim();
+    if (!trimmed) {
+      setSearchResults([]);
+      setSearchError(null);
+      setSearchLoading(false);
+      return;
+    }
+    let mounted = true;
+    const handle = window.setTimeout(async () => {
+      setSearchLoading(true);
+      setSearchError(null);
+      try {
+        const data = await apiGet<SearchResponse>(`/search?q=${encodeURIComponent(trimmed)}&limit=8`);
+        if (mounted) {
+          setSearchResults(data.results || []);
+        }
+      } catch (err) {
+        if (mounted) {
+          setSearchError(err instanceof Error ? err.message : 'Search failed.');
+        }
+      } finally {
+        if (mounted) {
+          setSearchLoading(false);
+        }
+      }
+    }, 350);
+    return () => {
+      mounted = false;
+      window.clearTimeout(handle);
+    };
+  }, [searchQuery]);
+
+  useEffect(() => {
+    if (!pendingSelection) {
+      return;
+    }
+    if (pendingSelection.episodeContextId) {
+      const match = days
+        .flatMap((day) => day.episodes ?? [])
+        .find((episode) => episode.context_ids?.includes(pendingSelection.episodeContextId ?? ''));
+      if (match) {
+        setSelectedEpisodeId(match.episode_id);
+        setSelectedItemId(null);
+        setPendingSelection(null);
+        return;
+      }
+    }
+    if (pendingSelection.itemId) {
+      setSelectedItemId(pendingSelection.itemId);
+      setSelectedEpisodeId(null);
+      setPendingSelection(null);
+    }
+  }, [days, pendingSelection]);
+
   const handleDelete = async (itemId: string) => {
     if (!confirm('Delete this memory? This will remove it from storage and search.')) {
       return;
@@ -338,10 +476,70 @@ export const Timeline: React.FC = () => {
     try {
       await apiDelete(`/timeline/items/${itemId}`);
       removeItem(itemId);
+      setReloadKey((value) => value + 1);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to delete item.');
     } finally {
       setDeletingId(null);
+    }
+  };
+
+  const handleEpisodeSave = async () => {
+    if (!selectedEpisodeId || !episodeDetail || episodeEditSaving) {
+      return;
+    }
+    setEpisodeEditSaving(true);
+    setEpisodeEditError(null);
+    try {
+      const payload = {
+        title: episodeEditTitle.trim(),
+        summary: episodeEditSummary.trim(),
+        context_type: 'activity_context',
+      };
+      const updated = await apiPatch<TimelineEpisodeDetail>(
+        `/timeline/episodes/${selectedEpisodeId}`,
+        payload
+      );
+      setEpisodeDetail(updated);
+      setEpisodeEditOpen(false);
+      setReloadKey((value) => value + 1);
+    } catch (err) {
+      setEpisodeEditError(err instanceof Error ? err.message : 'Failed to update episode.');
+    } finally {
+      setEpisodeEditSaving(false);
+    }
+  };
+
+  const handleEpisodeCancel = () => {
+    if (episodeDetail) {
+      setEpisodeEditTitle(episodeDetail.title || '');
+      setEpisodeEditSummary(episodeDetail.summary || '');
+    }
+    setEpisodeEditError(null);
+    setEpisodeEditOpen(false);
+  };
+
+  const handleSearchSelect = (result: SearchResult) => {
+    const eventTime = result.event_time_utc ? new Date(result.event_time_utc) : null;
+    if (eventTime && !Number.isNaN(eventTime.getTime())) {
+      setAnchorDate(eventTime);
+      setViewMode('day');
+    }
+    const isDaily = result.context_type === 'daily_summary';
+    if (isDaily) {
+      setPendingSelection(null);
+      setSelectedEpisodeId(null);
+      setSelectedItemId(null);
+      return;
+    }
+    const isEpisode = result.payload && result.payload['is_episode'] === true;
+    if (isEpisode) {
+      setPendingSelection({ episodeContextId: result.context_id });
+      return;
+    }
+    const itemId = result.source_item_ids?.[0];
+    if (itemId) {
+      setPendingSelection({ itemId });
     }
   };
 
@@ -425,6 +623,8 @@ export const Timeline: React.FC = () => {
         if (overrideEnabled && captureTimes[index]) {
           ingestPayload.captured_at = captureTimes[index]?.toISOString();
           ingestPayload.event_time_override = true;
+          ingestPayload.event_time_window_start = uploadStart.toISOString();
+          ingestPayload.event_time_window_end = uploadEnd.toISOString();
         }
         const ingestResponse = await apiPost<IngestResponse>('/upload/ingest', ingestPayload);
         if (ingestResponse?.item_id) {
@@ -527,18 +727,33 @@ export const Timeline: React.FC = () => {
     if (viewMode !== 'day') {
       setSelectedItemId(null);
       setDetail(null);
+      setSelectedEpisodeId(null);
+      setEpisodeDetail(null);
       return;
     }
-    if (!sortedDayItems.length) {
+    if (!sortedDayItems.length && !sortedDayEpisodes.length) {
       setSelectedItemId(null);
       setDetail(null);
+      setSelectedEpisodeId(null);
+      setEpisodeDetail(null);
       return;
     }
-    if (selectedItemId && sortedDayItems.some((item) => item.id === selectedItemId)) {
+    if (selectedEpisodeId && sortedDayEpisodes.some((episode) => episode.episode_id === selectedEpisodeId)) {
       return;
     }
-    setSelectedItemId(sortedDayItems[0].id);
-  }, [sortedDayItems, viewMode, selectedItemId]);
+    if (selectedItemId && dayItems.some((item) => item.id === selectedItemId)) {
+      return;
+    }
+    if (sortedDayEpisodes.length > 0) {
+      setSelectedEpisodeId(sortedDayEpisodes[0].episode_id);
+      setSelectedItemId(null);
+      return;
+    }
+    if (sortedDayItems.length > 0) {
+      setSelectedItemId(sortedDayItems[0].id);
+      setSelectedEpisodeId(null);
+    }
+  }, [sortedDayItems, sortedDayEpisodes, viewMode, selectedItemId, selectedEpisodeId]);
 
   useEffect(() => {
     if (!selectedItemId) {
@@ -569,6 +784,49 @@ export const Timeline: React.FC = () => {
       mounted = false;
     };
   }, [selectedItemId]);
+
+  useEffect(() => {
+    if (!selectedEpisodeId) {
+      setEpisodeDetail(null);
+      return;
+    }
+    let mounted = true;
+    setEpisodeLoading(true);
+    setEpisodeError(null);
+    const load = async () => {
+      try {
+        const data = await apiGet<TimelineEpisodeDetail>(`/timeline/episodes/${selectedEpisodeId}`);
+        if (mounted) {
+          setEpisodeDetail(data);
+        }
+      } catch (err) {
+        if (mounted) {
+          setEpisodeError(err instanceof Error ? err.message : 'Failed to load episode detail.');
+        }
+      } finally {
+        if (mounted) {
+          setEpisodeLoading(false);
+        }
+      }
+    };
+    load();
+    return () => {
+      mounted = false;
+    };
+  }, [selectedEpisodeId]);
+
+  useEffect(() => {
+    setEpisodeEditOpen(false);
+    setEpisodeEditError(null);
+  }, [selectedEpisodeId]);
+
+  useEffect(() => {
+    if (!episodeDetail || episodeEditOpen) {
+      return;
+    }
+    setEpisodeEditTitle(episodeDetail.title || '');
+    setEpisodeEditSummary(episodeDetail.summary || '');
+  }, [episodeDetail, episodeEditOpen]);
 
   const moveAnchor = (direction: number) => {
     const next = new Date(anchorDate);
@@ -617,6 +875,24 @@ export const Timeline: React.FC = () => {
                   </button>
                 ))}
               </div>
+              <div className="flex items-center gap-2 rounded-full border border-white/70 bg-white/70 px-3 py-1.5 text-xs shadow-sm backdrop-blur">
+                <Search className="h-4 w-4 text-slate-400" />
+                <input
+                  value={searchQuery}
+                  onChange={(event) => setSearchQuery(event.target.value)}
+                  placeholder="Search memories"
+                  className="w-44 bg-transparent text-xs text-slate-700 placeholder:text-slate-400 focus:outline-none"
+                />
+                {searchQuery && (
+                  <button
+                    type="button"
+                    onClick={() => setSearchQuery('')}
+                    className="text-slate-400 hover:text-slate-600"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                )}
+              </div>
               <div className="flex items-center gap-2 rounded-full border border-white/70 bg-white/70 px-2 py-1.5 text-sm shadow-sm backdrop-blur">
                 <button
                   type="button"
@@ -646,6 +922,63 @@ export const Timeline: React.FC = () => {
               </div>
             </div>
           </div>
+
+          {searchQuery.trim() && (
+            <div className="rounded-2xl border border-white/70 bg-white/80 p-4 shadow-sm backdrop-blur">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h2 className="text-sm font-semibold text-slate-900">Search results</h2>
+                  <p className="text-xs text-slate-500">
+                    {searchLoading ? 'Searching...' : `${searchResults.length} result(s)`}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSearchQuery('')}
+                  className="text-xs font-semibold text-slate-500 hover:text-slate-700"
+                >
+                  Clear
+                </button>
+              </div>
+              {searchError && <div className="mt-3 text-xs text-red-600">{searchError}</div>}
+              {!searchLoading && !searchError && searchResults.length === 0 && (
+                <div className="mt-3 text-xs text-slate-500">No matches found.</div>
+              )}
+              {searchResults.length > 0 && (
+                <div className="mt-3 space-y-2">
+                  {searchResults.map((result) => {
+                    const isEpisode = result.payload && result.payload['is_episode'] === true;
+                    const isDaily = result.context_type === 'daily_summary';
+                    const label = isDaily ? 'Daily summary' : isEpisode ? 'Episode' : 'Memory';
+                    return (
+                      <button
+                        key={result.context_id}
+                        type="button"
+                        onClick={() => handleSearchSelect(result)}
+                        className="w-full rounded-2xl border border-slate-100 bg-white px-4 py-3 text-left hover:shadow"
+                      >
+                        <div className="flex flex-wrap items-center gap-2 text-[10px] uppercase tracking-wide text-slate-400">
+                          <span>{label}</span>
+                          {result.context_type && !isDaily && (
+                            <span>{result.context_type.replace(/_/g, ' ')}</span>
+                          )}
+                          {result.event_time_utc && (
+                            <span>{formatDate(result.event_time_utc)}</span>
+                          )}
+                        </div>
+                        <p className="mt-1 text-sm font-semibold text-slate-900">
+                          {result.title || 'Untitled result'}
+                        </p>
+                        {result.summary && (
+                          <p className="mt-1 line-clamp-2 text-xs text-slate-600">{result.summary}</p>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
 
           {loading && (
             <div className="rounded-2xl border border-white/70 bg-white/80 p-6 text-sm text-slate-500 shadow-sm backdrop-blur">
@@ -823,7 +1156,7 @@ export const Timeline: React.FC = () => {
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
                     <h2 className="text-sm font-semibold text-slate-900">Daily timeline</h2>
-                    <p className="text-xs text-slate-500">{sortedDayItems.length} memories</p>
+                    <p className="text-xs text-slate-500">{memoryCount} memories</p>
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
                     <div className="flex flex-wrap gap-1 text-[10px]">
@@ -987,9 +1320,81 @@ export const Timeline: React.FC = () => {
                   </div>
                 )}
 
-                {sortedDayItems.length === 0 ? (
+                {sortedDayEpisodes.length > 0 && (
+                  <div className="mt-4 space-y-3">
+                    <div className="flex items-center justify-between text-xs text-slate-500">
+                      <span className="font-semibold text-slate-700">Merged episodes</span>
+                      <span>{sortedDayEpisodes.length}</span>
+                    </div>
+                    {visibleDayEpisodes.map((episode) => {
+                      const isActive = episode.episode_id === selectedEpisodeId;
+                      const preview = episode.preview_url;
+                      return (
+                        <button
+                          key={episode.episode_id}
+                          type="button"
+                          onClick={() => {
+                            setSelectedEpisodeId(episode.episode_id);
+                            setSelectedItemId(null);
+                          }}
+                          className={`w-full rounded-2xl border p-3 text-left transition-all ${
+                            isActive
+                              ? 'border-slate-900 bg-slate-900 text-white shadow-lg'
+                              : 'border-white/60 bg-white/90 hover:border-slate-200 hover:shadow'
+                          }`}
+                        >
+                          <div className="flex items-start gap-3">
+                            <div className="h-12 w-12 flex-shrink-0 overflow-hidden rounded-xl bg-slate-100">
+                              {preview ? (
+                                <img src={preview} alt={episode.title} className="h-full w-full object-cover" />
+                              ) : (
+                                <div className="flex h-full w-full items-center justify-center text-slate-400">
+                                  <ImageIcon className="h-4 w-4" />
+                                </div>
+                              )}
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center justify-between text-[10px] uppercase tracking-wide">
+                                <span className={isActive ? 'text-white/70' : 'text-slate-400'}>
+                                  Episode
+                                </span>
+                                <span className={isActive ? 'text-white/70' : 'text-slate-400'}>
+                                  {episode.item_count} items
+                                </span>
+                              </div>
+                              <p className={`mt-1 text-sm font-semibold ${isActive ? 'text-white' : 'text-slate-900'}`}>
+                                {episode.title}
+                              </p>
+                              <p className={`mt-1 text-xs ${isActive ? 'text-white/70' : 'text-slate-500'}`}>
+                                {formatTimeRange(episode.start_time_utc, episode.end_time_utc)}
+                              </p>
+                              <p className={`mt-1 line-clamp-2 text-xs ${isActive ? 'text-white/70' : 'text-slate-500'}`}>
+                                {episode.summary}
+                              </p>
+                            </div>
+                          </div>
+                        </button>
+                      );
+                    })}
+                    {hasMoreEpisodes && (
+                      <button
+                        type="button"
+                        onClick={() => setEpisodeVisibleCount((value) => value + EPISODES_PAGE_SIZE)}
+                        className="w-full rounded-full border border-slate-200 px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-50"
+                      >
+                        Show more episodes
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                {sortedDayItems.length === 0 && sortedDayEpisodes.length === 0 ? (
                   <div className="py-8 text-center text-sm text-slate-500">
                     No memories for this day.
+                  </div>
+                ) : sortedDayItems.length === 0 ? (
+                  <div className="py-4 text-center text-xs text-slate-500">
+                    No individual memories yet.
                   </div>
                 ) : (
                   <div className="mt-4 space-y-4">
@@ -1001,7 +1406,10 @@ export const Timeline: React.FC = () => {
                         <button
                           key={item.id}
                           type="button"
-                          onClick={() => setSelectedItemId(item.id)}
+                          onClick={() => {
+                            setSelectedItemId(item.id);
+                            setSelectedEpisodeId(null);
+                          }}
                           className="w-full text-left"
                         >
                           <div className="flex gap-3">
@@ -1066,84 +1474,122 @@ export const Timeline: React.FC = () => {
               </div>
 
               <div className="rounded-2xl border border-white/70 bg-white/80 p-6 shadow-sm backdrop-blur">
-                {detailLoading && (
-                  <div className="text-sm text-slate-500">Loading memory details...</div>
-                )}
-                {detailError && (
-                  <div className="text-sm text-red-600">{detailError}</div>
-                )}
-                {!detailLoading && !detail && (
-                  <div className="text-sm text-slate-500">Select a memory to see details.</div>
-                )}
-                {detail && (
-                  <div className="space-y-6">
-                    <div className="flex flex-wrap items-start justify-between gap-4">
-                      <div>
-                        <h3 className="text-lg font-semibold text-slate-900">{buildLabel(detail)}</h3>
-                        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-500">
-                          <span>{formatDate(detail.captured_at)}</span>
-                          <span className="rounded-full bg-slate-900 px-2 py-0.5 text-white">
-                            {detail.item_type}
+                {viewMode === 'day' && daySummary && (
+                  <div className="mb-6 rounded-2xl border border-slate-100 bg-white p-4">
+                    <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                      <FileText className="h-3 w-3" />
+                      Daily summary
+                    </div>
+                    <p className="mt-2 text-sm font-semibold text-slate-900">{daySummary.title}</p>
+                    <p className="mt-2 text-sm text-slate-600">{daySummary.summary}</p>
+                    {daySummary.keywords.length > 0 && (
+                      <div className="mt-3 flex flex-wrap gap-1">
+                        {daySummary.keywords.map((keyword) => (
+                          <span
+                            key={keyword}
+                            className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] text-slate-500"
+                          >
+                            {keyword}
                           </span>
-                          <span className="rounded-full bg-white px-2 py-0.5 text-slate-600">
-                            {detail.processed ? 'Processed' : 'Processing'}
-                          </span>
-                        </div>
+                        ))}
                       </div>
-                      <button
-                        type="button"
-                        onClick={() => handleDelete(detail.id)}
-                        className="rounded-full border border-slate-200 px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-50"
-                        disabled={deletingId === detail.id}
-                      >
-                        {deletingId === detail.id ? 'Deleting...' : 'Delete'}
-                      </button>
-                    </div>
-
-                    <div className="overflow-hidden rounded-2xl border border-slate-200 bg-slate-50">
-                      {detail.item_type === 'video' ? (
-                        detail.download_url ? (
-                          <video
-                            src={detail.download_url}
-                            className="w-full max-h-[360px]"
-                            controls
-                            preload="metadata"
-                            poster={detail.poster_url || undefined}
-                            playsInline
-                          />
-                        ) : (
-                          <div className="p-6 text-slate-400">Video unavailable.</div>
-                        )
-                      ) : detail.item_type === 'audio' ? (
-                        detail.download_url ? (
-                          <div className="bg-white p-4">
-                            <audio src={detail.download_url} controls className="w-full" preload="metadata" />
+                    )}
+                  </div>
+                )}
+                {selectedEpisodeId ? (
+                  <>
+                    {episodeLoading && (
+                      <div className="text-sm text-slate-500">Loading episode details...</div>
+                    )}
+                    {episodeError && (
+                      <div className="text-sm text-red-600">{episodeError}</div>
+                    )}
+                    {!episodeLoading && !episodeDetail && (
+                      <div className="text-sm text-slate-500">Select an episode to see details.</div>
+                    )}
+                    {episodeDetail && (
+                      <div className="space-y-6">
+                        <div>
+                          <div className="flex flex-wrap items-start justify-between gap-3">
+                            <div>
+                              <h3 className="text-lg font-semibold text-slate-900">{episodeDetail.title}</h3>
+                              <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                                <span>{formatDate(episodeDetail.start_time_utc || undefined)}</span>
+                                <span className="rounded-full bg-slate-900 px-2 py-0.5 text-white">
+                                  Episode
+                                </span>
+                                <span className="rounded-full bg-white px-2 py-0.5 text-slate-600">
+                                  {episodeDetail.source_item_ids.length} items
+                                </span>
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setEpisodeEditOpen(true);
+                                setEpisodeEditError(null);
+                              }}
+                              disabled={episodeEditSaving || episodeEditOpen}
+                              className="rounded-full border border-slate-200 px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-50 disabled:opacity-60"
+                            >
+                              {episodeEditOpen ? 'Editing' : 'Edit episode'}
+                            </button>
                           </div>
-                        ) : (
-                          <div className="p-6 text-slate-400">Audio unavailable.</div>
-                        )
-                      ) : detail.download_url ? (
-                        <img src={detail.download_url} alt={buildLabel(detail)} className="w-full object-cover" />
-                      ) : (
-                        <div className="p-6 text-slate-400">Preview unavailable.</div>
-                      )}
-                    </div>
+                          <p className="mt-2 text-sm text-slate-600">
+                            {formatTimeRange(episodeDetail.start_time_utc, episodeDetail.end_time_utc)}
+                          </p>
+                          {episodeEditOpen ? (
+                            <div className="mt-4 space-y-3 rounded-2xl border border-slate-100 bg-white p-4">
+                              <label className="text-xs text-slate-500">
+                                Title
+                                <input
+                                  value={episodeEditTitle}
+                                  onChange={(event) => setEpisodeEditTitle(event.target.value)}
+                                  className="mt-1 h-10 w-full rounded-lg border border-slate-200 px-3 text-sm text-slate-700"
+                                />
+                              </label>
+                              <label className="text-xs text-slate-500">
+                                Summary
+                                <textarea
+                                  value={episodeEditSummary}
+                                  onChange={(event) => setEpisodeEditSummary(event.target.value)}
+                                  rows={4}
+                                  className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700"
+                                />
+                              </label>
+                              <div className="flex flex-wrap gap-2">
+                                <button
+                                  type="button"
+                                  onClick={handleEpisodeSave}
+                                  disabled={episodeEditSaving}
+                                  className="rounded-full bg-slate-900 px-4 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-60"
+                                >
+                                  {episodeEditSaving ? 'Saving...' : 'Save changes'}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={handleEpisodeCancel}
+                                  className="rounded-full border border-slate-200 px-4 py-1.5 text-xs text-slate-600 hover:bg-slate-50"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                              {episodeEditError && (
+                                <div className="text-xs text-red-600">{episodeEditError}</div>
+                              )}
+                            </div>
+                          ) : (
+                            <p className="mt-2 text-sm text-slate-700">{episodeDetail.summary}</p>
+                          )}
+                        </div>
 
-                    <div>
-                      <h4 className="text-sm font-semibold text-slate-900">Contexts</h4>
-                      {detail.contexts.length === 0 ? (
-                        <p className="mt-2 text-xs text-slate-500">No contexts extracted yet.</p>
-                      ) : (
-                        <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                          {detail.contexts.map((context, index) => {
-                            const versions = context.processor_versions as Record<string, unknown> | undefined;
-                            const chunkValue = versions?.chunk_index;
-                            const chunkIndex = typeof chunkValue === 'number' ? chunkValue + 1 : null;
-                            return (
+                        <div>
+                          <h4 className="text-sm font-semibold text-slate-900">Episode contexts</h4>
+                          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                            {episodeDetail.contexts.map((context, index) => (
                               <div key={`${context.context_type}-${index}`} className="rounded-2xl border border-slate-100 bg-white p-4">
                                 <div className="flex items-center justify-between text-[10px] uppercase tracking-wide text-slate-400">
                                   <span>{context.context_type.replace(/_/g, ' ')}</span>
-                                  {chunkIndex ? <span>Chunk {chunkIndex}</span> : null}
                                 </div>
                                 <p className="mt-2 text-sm font-semibold text-slate-900">{context.title}</p>
                                 <p className="mt-1 text-xs text-slate-600">{context.summary}</p>
@@ -1157,32 +1603,176 @@ export const Timeline: React.FC = () => {
                                   </div>
                                 )}
                               </div>
-                            );
-                          })}
-                        </div>
-                      )}
-                    </div>
-
-                    {(detail.transcript_segments?.length || detail.transcript_text) && (
-                      <div>
-                        <h4 className="text-sm font-semibold text-slate-900">Transcript</h4>
-                        {detail.transcript_segments && detail.transcript_segments.length > 0 ? (
-                          <div className="mt-3 space-y-3 rounded-2xl border border-slate-100 bg-white p-4 max-h-56 overflow-y-auto">
-                            {detail.transcript_segments.map((segment, index) => (
-                              <div key={`${segment.start_ms}-${index}`} className="text-xs text-slate-600">
-                                <span className="text-[10px] uppercase tracking-wide text-slate-400">
-                                  {formatDuration(segment.start_ms)} - {formatDuration(segment.end_ms)}
-                                </span>
-                                <p className="mt-1 text-slate-700">{segment.text || '...'}</p>
-                              </div>
                             ))}
                           </div>
-                        ) : (
-                          <p className="mt-2 whitespace-pre-wrap text-xs text-slate-600">{detail.transcript_text}</p>
+                        </div>
+
+                        <div>
+                          <h4 className="text-sm font-semibold text-slate-900">Episode items</h4>
+                          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                            {episodeDetail.items.map((item) => (
+                              <button
+                                key={item.id}
+                                type="button"
+                                onClick={() => {
+                                  setSelectedEpisodeId(null);
+                                  setSelectedItemId(item.id);
+                                }}
+                                className="flex items-center gap-3 rounded-2xl border border-slate-100 bg-white p-3 text-left hover:shadow"
+                              >
+                                <div className="h-12 w-12 overflow-hidden rounded-xl bg-slate-100">
+                                  {item.item_type === 'video' && item.poster_url ? (
+                                    <img src={item.poster_url} alt={buildLabel(item)} className="h-full w-full object-cover" />
+                                  ) : item.item_type === 'photo' && item.download_url ? (
+                                    <img src={item.download_url} alt={buildLabel(item)} className="h-full w-full object-cover" />
+                                  ) : item.item_type === 'video' ? (
+                                    <div className="flex h-full w-full items-center justify-center text-slate-400">
+                                      <Video className="h-4 w-4" />
+                                    </div>
+                                  ) : item.item_type === 'audio' ? (
+                                    <div className="flex h-full w-full items-center justify-center text-slate-400">
+                                      <Mic className="h-4 w-4" />
+                                    </div>
+                                  ) : (
+                                    <div className="flex h-full w-full items-center justify-center text-slate-400">
+                                      <ImageIcon className="h-4 w-4" />
+                                    </div>
+                                  )}
+                                </div>
+                                <div className="min-w-0 flex-1">
+                                  <p className="text-xs uppercase tracking-wide text-slate-400">{item.item_type}</p>
+                                  <p className="mt-1 text-sm font-semibold text-slate-900 line-clamp-2">
+                                    {buildLabel(item)}
+                                  </p>
+                                </div>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    {detailLoading && (
+                      <div className="text-sm text-slate-500">Loading memory details...</div>
+                    )}
+                    {detailError && (
+                      <div className="text-sm text-red-600">{detailError}</div>
+                    )}
+                    {!detailLoading && !detail && (
+                      <div className="text-sm text-slate-500">Select a memory to see details.</div>
+                    )}
+                    {detail && (
+                      <div className="space-y-6">
+                        <div className="flex flex-wrap items-start justify-between gap-4">
+                          <div>
+                            <h3 className="text-lg font-semibold text-slate-900">{buildLabel(detail)}</h3>
+                            <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                              <span>{formatDate(detail.captured_at)}</span>
+                              <span className="rounded-full bg-slate-900 px-2 py-0.5 text-white">
+                                {detail.item_type}
+                              </span>
+                              <span className="rounded-full bg-white px-2 py-0.5 text-slate-600">
+                                {detail.processed ? 'Processed' : 'Processing'}
+                              </span>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => handleDelete(detail.id)}
+                            className="rounded-full border border-slate-200 px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-50"
+                            disabled={deletingId === detail.id}
+                          >
+                            {deletingId === detail.id ? 'Deleting...' : 'Delete'}
+                          </button>
+                        </div>
+
+                        <div className="overflow-hidden rounded-2xl border border-slate-200 bg-slate-50">
+                          {detail.item_type === 'video' ? (
+                            detail.download_url ? (
+                              <video
+                                src={detail.download_url}
+                                className="w-full max-h-[360px]"
+                                controls
+                                preload="metadata"
+                                poster={detail.poster_url || undefined}
+                                playsInline
+                              />
+                            ) : (
+                              <div className="p-6 text-slate-400">Video unavailable.</div>
+                            )
+                          ) : detail.item_type === 'audio' ? (
+                            detail.download_url ? (
+                              <div className="bg-white p-4">
+                                <audio src={detail.download_url} controls className="w-full" preload="metadata" />
+                              </div>
+                            ) : (
+                              <div className="p-6 text-slate-400">Audio unavailable.</div>
+                            )
+                          ) : detail.download_url ? (
+                            <img src={detail.download_url} alt={buildLabel(detail)} className="w-full object-cover" />
+                          ) : (
+                            <div className="p-6 text-slate-400">Preview unavailable.</div>
+                          )}
+                        </div>
+
+                        <div>
+                          <h4 className="text-sm font-semibold text-slate-900">Contexts</h4>
+                          {detail.contexts.length === 0 ? (
+                            <p className="mt-2 text-xs text-slate-500">No contexts extracted yet.</p>
+                          ) : (
+                            <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                              {detail.contexts.map((context, index) => {
+                                const versions = context.processor_versions as Record<string, unknown> | undefined;
+                                const chunkValue = versions?.chunk_index;
+                                const chunkIndex = typeof chunkValue === 'number' ? chunkValue + 1 : null;
+                                return (
+                                  <div key={`${context.context_type}-${index}`} className="rounded-2xl border border-slate-100 bg-white p-4">
+                                    <div className="flex items-center justify-between text-[10px] uppercase tracking-wide text-slate-400">
+                                      <span>{context.context_type.replace(/_/g, ' ')}</span>
+                                      {chunkIndex ? <span>Chunk {chunkIndex}</span> : null}
+                                    </div>
+                                    <p className="mt-2 text-sm font-semibold text-slate-900">{context.title}</p>
+                                    <p className="mt-1 text-xs text-slate-600">{context.summary}</p>
+                                    {context.keywords.length > 0 && (
+                                      <div className="mt-3 flex flex-wrap gap-1">
+                                        {context.keywords.map((keyword) => (
+                                          <span key={keyword} className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] text-slate-500">
+                                            {keyword}
+                                          </span>
+                                        ))}
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+
+                        {(detail.transcript_segments?.length || detail.transcript_text) && (
+                          <div>
+                            <h4 className="text-sm font-semibold text-slate-900">Transcript</h4>
+                            {detail.transcript_segments && detail.transcript_segments.length > 0 ? (
+                              <div className="mt-3 space-y-3 rounded-2xl border border-slate-100 bg-white p-4 max-h-56 overflow-y-auto">
+                                {detail.transcript_segments.map((segment, index) => (
+                                  <div key={`${segment.start_ms}-${index}`} className="text-xs text-slate-600">
+                                    <span className="text-[10px] uppercase tracking-wide text-slate-400">
+                                      {formatDuration(segment.start_ms)} - {formatDuration(segment.end_ms)}
+                                    </span>
+                                    <p className="mt-1 text-slate-700">{segment.text || '...'}</p>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : (
+                              <p className="mt-2 whitespace-pre-wrap text-xs text-slate-600">{detail.transcript_text}</p>
+                            )}
+                          </div>
                         )}
                       </div>
                     )}
-                  </div>
+                  </>
                 )}
               </div>
             </div>

@@ -38,6 +38,14 @@ class IngestRequest(BaseModel):
     original_filename: Optional[str] = Field(default=None, description="Original filename if available")
     size_bytes: Optional[int] = Field(default=None, ge=1, description="Asset size in bytes")
     duration_sec: Optional[float] = Field(default=None, ge=0, description="Duration in seconds")
+    event_time_window_start: Optional[datetime] = Field(
+        default=None,
+        description="Optional window start for manual time overrides",
+    )
+    event_time_window_end: Optional[datetime] = Field(
+        default=None,
+        description="Optional window end for manual time overrides",
+    )
     reprocess_duplicates: Optional[bool] = Field(
         default=None,
         description="Re-run expensive steps even if the item is a duplicate",
@@ -123,6 +131,10 @@ async def ingest_item(
         "size_bytes": request.size_bytes,
         "duration_sec": request.duration_sec,
     }
+    if request.event_time_window_start:
+        payload["event_time_window_start"] = request.event_time_window_start.isoformat()
+    if request.event_time_window_end:
+        payload["event_time_window_end"] = request.event_time_window_end.isoformat()
     if request.reprocess_duplicates is not None:
         payload["reprocess_duplicates"] = request.reprocess_duplicates
     if request.event_time_override is not None:

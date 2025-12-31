@@ -24,7 +24,21 @@ async def search_items(
     user_id: UUID = DEFAULT_TEST_USER_ID,
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    results = search_contexts(q, limit=limit, user_id=str(user_id))
+    results = search_contexts(q, limit=limit, user_id=str(user_id), is_episode=True)
+    if len(results) < limit:
+        fallback = search_contexts(q, limit=limit * 2, user_id=str(user_id))
+        seen = {result.get("context_id") for result in results}
+        for entry in fallback:
+            payload = entry.get("payload") or {}
+            if payload.get("is_episode") is True:
+                continue
+            context_id = entry.get("context_id")
+            if context_id in seen:
+                continue
+            results.append(entry)
+            seen.add(context_id)
+            if len(results) >= limit:
+                break
     context_ids: list[UUID] = []
     for result in results:
         try:

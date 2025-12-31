@@ -286,6 +286,8 @@ class MetadataStep:
         }
         if payload.get("duration_sec") is not None:
             metadata["duration_sec"] = payload.get("duration_sec")
+        if payload.get("client_tz_offset_minutes") is not None:
+            metadata["client_tz_offset_minutes"] = payload.get("client_tz_offset_minutes")
         window_start = payload.get("event_time_window_start")
         window_end = payload.get("event_time_window_end")
         if window_start:
@@ -859,6 +861,10 @@ class EventTimeStep:
         exif_time = parse_iso_datetime(exif_payload.get("event_time_utc"))
         if not exif_time:
             exif_time = parse_exif_datetime(exif_payload.get("datetime_original"))
+        client_offset = config.payload.get("client_tz_offset_minutes")
+        if exif_time and exif_time.tzinfo is None and isinstance(client_offset, (int, float)):
+            tzinfo = timezone(timedelta(minutes=-int(client_offset)))
+            exif_time = exif_time.replace(tzinfo=tzinfo).astimezone(timezone.utc)
         media_metadata = artifacts.get("media_metadata") or {}
         media_time = None
         if isinstance(media_metadata, dict):
@@ -1098,7 +1104,15 @@ class VlmStep:
         blob = artifacts.get("blob") or b""
         prompt = build_lifelog_image_prompt(ocr_text)
         try:
-            response = await analyze_image_with_vlm(blob, prompt, config.settings, item.content_type)
+            response = await analyze_image_with_vlm(
+                blob,
+                prompt,
+                config.settings,
+                item.content_type,
+                user_id=item.user_id,
+                item_id=item.id,
+                step_name="vlm",
+            )
         except Exception as exc:  # pragma: no cover - external service dependency
             logger.warning("VLM failed for item {}: {}", item.id, exc)
             response = {"status": "error", "error": str(exc), "raw_text": "", "parsed": None}
@@ -1353,11 +1367,23 @@ class MediaChunkUnderstandingStep:
 
                     if item.item_type == "video":
                         response = await analyze_video_with_gemini(
-                            chunk_bytes, prompt, config.settings, content_type
+                            chunk_bytes,
+                            prompt,
+                            config.settings,
+                            content_type,
+                            user_id=item.user_id,
+                            item_id=item.id,
+                            step_name="media_chunk_understanding",
                         )
                     else:
                         response = await analyze_audio_with_gemini(
-                            chunk_bytes, prompt, config.settings, content_type
+                            chunk_bytes,
+                            prompt,
+                            config.settings,
+                            content_type,
+                            user_id=item.user_id,
+                            item_id=item.id,
+                            step_name="media_chunk_understanding",
                         )
 
                     parsed = response.get("parsed") or {}

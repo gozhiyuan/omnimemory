@@ -154,6 +154,7 @@ export const UploadManager: React.FC = () => {
           original_filename: file.name,
           size_bytes: file.size,
           duration_sec: durationSec,
+          client_tz_offset_minutes: new Date().getTimezoneOffset(),
         });
 
         setUploadedCount((count) => count + 1);

@@ -10,10 +10,13 @@ import {
   TimelineEpisodeDetail,
   TimelineItem,
   TimelineItemDetail,
+  TimelineItemsResponse,
+  TimelineFocus,
+  TimelineViewMode,
   UploadUrlResponse,
 } from '../types';
 
-type ViewMode = 'day' | 'week' | 'month' | 'year';
+type ViewMode = TimelineViewMode;
 
 const formatDate = (value?: string) => {
   if (!value) return 'Unknown date';
@@ -137,6 +140,9 @@ const formatRangeLabel = (view: ViewMode, anchor: Date) => {
   if (view === 'month') {
     return anchor.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
   }
+  if (view === 'all') {
+    return 'All time';
+  }
   return anchor.getFullYear().toString();
 };
 
@@ -167,11 +173,20 @@ const VIEW_LABELS: Record<ViewMode, string> = {
   week: 'Week',
   month: 'Month',
   year: 'Year',
+  all: 'All',
 };
 
-const EPISODES_PAGE_SIZE = 6;
+const VIEW_MODES: ViewMode[] = ['day', 'week', 'month', 'year', 'all'];
 
-export const Timeline: React.FC = () => {
+const EPISODES_PAGE_SIZE = 6;
+const ALL_PAGE_SIZE = 24;
+
+interface TimelineProps {
+  focus?: TimelineFocus | null;
+  onFocusHandled?: () => void;
+}
+
+export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => {
   const [days, setDays] = useState<TimelineDay[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -208,9 +223,17 @@ export const Timeline: React.FC = () => {
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [pendingSelection, setPendingSelection] = useState<{ itemId?: string; episodeContextId?: string } | null>(null);
+  const [allItems, setAllItems] = useState<TimelineItem[]>([]);
+  const [allOffset, setAllOffset] = useState(0);
+  const [allTotal, setAllTotal] = useState(0);
+  const [allLoading, setAllLoading] = useState(false);
+  const [allError, setAllError] = useState<string | null>(null);
 
   const range = useMemo(() => {
     if (viewMode === 'day') {
+      return { start: anchorDate, end: anchorDate };
+    }
+    if (viewMode === 'all') {
       return { start: anchorDate, end: anchorDate };
     }
     if (viewMode === 'week') {
@@ -223,6 +246,10 @@ export const Timeline: React.FC = () => {
   }, [viewMode, anchorDate]);
 
   useEffect(() => {
+    if (viewMode === 'all') {
+      setLoading(false);
+      return;
+    }
     let mounted = true;
     const load = async () => {
       setLoading(true);
@@ -253,7 +280,33 @@ export const Timeline: React.FC = () => {
     return () => {
       mounted = false;
     };
-  }, [range, reloadKey]);
+  }, [range, reloadKey, viewMode]);
+
+  useEffect(() => {
+    if (!focus) {
+      return;
+    }
+    if (focus.viewMode) {
+      setViewMode(focus.viewMode);
+    }
+    if (focus.anchorDate) {
+      const parsed = new Date(focus.anchorDate);
+      if (!Number.isNaN(parsed.getTime())) {
+        setAnchorDate(parsed);
+      }
+    }
+    if (focus.itemId) {
+      setSelectedEpisodeId(null);
+      setSelectedItemId(null);
+      setPendingSelection({ itemId: focus.itemId });
+    }
+    if (focus.viewMode === 'all') {
+      setSelectedEpisodeId(null);
+      setSelectedItemId(null);
+      setPendingSelection(null);
+    }
+    onFocusHandled?.();
+  }, [focus, onFocusHandled]);
 
   const dayLookup = useMemo(() => {
     const map = new Map<string, TimelineDay>();
@@ -284,6 +337,36 @@ export const Timeline: React.FC = () => {
     }
     return dayLookup.get(dayKey)?.daily_summary ?? null;
   }, [dayLookup, dayKey, viewMode]);
+
+  const loadAllItems = async (reset = false) => {
+    if (allLoading) {
+      return;
+    }
+    setAllLoading(true);
+    setAllError(null);
+    try {
+      const nextOffset = reset ? 0 : allOffset;
+      const query = new URLSearchParams({
+        limit: ALL_PAGE_SIZE.toString(),
+        offset: nextOffset.toString(),
+      });
+      const data = await apiGet<TimelineItemsResponse>(`/timeline/items?${query.toString()}`);
+      setAllItems((prev) => (reset ? data.items : [...prev, ...data.items]));
+      setAllTotal(data.total);
+      setAllOffset(nextOffset + data.items.length);
+    } catch (err) {
+      setAllError(err instanceof Error ? err.message : 'Failed to load memories.');
+    } finally {
+      setAllLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (viewMode !== 'all') {
+      return;
+    }
+    loadAllItems(true);
+  }, [viewMode, reloadKey]);
 
   useEffect(() => {
     setUploadOpen(false);
@@ -344,6 +427,11 @@ export const Timeline: React.FC = () => {
   const hasMoreEpisodes = useMemo(
     () => sortedDayEpisodes.length > episodeVisibleCount,
     [sortedDayEpisodes.length, episodeVisibleCount]
+  );
+
+  const hasMoreAllItems = useMemo(
+    () => allItems.length < allTotal,
+    [allItems.length, allTotal]
   );
 
   const dayStats = useMemo(() => {
@@ -619,6 +707,7 @@ export const Timeline: React.FC = () => {
           original_filename: file.name,
           size_bytes: file.size,
           duration_sec: durationSec,
+          client_tz_offset_minutes: new Date().getTimezoneOffset(),
         };
         if (overrideEnabled && captureTimes[index]) {
           ingestPayload.captured_at = captureTimes[index]?.toISOString();
@@ -830,6 +919,9 @@ export const Timeline: React.FC = () => {
 
   const moveAnchor = (direction: number) => {
     const next = new Date(anchorDate);
+    if (viewMode === 'all') {
+      return;
+    }
     if (viewMode === 'day') {
       next.setDate(next.getDate() + direction);
     } else if (viewMode === 'week') {
@@ -860,7 +952,7 @@ export const Timeline: React.FC = () => {
             </div>
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
               <div className="flex items-center gap-1 rounded-full border border-white/70 bg-white/70 p-1 shadow-sm backdrop-blur">
-                {(Object.keys(VIEW_LABELS) as ViewMode[]).map((mode) => (
+                {VIEW_MODES.map((mode) => (
                   <button
                     key={mode}
                     type="button"
@@ -980,7 +1072,7 @@ export const Timeline: React.FC = () => {
             </div>
           )}
 
-          {loading && (
+          {loading && viewMode !== 'all' && (
             <div className="rounded-2xl border border-white/70 bg-white/80 p-6 text-sm text-slate-500 shadow-sm backdrop-blur">
               Loading timeline...
             </div>
@@ -992,13 +1084,13 @@ export const Timeline: React.FC = () => {
             </div>
           )}
 
-          {!loading && !error && !hasItems && (
+          {!loading && !error && !hasItems && viewMode !== 'all' && (
             <div className="rounded-2xl border border-dashed border-slate-300 bg-white/70 px-6 py-14 text-center text-sm text-slate-500 shadow-sm backdrop-blur">
               No memories yet. Upload something to start your timeline.
             </div>
           )}
 
-          {!loading && !error && viewMode !== 'day' && hasItems && (
+          {!loading && !error && viewMode !== 'day' && viewMode !== 'all' && hasItems && (
             <div className="rounded-2xl border border-white/70 bg-white/80 p-6 shadow-sm backdrop-blur">
               <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
                 <div>
@@ -1146,6 +1238,96 @@ export const Timeline: React.FC = () => {
                     );
                   })}
                 </div>
+              )}
+            </div>
+          )}
+
+          {!error && viewMode === 'all' && (
+            <div className="rounded-2xl border border-white/70 bg-white/80 p-6 shadow-sm backdrop-blur">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h2 className="text-lg font-semibold text-slate-900">All memories</h2>
+                  <p className="text-xs text-slate-500">{allTotal} total</p>
+                </div>
+                <div className="text-xs text-slate-400">Newest first</div>
+              </div>
+              {allError && <div className="mt-4 text-xs text-red-600">{allError}</div>}
+              {allLoading && allItems.length === 0 && (
+                <div className="mt-6 text-sm text-slate-500">Loading memories...</div>
+              )}
+              {!allLoading && allItems.length === 0 && (
+                <div className="mt-6 text-sm text-slate-500">No memories yet.</div>
+              )}
+              {allItems.length > 0 && (
+                <div className="mt-5 space-y-3">
+                  {allItems.map((item) => {
+                    const thumbnail = getThumbnail(item);
+                    return (
+                      <button
+                        key={item.id}
+                        type="button"
+                        onClick={() => {
+                          if (item.captured_at) {
+                            const parsed = new Date(item.captured_at);
+                            if (!Number.isNaN(parsed.getTime())) {
+                              setAnchorDate(parsed);
+                            }
+                          }
+                          setViewMode('day');
+                          setSelectedEpisodeId(null);
+                          setSelectedItemId(null);
+                          setPendingSelection({ itemId: item.id });
+                        }}
+                        className="flex w-full items-center gap-4 rounded-2xl border border-white/60 bg-white/90 p-4 text-left transition-all hover:border-slate-200 hover:shadow"
+                      >
+                        <div className="relative h-14 w-14 flex-shrink-0 overflow-hidden rounded-xl bg-slate-100">
+                          {thumbnail ? (
+                            <img src={thumbnail} alt={buildLabel(item)} className="h-full w-full object-cover" />
+                          ) : item.item_type === 'video' ? (
+                            <div className="flex h-full w-full items-center justify-center text-slate-400">
+                              <Video className="h-5 w-5" />
+                            </div>
+                          ) : item.item_type === 'audio' ? (
+                            <div className="flex h-full w-full items-center justify-center text-slate-400">
+                              <Mic className="h-5 w-5" />
+                            </div>
+                          ) : (
+                            <div className="flex h-full w-full items-center justify-center text-slate-400">
+                              <ImageIcon className="h-5 w-5" />
+                            </div>
+                          )}
+                          {item.item_type === 'video' && (
+                            <span className="absolute inset-0 flex items-center justify-center">
+                              <span className="flex h-6 w-6 items-center justify-center rounded-full bg-black/60 text-white">
+                                <Play className="h-3 w-3" />
+                              </span>
+                            </span>
+                          )}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2 text-[10px] uppercase tracking-wide text-slate-400">
+                            <span>{item.item_type}</span>
+                            <span>{formatDate(item.captured_at)}</span>
+                            {item.captured_at && <span>{formatTime(item.captured_at)}</span>}
+                          </div>
+                          <p className="mt-1 line-clamp-2 text-sm font-semibold text-slate-900">
+                            {buildLabel(item)}
+                          </p>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+              {hasMoreAllItems && (
+                <button
+                  type="button"
+                  onClick={() => loadAllItems(false)}
+                  disabled={allLoading}
+                  className="mt-5 w-full rounded-full border border-slate-200 px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-50 disabled:opacity-60"
+                >
+                  {allLoading ? 'Loading more...' : 'Load more memories'}
+                </button>
               )}
             </div>
           )}

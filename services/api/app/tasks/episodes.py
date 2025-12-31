@@ -162,6 +162,7 @@ async def _generate_episode_summary(
     omitted_count: int,
     start_time: datetime,
     end_time: datetime,
+    user_id: UUID,
 ) -> Optional[dict[str, Any]]:
     if settings.video_understanding_provider != "gemini":
         return None
@@ -182,6 +183,8 @@ async def _generate_episode_summary(
         temperature=settings.video_understanding_temperature,
         max_output_tokens=settings.vlm_max_output_tokens,
         timeout_seconds=settings.video_understanding_timeout_seconds,
+        user_id=user_id,
+        step_name="episode_summary",
     )
     if response.get("status") != "ok":
         return None
@@ -659,6 +662,7 @@ async def _update_episode_for_item(item_id: str) -> dict[str, Any]:
                     omitted_count=omitted_count,
                     start_time=start_time,
                     end_time=end_time,
+                    user_id=item.user_id,
                 )
 
         episode_records = _build_episode_context_records(

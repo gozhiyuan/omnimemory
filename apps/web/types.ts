@@ -93,6 +93,14 @@ export interface TimelineItemDetail extends TimelineItem {
   transcript_segments?: TranscriptSegment[];
 }
 
+export type TimelineViewMode = 'day' | 'week' | 'month' | 'year' | 'all';
+
+export interface TimelineFocus {
+  viewMode?: TimelineViewMode;
+  anchorDate?: string;
+  itemId?: string;
+}
+
 export interface TimelineEpisodeDetail {
   episode_id: string;
   title: string;
@@ -132,6 +140,29 @@ export interface DashboardStatsResponse {
   storage_used_bytes: number;
   recent_items: DashboardRecentItem[];
   activity: DashboardActivityPoint[];
+  usage_this_week: UsageTotals;
+  usage_all_time: UsageTotals;
+  usage_daily: UsageDailyPoint[];
+}
+
+export interface UsageTotals {
+  prompt_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+}
+
+export interface UsageDailyPoint {
+  date: string;
+  total_tokens: number;
+  cost_usd: number;
+}
+
+export interface TimelineItemsResponse {
+  items: TimelineItem[];
+  total: number;
+  limit: number;
+  offset: number;
 }
 
 export interface SearchResult {

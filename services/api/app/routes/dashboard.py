@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from uuid import UUID
 
 import asyncio
@@ -17,6 +17,7 @@ from loguru import logger
 from ..config import get_settings
 from ..db.models import (
     DEFAULT_TEST_USER_ID,
+    AiUsageEvent,
     DataConnection,
     DerivedArtifact,
     ProcessedContent,
@@ -49,6 +50,19 @@ class DashboardRecentItem(BaseModel):
     poster_url: Optional[str] = None
 
 
+class UsageTotals(BaseModel):
+    prompt_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cost_usd: float
+
+
+class UsageDailyPoint(BaseModel):
+    date: date
+    total_tokens: int
+    cost_usd: float
+
+
 class DashboardStats(BaseModel):
     total_items: int
     processed_items: int
@@ -58,16 +72,36 @@ class DashboardStats(BaseModel):
     storage_used_bytes: int
     recent_items: list[DashboardRecentItem]
     activity: list[DashboardActivityPoint]
+    usage_this_week: UsageTotals
+    usage_all_time: UsageTotals
+    usage_daily: list[UsageDailyPoint]
+
+
+def _build_date_range(start_day: date, end_day: date) -> list[date]:
+    days: list[date] = []
+    cursor = start_day
+    while cursor <= end_day:
+        days.append(cursor)
+        cursor += timedelta(days=1)
+    return days
 
 
 @router.get("/stats", response_model=DashboardStats)
 async def get_dashboard_stats(
     user_id: UUID = DEFAULT_TEST_USER_ID,
     session: AsyncSession = Depends(get_session),
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
 ) -> DashboardStats:
     """Return aggregate counts used by the dashboard cards."""
 
     since = datetime.utcnow() - timedelta(days=7)
+    range_end = end_date or date.today()
+    range_start = start_date or (range_end - timedelta(days=6))
+    if range_start > range_end:
+        range_start, range_end = range_end, range_start
+    range_start_dt = datetime.combine(range_start, time.min, tzinfo=timezone.utc)
+    range_end_dt = datetime.combine(range_end, time.min, tzinfo=timezone.utc) + timedelta(days=1)
     total_items_stmt = select(func.count(SourceItem.id)).where(
         SourceItem.user_id == user_id,
         SourceItem.processing_status == "completed",
@@ -110,7 +144,40 @@ async def get_dashboard_stats(
         .where(
             SourceItem.user_id == user_id,
             SourceItem.processing_status == "completed",
-            SourceItem.created_at >= since,
+            SourceItem.created_at >= range_start_dt,
+            SourceItem.created_at < range_end_dt,
+        )
+        .group_by("day")
+        .order_by("day")
+    )
+
+    usage_week_stmt = select(
+        func.coalesce(func.sum(AiUsageEvent.prompt_tokens), 0).label("prompt_tokens"),
+        func.coalesce(func.sum(AiUsageEvent.output_tokens), 0).label("output_tokens"),
+        func.coalesce(func.sum(AiUsageEvent.total_tokens), 0).label("total_tokens"),
+        func.coalesce(func.sum(AiUsageEvent.cost_usd), 0.0).label("cost_usd"),
+    ).where(
+        AiUsageEvent.user_id == user_id,
+        AiUsageEvent.created_at >= since,
+    )
+
+    usage_all_time_stmt = select(
+        func.coalesce(func.sum(AiUsageEvent.prompt_tokens), 0).label("prompt_tokens"),
+        func.coalesce(func.sum(AiUsageEvent.output_tokens), 0).label("output_tokens"),
+        func.coalesce(func.sum(AiUsageEvent.total_tokens), 0).label("total_tokens"),
+        func.coalesce(func.sum(AiUsageEvent.cost_usd), 0.0).label("cost_usd"),
+    ).where(AiUsageEvent.user_id == user_id)
+
+    usage_daily_stmt = (
+        select(
+            func.date(AiUsageEvent.created_at).label("day"),
+            func.coalesce(func.sum(AiUsageEvent.total_tokens), 0).label("total_tokens"),
+            func.coalesce(func.sum(AiUsageEvent.cost_usd), 0.0).label("cost_usd"),
+        )
+        .where(
+            AiUsageEvent.user_id == user_id,
+            AiUsageEvent.created_at >= range_start_dt,
+            AiUsageEvent.created_at < range_end_dt,
         )
         .group_by("day")
         .order_by("day")
@@ -122,6 +189,9 @@ async def get_dashboard_stats(
     active_connections = (await session.execute(connections_stmt)).scalar_one()
     uploads_last_7_days = (await session.execute(uploads_last_week_stmt)).scalar_one()
     storage_used_bytes = (await session.execute(storage_sum_stmt)).scalar_one() or 0
+
+    usage_week_row = (await session.execute(usage_week_stmt)).one()
+    usage_all_time_row = (await session.execute(usage_all_time_stmt)).one()
 
     recent_items_result = await session.execute(recent_items_stmt)
     recent_items = list(recent_items_result.scalars().all())
@@ -245,9 +315,27 @@ async def get_dashboard_stats(
     activity_rows = await session.execute(activity_stmt)
     activity_by_day = {row.day: row[1] for row in activity_rows.fetchall()}
     activity: list[DashboardActivityPoint] = []
-    for i in range(6, -1, -1):
-        day = (date.today() - timedelta(days=i))
+    for day in _build_date_range(range_start, range_end):
         activity.append(DashboardActivityPoint(date=day, count=activity_by_day.get(day, 0)))
+
+    usage_rows = await session.execute(usage_daily_stmt)
+    usage_by_day = {
+        row.day: {
+            "total_tokens": row.total_tokens or 0,
+            "cost_usd": float(row.cost_usd or 0),
+        }
+        for row in usage_rows.fetchall()
+    }
+    usage_daily: list[UsageDailyPoint] = []
+    for day in _build_date_range(range_start, range_end):
+        usage = usage_by_day.get(day, {"total_tokens": 0, "cost_usd": 0.0})
+        usage_daily.append(
+            UsageDailyPoint(
+                date=day,
+                total_tokens=int(usage["total_tokens"]),
+                cost_usd=float(usage["cost_usd"]),
+            )
+        )
 
     return DashboardStats(
         total_items=total_items,
@@ -272,4 +360,17 @@ async def get_dashboard_stats(
             for item in recent_items
         ],
         activity=activity,
+        usage_this_week=UsageTotals(
+            prompt_tokens=int(usage_week_row.prompt_tokens or 0),
+            output_tokens=int(usage_week_row.output_tokens or 0),
+            total_tokens=int(usage_week_row.total_tokens or 0),
+            cost_usd=float(usage_week_row.cost_usd or 0),
+        ),
+        usage_all_time=UsageTotals(
+            prompt_tokens=int(usage_all_time_row.prompt_tokens or 0),
+            output_tokens=int(usage_all_time_row.output_tokens or 0),
+            total_tokens=int(usage_all_time_row.total_tokens or 0),
+            cost_usd=float(usage_all_time_row.cost_usd or 0),
+        ),
+        usage_daily=usage_daily,
     )

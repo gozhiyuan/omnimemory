@@ -49,6 +49,13 @@ class TimelineItem(BaseModel):
     poster_url: Optional[str] = None
 
 
+class TimelineItemsPage(BaseModel):
+    items: list[TimelineItem]
+    total: int
+    limit: int
+    offset: int
+
+
 class TimelineDay(BaseModel):
     date: date
     item_count: int
@@ -490,6 +497,216 @@ async def get_timeline(
         )
 
     return timeline
+
+
+@router.get("/items", response_model=TimelineItemsPage)
+async def get_timeline_items(
+    user_id: UUID = DEFAULT_TEST_USER_ID,
+    session: AsyncSession = Depends(get_session),
+    limit: int = 50,
+    offset: int = 0,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    tz_offset_minutes: Optional[int] = None,
+) -> TimelineItemsPage:
+    offset_minutes = tz_offset_minutes or 0
+    offset_delta = timedelta(minutes=offset_minutes)
+
+    event_time_expr = func.coalesce(SourceItem.event_time_utc, SourceItem.created_at)
+    filters = [
+        SourceItem.user_id == user_id,
+        SourceItem.processing_status == "completed",
+    ]
+    if start_date:
+        start_dt = datetime.combine(start_date, time.min, tzinfo=timezone.utc) + offset_delta
+        filters.append(event_time_expr >= start_dt)
+    if end_date:
+        end_dt = datetime.combine(end_date, time.min, tzinfo=timezone.utc) + offset_delta + timedelta(days=1)
+        filters.append(event_time_expr < end_dt)
+
+    total_stmt = select(func.count(SourceItem.id)).where(*filters)
+    total = (await session.execute(total_stmt)).scalar_one()
+
+    stmt = (
+        select(SourceItem)
+        .where(*filters)
+        .order_by(SourceItem.event_time_utc.desc().nulls_last(), SourceItem.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    result = await session.execute(stmt)
+    items: list[SourceItem] = list(result.scalars().all())
+
+    captions: dict[UUID, str] = {}
+    context_summaries: dict[UUID, str] = {}
+    preview_keys: dict[UUID, str] = {}
+    keyframe_keys: dict[UUID, str] = {}
+    if items:
+        item_ids = [item.id for item in items]
+        caption_stmt = select(ProcessedContent.item_id, ProcessedContent.data).where(
+            ProcessedContent.item_id.in_(item_ids),
+            ProcessedContent.content_role == "caption",
+        )
+        caption_rows = await session.execute(caption_stmt)
+        captions = {
+            row.item_id: (row.data or {}).get("text")
+            for row in caption_rows.fetchall()
+            if row.data
+        }
+
+        context_stmt = select(ProcessedContext).where(
+            ProcessedContext.user_id == user_id,
+            ProcessedContext.is_episode.is_(False),
+            ProcessedContext.source_item_ids.overlap(item_ids),
+        )
+        context_rows = await session.execute(context_stmt)
+        for context in context_rows.scalars().all():
+            for source_id in context.source_item_ids:
+                existing = context_summaries.get(source_id)
+                if existing and context.context_type != "activity_context":
+                    continue
+                if source_id not in context_summaries or context.context_type == "activity_context":
+                    context_summaries[source_id] = context.summary
+
+        preview_stmt = select(DerivedArtifact.source_item_id, DerivedArtifact.payload).where(
+            DerivedArtifact.source_item_id.in_(item_ids),
+            DerivedArtifact.artifact_type == "preview_image",
+        )
+        preview_rows = await session.execute(preview_stmt)
+        for row in preview_rows.fetchall():
+            payload = row.payload or {}
+            if payload.get("status") == "ok" and payload.get("storage_key"):
+                preview_keys[row.source_item_id] = payload["storage_key"]
+
+        keyframe_stmt = select(DerivedArtifact.source_item_id, DerivedArtifact.payload).where(
+            DerivedArtifact.source_item_id.in_(item_ids),
+            DerivedArtifact.artifact_type == "keyframes",
+        )
+        keyframe_rows = await session.execute(keyframe_stmt)
+        for row in keyframe_rows.fetchall():
+            payload = row.payload or {}
+            if not isinstance(payload, dict):
+                continue
+            poster = payload.get("poster")
+            if isinstance(poster, dict) and poster.get("storage_key"):
+                keyframe_keys[row.source_item_id] = poster["storage_key"]
+                continue
+            frames = payload.get("frames")
+            if isinstance(frames, list) and frames:
+                first = frames[0]
+                if isinstance(first, dict) and first.get("storage_key"):
+                    keyframe_keys[row.source_item_id] = first["storage_key"]
+
+    settings = get_settings()
+    storage = get_storage_provider()
+
+    connections: dict[UUID, DataConnection] = {}
+    tokens: dict[UUID, str] = {}
+    if items:
+        connection_ids = [getattr(item, "connection_id", None) for item in items if getattr(item, "connection_id", None)]
+        if connection_ids:
+            conn_rows = await session.execute(select(DataConnection).where(DataConnection.id.in_(connection_ids)))
+            connections = {conn.id: conn for conn in conn_rows.scalars().all()}
+            http_connection_ids = {
+                item.connection_id
+                for item in items
+                if item.connection_id
+                and item.storage_key
+                and item.storage_key.startswith(("http://", "https://"))
+            }
+            google_photos_connections = [
+                connections[conn_id]
+                for conn_id in http_connection_ids
+                if conn_id in connections and connections[conn_id].provider == "google_photos"
+            ]
+            for conn in google_photos_connections:
+                token = await get_valid_access_token(session, conn)
+                if token:
+                    tokens[conn.id] = token
+
+    async def sign_url(storage_key: str) -> Optional[str]:
+        if storage_key.startswith("http://") or storage_key.startswith("https://"):
+            return storage_key
+        try:
+            signed = await asyncio.to_thread(
+                storage.get_presigned_download, storage_key, settings.presigned_url_ttl_seconds
+            )
+        except Exception as exc:  # pragma: no cover - external service dependency
+            logger.warning("Failed to sign download URL for {}: {}", storage_key, exc)
+            return None
+        return signed.get("url") if signed else None
+
+    async def download_url_for(item: SourceItem, storage_override: Optional[str]) -> Optional[str]:
+        storage_key = storage_override or item.storage_key
+        if storage_key.startswith("http://") or storage_key.startswith("https://"):
+            conn_id = getattr(item, "connection_id", None)
+            token = tokens.get(conn_id) if conn_id else None
+            if token:
+                sep = "&" if "?" in storage_key else "?"
+                return f"{storage_key}{sep}access_token={token}"
+            return storage_key
+        try:
+            signed = await asyncio.to_thread(
+                storage.get_presigned_download, storage_key, settings.presigned_url_ttl_seconds
+            )
+        except Exception as exc:  # pragma: no cover - external service dependency
+            logger.warning("Failed to sign download URL for {}: {}", storage_key, exc)
+            return None
+        return signed.get("url") if signed else None
+
+    download_urls: dict[UUID, Optional[str]] = {}
+    if items:
+        signed_list = await asyncio.gather(
+            *(
+                download_url_for(
+                    item,
+                    preview_keys.get(item.id)
+                    if item.item_type == "photo"
+                    and (item.content_type or "").lower() not in WEB_IMAGE_TYPES
+                    else None,
+                )
+                for item in items
+            ),
+            return_exceptions=False,
+        )
+        download_urls = {item.id: url for item, url in zip(items, signed_list)}
+
+    poster_urls: dict[UUID, Optional[str]] = {}
+    poster_candidates = [
+        (item.id, keyframe_keys.get(item.id))
+        for item in items
+        if item.item_type == "video" and keyframe_keys.get(item.id)
+    ]
+    if poster_candidates:
+        poster_signed = await asyncio.gather(
+            *(sign_url(key) for _, key in poster_candidates),
+            return_exceptions=False,
+        )
+        poster_urls = {
+            item_id: url for (item_id, _), url in zip(poster_candidates, poster_signed)
+        }
+
+    return TimelineItemsPage(
+        items=[
+            TimelineItem(
+                id=item.id,
+                item_type=item.item_type,
+                captured_at=(item.event_time_utc or item.captured_at or item.created_at).isoformat(),
+                processed=item.processing_status == "completed",
+                processing_status=item.processing_status,
+                storage_key=item.storage_key,
+                content_type=item.content_type,
+                original_filename=item.original_filename,
+                caption=context_summaries.get(item.id) or captions.get(item.id),
+                download_url=download_urls.get(item.id),
+                poster_url=poster_urls.get(item.id),
+            )
+            for item in items
+        ],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get("/items/{item_id}", response_model=TimelineItemDetail)

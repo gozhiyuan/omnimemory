@@ -13,6 +13,8 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
+    Integer,
     String,
     Text,
     UniqueConstraint,
@@ -226,6 +228,35 @@ class DailySummary(Base):
     user: Mapped[User] = relationship()
 
 
+class AiUsageEvent(Base):
+    __tablename__ = "ai_usage_events"
+    __table_args__ = (
+        Index("ai_usage_events_user_created_idx", "user_id", "created_at"),
+        Index("ai_usage_events_item_created_idx", "item_id", "created_at"),
+        Index("ai_usage_events_model_idx", "model"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"))
+    item_id: Mapped[Optional[UUID]] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("source_items.id", ondelete="SET NULL"), nullable=True
+    )
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    model: Mapped[str] = mapped_column(String(255), nullable=False)
+    step_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    prompt_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    total_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    cost_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("NOW()"), nullable=False
+    )
+
+    user: Mapped[User] = relationship()
+
+
 __all__ = [
     "Base",
     "User",
@@ -235,5 +266,6 @@ __all__ = [
     "DerivedArtifact",
     "ProcessedContext",
     "DailySummary",
+    "AiUsageEvent",
     "DEFAULT_TEST_USER_ID",
 ]

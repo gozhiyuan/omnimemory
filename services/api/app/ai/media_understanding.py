@@ -6,12 +6,14 @@ import asyncio
 import json
 import re
 from typing import Any, Dict, Optional
+from uuid import UUID
 
 from google import genai
 from google.genai import types
 from loguru import logger
 
 from ..config import Settings
+from .usage import log_usage_from_response
 
 
 def _extract_json(text: str) -> Optional[dict]:
@@ -58,6 +60,9 @@ async def _generate_content(
     timeout_seconds: int,
     media_bytes: bytes | None = None,
     content_type: str | None = None,
+    user_id: UUID | str | None = None,
+    item_id: UUID | str | None = None,
+    step_name: str = "media_understanding",
 ) -> Dict[str, Any]:
     api_key = settings.gemini_api_key
     if not api_key:
@@ -94,6 +99,14 @@ async def _generate_content(
         return {"status": "error", "error": str(exc), "raw_text": ""}
 
     raw_text = getattr(response, "text", "") or ""
+    log_usage_from_response(
+        response,
+        user_id=user_id,
+        item_id=item_id,
+        provider="gemini",
+        model=model,
+        step_name=step_name,
+    )
     return {"status": "ok", "raw_text": raw_text}
 
 
@@ -102,6 +115,10 @@ async def analyze_video_with_gemini(
     prompt: str,
     settings: Settings,
     content_type: str | None = None,
+    *,
+    user_id: UUID | str | None = None,
+    item_id: UUID | str | None = None,
+    step_name: str = "video_understanding",
 ) -> Dict[str, Any]:
     provider = settings.video_understanding_provider
     if provider == "none":
@@ -118,6 +135,9 @@ async def analyze_video_with_gemini(
         timeout_seconds=settings.video_understanding_timeout_seconds,
         media_bytes=video_bytes,
         content_type=content_type or "video/mp4",
+        user_id=user_id,
+        item_id=item_id,
+        step_name=step_name,
     )
     raw_text = response.get("raw_text", "")
     parsed = _extract_json(raw_text) if raw_text else None
@@ -134,6 +154,10 @@ async def analyze_audio_with_gemini(
     prompt: str,
     settings: Settings,
     content_type: str | None = None,
+    *,
+    user_id: UUID | str | None = None,
+    item_id: UUID | str | None = None,
+    step_name: str = "audio_understanding",
 ) -> Dict[str, Any]:
     provider = settings.audio_understanding_provider
     if provider == "none":
@@ -150,6 +174,9 @@ async def analyze_audio_with_gemini(
         timeout_seconds=settings.audio_understanding_timeout_seconds,
         media_bytes=audio_bytes,
         content_type=content_type or "audio/mpeg",
+        user_id=user_id,
+        item_id=item_id,
+        step_name=step_name,
     )
     raw_text = response.get("raw_text", "")
     parsed = _extract_json(raw_text) if raw_text else None
@@ -168,6 +195,10 @@ async def summarize_text_with_gemini(
     temperature: float,
     max_output_tokens: int,
     timeout_seconds: int,
+    *,
+    user_id: UUID | str | None = None,
+    item_id: UUID | str | None = None,
+    step_name: str = "text_summary",
 ) -> Dict[str, Any]:
     response = await _generate_content(
         prompt=prompt,
@@ -177,6 +208,9 @@ async def summarize_text_with_gemini(
         max_output_tokens=max_output_tokens,
         timeout_seconds=timeout_seconds,
         media_bytes=None,
+        user_id=user_id,
+        item_id=item_id,
+        step_name=step_name,
     )
     raw_text = response.get("raw_text", "")
     parsed = _extract_json(raw_text) if raw_text else None

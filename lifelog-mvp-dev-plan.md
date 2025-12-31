@@ -193,69 +193,65 @@
 - Harden existing ingest flows (manual upload + Google Photos Picker)
 - Implement versioned artifacts, dedupe gates, and canonical timestamps
 - Implement image multi-context extraction + context-level Qdrant indexing
-- Lay the foundation for video/audio pipelines (artifacts first)
-- Prepare episode merge + daily summaries (Week 4→5 bridge)
+- Ship video/audio pipelines with chunked Gemini understanding, keyframes, and transcripts
+- Ship episode merge + daily summaries (embedded + searchable)
 
 ### Tasks
 
-**Week 3 (current): Ingestion core (artifacts → contexts → embeddings)**
+**Week 3 (implemented): Ingestion core (artifacts → contexts → embeddings)**
 
 Reference: `docs/minecontext/lifelog_ingestion_rag_design.md`
 
-1) **Confirm and document what’s already working**
-   - [ ] Manual uploads enqueue via `POST /upload/ingest` and complete a worker task.
-   - [ ] Google Photos OAuth + Picker session works and enqueues ingestion jobs.
+- [x] Manual uploads flow: `POST /storage/upload-url` → `PUT <signed url>` → `POST /upload/ingest` with optional `captured_at` + `client_tz_offset_minutes`.
+- [x] Google Photos Picker sync: OAuth + session ingest (`integrations.google_photos.sync`) writes originals into Supabase and enqueues pipeline.
+- [x] Schema migrations shipped:
+  - `002_ingestion_core.sql`: `event_time_utc`, `content_hash`, `phash`, `derived_artifacts`, `processed_contexts`.
+  - `003_dedup_canonical.sql`: `canonical_item_id` for dedupe linkage.
+  - `004_ai_usage_events.sql`: token usage capture for dashboard spend stats.
+- [x] Modular pipeline in `services/api/app/pipeline/` with versioned steps and `input_fingerprint` caching:
+  - `fetch_blob`, `content_hash`, `metadata`, `media_metadata`, `exif`, `preview`, `phash`,
+    `event_time`, `dedupe`, `geocode`, `caption`, `keyframes`, `media_chunk_understanding`,
+    `media_summary`, `transcript_context`, `generic_context`, `contexts`, `embeddings`.
+- [x] Canonical timestamp priority: EXIF/container → provider metadata → request `captured_at`
+  → server time, with `event_time_source` + confidence stored. Naive EXIF uses the
+  `client_tz_offset_minutes` from the upload request.
+- [x] Dedupe gates: SHA256 `content_hash` + near-dup `pHash` with window/hamming settings;
+  `PIPELINE_REPROCESS_DUPLICATES` controls whether expensive steps rerun.
+- [x] Image pipeline v2:
+  - HEIC/HEIF preview fallback for browser-friendly thumbnails.
+  - Gemini VLM prompt `lifelog_image_analysis_v2` with full taxonomy + user-perspective phrasing.
+  - Contexts stored in `processed_contexts` with `vector_text` for embeddings.
+- [x] Qdrant indexing by **context_id** (payload includes `user_id`, `context_type`, `event_time_utc`,
+  `source_item_ids`, `is_episode`). `/search` returns context hits for items + episodes + daily summaries.
+- [x] Token usage tracking: Gemini calls log `usage_metadata` into `ai_usage_events`; `/dashboard/stats`
+  returns `usage_this_week`, `usage_all_time`, and `usage_daily` series.
+- [x] Backfill + cleanup:
+  - Pipeline backfill task (`maintenance.backfill_pipeline`) for missing artifacts/embeddings.
+  - Episodes-only backfill (`episodes.backfill`) for post-hoc episode creation.
+  - Timeline delete endpoint removes storage + Qdrant + episode/daily summary updates.
 
-2) **Schema migrations (enable timeline alignment + dedupe + contexts)**
-   - [ ] Extend `source_items` with: `provider`, `external_id`, `content_hash`, `phash`, `event_time_utc`, `event_time_source`, `event_time_confidence` (and `processing_error` if missing).
-   - [ ] Add `derived_artifacts` (or evolve `processed_content`) to store versioned step outputs with `producer_version` + `input_fingerprint`.
-   - [ ] Add `processed_contexts` to store 1..N contexts per item plus merged episode contexts later.
+**Week 4 (implemented): Video/audio foundations + episode merge**
 
-3) **Pipeline modularization (so you can swap/upgrade steps)**
-   - [ ] Create `services/api/app/pipeline/` with a small step interface: `name`, `version`, `run(item, artifacts, config)`.
-   - [ ] Refactor `services/api/app/tasks/process_item.py` to:
-     - run shared pre-processing steps for all items
-     - route into per-type steps (`photo|video|audio|document`)
-     - persist artifacts/contexts incrementally
-     - be idempotent (safe retry) and cacheable (skip recomputation using `input_fingerprint`)
-
-4) **Canonical timestamp normalization (timeline correctness)**
-   - [ ] Implement `event_time_utc` selection priority: EXIF/container → provider metadata → request `captured_at` → server time.
-   - [ ] Store `event_time_source` + `event_time_confidence`.
-
-5) **Dedup gates (cost control; required for future devices)**
-   - [ ] Exact dedup: compute `content_hash` (SHA256); if duplicate, link to canonical and skip expensive steps.
-   - [ ] Near-dup for images: compute `pHash` and compare within a rolling window; mark redundant items and skip VLM (configurable).
-
-6) **Image pipeline v1 (multi-context extraction)**
-   - [ ] OCR step (configurable backend; start with a placeholder or simple implementation).
-   - [ ] VLM batch analysis using `lifelog_image_analysis_v1` (see prompt templates in the design doc).
-   - [ ] Parse VLM JSON → write `processed_contexts` (require `activity_context` per image; add others as present).
-   - [ ] Semantic merge hook (design now; implement merge in Week 4): `lifelog_semantic_merging_v1`.
-
-7) **Embeddings + Qdrant indexing (context IDs)**
-   - [ ] Embed `processed_contexts.vector_text` and upsert to Qdrant using **context_id**.
-   - [ ] Store filterable payload: `user_id`, `context_type`, `event_time_utc`, `source_item_ids`, `entities`.
-   - [ ] Update `/search` to search contexts (not raw items) and return context IDs + citations.
-
-8) **API/UI wiring validation**
-   - [ ] Timeline uses `event_time_utc` and shows context-derived title/summary (fallback to legacy caption).
-   - [ ] Add a small “processing inspector” view (optional): show derived artifacts + contexts per item for debugging.
-
-**Week 4: Video/audio foundations + episode merge**
-
-9) **Video artifacts first**
-   - [ ] Extract technical metadata + keyframes/scenes (bounded max frames per video).
-   - [ ] Extract audio track and run transcription (timestamps; diarization optional).
-   - [ ] Generate contexts from keyframes + transcript and upsert context vectors.
-
-10) **Audio pipeline v1**
-   - [ ] Transcribe with timestamps; chunk transcript for embeddings.
-   - [ ] Extract entities/topics; create `social_context`/`knowledge_context` where appropriate.
-
-11) **Episode merge job + daily summaries**
-   - [ ] Implement an episode clustering job (time window + merge prompt) that creates episode contexts (`is_episode=true`).
-   - [ ] Implement daily summary generation based on episode contexts; embed and index daily summaries for fast broad retrieval.
+- [x] Media guards: size/duration bounds (`media_max_bytes=1GB`, `video_max_duration_sec=300`,
+  `audio_max_duration_sec=3600`, `video_understanding_max_duration_sec=1200`).
+- [x] Keyframes + poster:
+  - Scene detection with interval fallback (`video_keyframe_mode=scene`, `video_keyframe_interval_sec=5`).
+  - Always capture a `t=0` poster and prefer it for `poster_url`.
+  - Keyframes stored under `derived_artifacts` with `poster` + `frames` storage keys.
+- [x] Chunked Gemini understanding for video/audio:
+  - Chunks target 10MB (`media_chunk_target_bytes=10_000_000`), 60s for video, 300s for audio.
+  - Audio chunks normalized to 16kHz mono; Gemini returns **both transcript + contexts per chunk**.
+  - Transcript segments stored in `processed_content` + derived artifacts (size-capped with storage fallback).
+- [x] Episode merge + semantic cleanup:
+  - Item-level contexts cleaned via semantic merge (Jaccard threshold).
+  - Episodes built via time gap + similarity; stored as `processed_contexts.is_episode=true`.
+  - Episode summaries can be re-generated with Gemini and re-embedded.
+- [x] Daily summaries:
+  - Generated from episode contexts, stored as `processed_contexts` (`context_type=daily_summary`).
+  - Embedded and searchable; shown in Timeline day view.
+- [x] UI wiring:
+  - Timeline shows episodes + drill-down items, posters for video, daily summary card, search, and upload-for-date.
+  - Dashboard shows AI usage totals + usage daily chart.
 
 **Lifecycle & Retention Jobs**
 - [ ] Create `enforce_storage_lifecycle` Celery task:
@@ -322,10 +318,10 @@ Reference: `docs/minecontext/lifelog_ingestion_rag_design.md`
 
 ### Deliverables
 - ✅ Upload/Google Photos ingestion stays functional while the pipeline is upgraded
-- ✅ Every ingested item has a canonical `event_time_utc` and dedupe signals (`content_hash`, optional `pHash`)
-- ✅ Images produce 1..N `processed_contexts` (at minimum `activity_context`) and are indexed in Qdrant by context ID
-- ✅ Search returns context-level hits with timestamps + citations
-- ✅ Video/audio pipelines produce at least artifacts + first contexts (Week 4), ready for episode merge/daily summaries (Week 5)
+- ✅ Every ingested item has canonical `event_time_utc` + dedupe signals (`content_hash`, optional `pHash`)
+- ✅ Images, videos, and audio produce 1..N `processed_contexts` (min `activity_context`) indexed in Qdrant
+- ✅ Chunked Gemini understanding + transcripts for video/audio, with keyframes + poster artifacts
+- ✅ Episodes + daily summaries are generated, embedded, searchable, and shown in Timeline
 
 ---
 
@@ -1434,6 +1430,14 @@ User question: {query}"""
 
 ## Post-MVP: Next Steps
 
+### Summary (Post-MVP scope at a glance)
+- Identity & personalization: people/voice enrollment, matching, review flow
+- Ingestion expansion: desktop capture, Drive/Oura/Apple Photos, ESP32 device ingest
+- Lifecycle + cost controls: storage retention, budget guardrails, monitoring
+- Live data access (MCP): tool routing + cached live context
+- Memory graph + analytics: richer entity/episode intelligence
+- Platform expansion: mobile apps, sharing, developer API
+
 ### Immediate Priorities (Week 13+)
 1. Analyze pilot user feedback
 2. Fix critical bugs and UX issues
@@ -1441,6 +1445,28 @@ User question: {query}"""
 4. Add most requested features
 
 ### Ingestion Expansion (Post-MVP)
+
+**Photo Pipeline Enhancements (Post-MVP)**
+- [ ] EXIF timezone fallback: infer timezone when OffsetTimeOriginal is missing (e.g., GPS/timezone database or user profile)
+- [ ] EXIF/XMP sidecar support for GPS/time when metadata is stored outside the image file
+- [ ] Preview/thumbnail generation for all photo formats (not just HEIF)
+- [ ] Geocode VLM-derived location names when GPS is missing (normalize to lat/lng + address)
+
+**People + Voice Identity (Post-MVP, opt-in)**
+
+**Faces in photos/videos: enroll → embed → match → confirm**
+- [ ] People setup flow: “Add Me” + optional family members; upload 3–10 photos or pick from library.
+- [ ] Compute face embeddings per detected face; store per-person profile vectors (no model training).
+- [ ] Ingestion: detect faces in photos + video keyframes, embed, match against profiles with a similarity threshold.
+- [ ] Unknown/low-confidence faces grouped for review.
+- [ ] Review UI: user assigns names; confirmed embeddings are added to the person profile (or centroid updated).
+
+**Voices in audio/videos: diarize → embed → match → confirm**
+- [ ] Voice setup flow: record 20–60s prompts for user + optional family voices.
+- [ ] Store speaker embeddings per person.
+- [ ] Ingestion: ASR → diarization → speaker embeddings; match against enrolled voices.
+- [ ] Unknown speakers surfaced with short clips + transcript snippets for confirmation.
+- [ ] Confirmed segments update the speaker profile vectors.
 
 **Desktop Capture App (macOS first)**
 - [ ] Build a lightweight menubar app that captures screenshots every 30s while the screen is active (idle detection + pause toggle)

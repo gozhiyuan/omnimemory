@@ -32,6 +32,11 @@ class FakeResult:
     def scalar_one(self):
         return self._scalar
 
+    def one(self):
+        if self._rows:
+            return self._rows[0]
+        return self._scalar
+
 
 class FakeSession:
     def __init__(self, results):
@@ -53,6 +58,7 @@ def test_timeline_groups_items_and_signs_urls(monkeypatch):
         id=item_id,
         item_type="photo",
         captured_at=captured_at,
+        event_time_utc=captured_at,
         created_at=captured_at,
         processing_status="completed",
         storage_key="uploads/ui/example.png",
@@ -65,6 +71,11 @@ def test_timeline_groups_items_and_signs_urls(monkeypatch):
         [
             FakeResult(scalars=[item]),
             FakeResult(rows=[caption_row]),
+            FakeResult(scalars=[]),
+            FakeResult(rows=[]),
+            FakeResult(rows=[]),
+            FakeResult(scalars=[]),
+            FakeResult(scalars=[]),
         ]
     )
 

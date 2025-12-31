@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from uuid import UUID
 
 import asyncio
@@ -15,7 +15,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
 from ..config import get_settings
-from ..db.models import DEFAULT_TEST_USER_ID, DataConnection, ProcessedContent, SourceItem
+from ..db.models import (
+    DEFAULT_TEST_USER_ID,
+    AiUsageEvent,
+    DataConnection,
+    DerivedArtifact,
+    ProcessedContent,
+    ProcessedContext,
+    SourceItem,
+)
 from ..db.session import get_session
 from ..google_photos import get_valid_access_token
 from ..storage import get_storage_provider
@@ -39,6 +47,20 @@ class DashboardRecentItem(BaseModel):
     original_filename: Optional[str] = None
     caption: Optional[str] = None
     download_url: Optional[str] = None
+    poster_url: Optional[str] = None
+
+
+class UsageTotals(BaseModel):
+    prompt_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cost_usd: float
+
+
+class UsageDailyPoint(BaseModel):
+    date: date
+    total_tokens: int
+    cost_usd: float
 
 
 class DashboardStats(BaseModel):
@@ -50,16 +72,36 @@ class DashboardStats(BaseModel):
     storage_used_bytes: int
     recent_items: list[DashboardRecentItem]
     activity: list[DashboardActivityPoint]
+    usage_this_week: UsageTotals
+    usage_all_time: UsageTotals
+    usage_daily: list[UsageDailyPoint]
+
+
+def _build_date_range(start_day: date, end_day: date) -> list[date]:
+    days: list[date] = []
+    cursor = start_day
+    while cursor <= end_day:
+        days.append(cursor)
+        cursor += timedelta(days=1)
+    return days
 
 
 @router.get("/stats", response_model=DashboardStats)
 async def get_dashboard_stats(
     user_id: UUID = DEFAULT_TEST_USER_ID,
     session: AsyncSession = Depends(get_session),
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
 ) -> DashboardStats:
     """Return aggregate counts used by the dashboard cards."""
 
     since = datetime.utcnow() - timedelta(days=7)
+    range_end = end_date or date.today()
+    range_start = start_date or (range_end - timedelta(days=6))
+    if range_start > range_end:
+        range_start, range_end = range_end, range_start
+    range_start_dt = datetime.combine(range_start, time.min, tzinfo=timezone.utc)
+    range_end_dt = datetime.combine(range_end, time.min, tzinfo=timezone.utc) + timedelta(days=1)
     total_items_stmt = select(func.count(SourceItem.id)).where(
         SourceItem.user_id == user_id,
         SourceItem.processing_status == "completed",
@@ -93,7 +135,7 @@ async def get_dashboard_stats(
             SourceItem.user_id == user_id,
             SourceItem.processing_status == "completed",
         )
-        .order_by(SourceItem.created_at.desc())
+        .order_by(SourceItem.event_time_utc.desc().nulls_last(), SourceItem.created_at.desc())
         .limit(5)
     )
 
@@ -102,7 +144,40 @@ async def get_dashboard_stats(
         .where(
             SourceItem.user_id == user_id,
             SourceItem.processing_status == "completed",
-            SourceItem.created_at >= since,
+            SourceItem.created_at >= range_start_dt,
+            SourceItem.created_at < range_end_dt,
+        )
+        .group_by("day")
+        .order_by("day")
+    )
+
+    usage_week_stmt = select(
+        func.coalesce(func.sum(AiUsageEvent.prompt_tokens), 0).label("prompt_tokens"),
+        func.coalesce(func.sum(AiUsageEvent.output_tokens), 0).label("output_tokens"),
+        func.coalesce(func.sum(AiUsageEvent.total_tokens), 0).label("total_tokens"),
+        func.coalesce(func.sum(AiUsageEvent.cost_usd), 0.0).label("cost_usd"),
+    ).where(
+        AiUsageEvent.user_id == user_id,
+        AiUsageEvent.created_at >= since,
+    )
+
+    usage_all_time_stmt = select(
+        func.coalesce(func.sum(AiUsageEvent.prompt_tokens), 0).label("prompt_tokens"),
+        func.coalesce(func.sum(AiUsageEvent.output_tokens), 0).label("output_tokens"),
+        func.coalesce(func.sum(AiUsageEvent.total_tokens), 0).label("total_tokens"),
+        func.coalesce(func.sum(AiUsageEvent.cost_usd), 0.0).label("cost_usd"),
+    ).where(AiUsageEvent.user_id == user_id)
+
+    usage_daily_stmt = (
+        select(
+            func.date(AiUsageEvent.created_at).label("day"),
+            func.coalesce(func.sum(AiUsageEvent.total_tokens), 0).label("total_tokens"),
+            func.coalesce(func.sum(AiUsageEvent.cost_usd), 0.0).label("cost_usd"),
+        )
+        .where(
+            AiUsageEvent.user_id == user_id,
+            AiUsageEvent.created_at >= range_start_dt,
+            AiUsageEvent.created_at < range_end_dt,
         )
         .group_by("day")
         .order_by("day")
@@ -115,13 +190,19 @@ async def get_dashboard_stats(
     uploads_last_7_days = (await session.execute(uploads_last_week_stmt)).scalar_one()
     storage_used_bytes = (await session.execute(storage_sum_stmt)).scalar_one() or 0
 
+    usage_week_row = (await session.execute(usage_week_stmt)).one()
+    usage_all_time_row = (await session.execute(usage_all_time_stmt)).one()
+
     recent_items_result = await session.execute(recent_items_stmt)
     recent_items = list(recent_items_result.scalars().all())
 
     captions: dict[UUID, str] = {}
+    context_summaries: dict[UUID, str] = {}
+    keyframe_keys: dict[UUID, str] = {}
     if recent_items:
+        recent_ids = [item.id for item in recent_items]
         caption_stmt = select(ProcessedContent.item_id, ProcessedContent.data).where(
-            ProcessedContent.item_id.in_([item.id for item in recent_items]),
+            ProcessedContent.item_id.in_(recent_ids),
             ProcessedContent.content_role == "caption",
         )
         caption_rows = await session.execute(caption_stmt)
@@ -130,6 +211,39 @@ async def get_dashboard_stats(
             for row in caption_rows.fetchall()
             if row.data
         }
+
+        context_stmt = select(ProcessedContext).where(
+            ProcessedContext.user_id == user_id,
+            ProcessedContext.is_episode.is_(False),
+            ProcessedContext.source_item_ids.overlap(recent_ids),
+        )
+        context_rows = await session.execute(context_stmt)
+        for context in context_rows.scalars().all():
+            for source_id in context.source_item_ids:
+                existing = context_summaries.get(source_id)
+                if existing and context.context_type != "activity_context":
+                    continue
+                if source_id not in context_summaries or context.context_type == "activity_context":
+                    context_summaries[source_id] = context.summary
+
+        keyframe_stmt = select(DerivedArtifact.source_item_id, DerivedArtifact.payload).where(
+            DerivedArtifact.source_item_id.in_(recent_ids),
+            DerivedArtifact.artifact_type == "keyframes",
+        )
+        keyframe_rows = await session.execute(keyframe_stmt)
+        for row in keyframe_rows.fetchall():
+            payload = row.payload or {}
+            if not isinstance(payload, dict):
+                continue
+            poster = payload.get("poster")
+            if isinstance(poster, dict) and poster.get("storage_key"):
+                keyframe_keys[row.source_item_id] = poster["storage_key"]
+                continue
+            frames = payload.get("frames")
+            if isinstance(frames, list) and frames:
+                first = frames[0]
+                if isinstance(first, dict) and first.get("storage_key"):
+                    keyframe_keys[row.source_item_id] = first["storage_key"]
 
     settings = get_settings()
     storage = get_storage_provider()
@@ -163,7 +277,20 @@ async def get_dashboard_stats(
             return None
         return signed.get("url") if signed else None
 
+    async def sign_storage_key(storage_key: str) -> Optional[str]:
+        if storage_key.startswith("http://") or storage_key.startswith("https://"):
+            return storage_key
+        try:
+            signed = await asyncio.to_thread(
+                storage.get_presigned_download, storage_key, settings.presigned_url_ttl_seconds
+            )
+        except Exception as exc:  # pragma: no cover - external service dependency
+            logger.warning("Failed to sign download URL for {}: {}", storage_key, exc)
+            return None
+        return signed.get("url") if signed else None
+
     download_urls: dict[UUID, Optional[str]] = {}
+    poster_urls: dict[UUID, Optional[str]] = {}
     if recent_items:
         signed_list = await asyncio.gather(
             *(build_url(item) for item in recent_items),
@@ -171,12 +298,44 @@ async def get_dashboard_stats(
         )
         download_urls = {item.id: url for item, url in zip(recent_items, signed_list)}
 
+        poster_candidates = [
+            (item.id, keyframe_keys.get(item.id))
+            for item in recent_items
+            if item.item_type == "video" and keyframe_keys.get(item.id)
+        ]
+        if poster_candidates:
+            poster_signed = await asyncio.gather(
+                *(sign_storage_key(key) for _, key in poster_candidates),
+                return_exceptions=False,
+            )
+            poster_urls = {
+                item_id: url for (item_id, _), url in zip(poster_candidates, poster_signed)
+            }
+
     activity_rows = await session.execute(activity_stmt)
     activity_by_day = {row.day: row[1] for row in activity_rows.fetchall()}
     activity: list[DashboardActivityPoint] = []
-    for i in range(6, -1, -1):
-        day = (date.today() - timedelta(days=i))
+    for day in _build_date_range(range_start, range_end):
         activity.append(DashboardActivityPoint(date=day, count=activity_by_day.get(day, 0)))
+
+    usage_rows = await session.execute(usage_daily_stmt)
+    usage_by_day = {
+        row.day: {
+            "total_tokens": row.total_tokens or 0,
+            "cost_usd": float(row.cost_usd or 0),
+        }
+        for row in usage_rows.fetchall()
+    }
+    usage_daily: list[UsageDailyPoint] = []
+    for day in _build_date_range(range_start, range_end):
+        usage = usage_by_day.get(day, {"total_tokens": 0, "cost_usd": 0.0})
+        usage_daily.append(
+            UsageDailyPoint(
+                date=day,
+                total_tokens=int(usage["total_tokens"]),
+                cost_usd=float(usage["cost_usd"]),
+            )
+        )
 
     return DashboardStats(
         total_items=total_items,
@@ -189,15 +348,29 @@ async def get_dashboard_stats(
             DashboardRecentItem(
                 id=item.id,
                 item_type=item.item_type,
-                captured_at=(item.captured_at or item.created_at).isoformat(),
+                captured_at=(item.event_time_utc or item.captured_at or item.created_at).isoformat(),
                 processed=item.processing_status == "completed",
                 storage_key=item.storage_key,
                 content_type=item.content_type,
                 original_filename=item.original_filename,
-                caption=captions.get(item.id),
+                caption=context_summaries.get(item.id) or captions.get(item.id),
                 download_url=download_urls.get(item.id),
+                poster_url=poster_urls.get(item.id),
             )
             for item in recent_items
         ],
         activity=activity,
+        usage_this_week=UsageTotals(
+            prompt_tokens=int(usage_week_row.prompt_tokens or 0),
+            output_tokens=int(usage_week_row.output_tokens or 0),
+            total_tokens=int(usage_week_row.total_tokens or 0),
+            cost_usd=float(usage_week_row.cost_usd or 0),
+        ),
+        usage_all_time=UsageTotals(
+            prompt_tokens=int(usage_all_time_row.prompt_tokens or 0),
+            output_tokens=int(usage_all_time_row.output_tokens or 0),
+            total_tokens=int(usage_all_time_row.total_tokens or 0),
+            cost_usd=float(usage_all_time_row.cost_usd or 0),
+        ),
+        usage_daily=usage_daily,
     )

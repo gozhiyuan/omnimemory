@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { UploadCloud, CheckCircle2, FileImage, X, AlertCircle, ChevronDown } from 'lucide-react';
+import { UploadCloud, CheckCircle2, FileImage, X, AlertCircle, ChevronDown, FileText, Mic, Play, Video } from 'lucide-react';
 import { apiGet, apiPost } from '../services/api';
 import {
   GooglePhotosAuthUrlResponse,
@@ -42,6 +42,30 @@ export const UploadManager: React.FC = () => {
     if (file.type.startsWith('video/')) return 'video';
     if (file.type.startsWith('audio/')) return 'audio';
     return 'document';
+  };
+
+  const getMediaDuration = (file: File): Promise<number | null> => {
+    if (!file.type.startsWith('video/') && !file.type.startsWith('audio/')) {
+      return Promise.resolve(null);
+    }
+    return new Promise((resolve) => {
+      const url = URL.createObjectURL(file);
+      const media = document.createElement(file.type.startsWith('video/') ? 'video' : 'audio');
+      const cleanup = () => {
+        URL.revokeObjectURL(url);
+      };
+      media.preload = 'metadata';
+      media.onloadedmetadata = () => {
+        const duration = Number.isFinite(media.duration) ? media.duration : null;
+        cleanup();
+        resolve(duration);
+      };
+      media.onerror = () => {
+        cleanup();
+        resolve(null);
+      };
+      media.src = url;
+    });
   };
 
   const handleDrag = (e: React.DragEvent) => {
@@ -122,11 +146,15 @@ export const UploadManager: React.FC = () => {
           );
         }
 
+        const durationSec = await getMediaDuration(file);
         await apiPost<IngestResponse>('/upload/ingest', {
           storage_key: uploadMeta.key,
           item_type: inferItemType(file),
           content_type: contentType,
           original_filename: file.name,
+          size_bytes: file.size,
+          duration_sec: durationSec,
+          client_tz_offset_minutes: new Date().getTimezoneOffset(),
         });
 
         setUploadedCount((count) => count + 1);
@@ -302,7 +330,7 @@ export const UploadManager: React.FC = () => {
               multiple 
               className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
               onChange={handleChange}
-              accept="image/*,video/*"
+              accept="image/*,video/*,audio/*"
             />
             <div className="p-4 bg-white rounded-full shadow-sm mb-4 pointer-events-none">
               <UploadCloud className={`w-8 h-8 ${dragActive ? 'text-primary-600' : 'text-slate-400'}`} />
@@ -311,7 +339,7 @@ export const UploadManager: React.FC = () => {
               Click to upload or drag and drop
             </p>
             <p className="text-xs text-slate-500 mt-2 max-w-xs pointer-events-none">
-              Supported: JPG, PNG, MP4, MOV (Max 5GB per batch)
+              Supported: JPG, PNG, MP4, MOV, MP3, WAV (Max 5GB per batch)
             </p>
           </div>
 
@@ -483,7 +511,32 @@ export const UploadManager: React.FC = () => {
                                   alt={item.original_filename || 'Google Photos thumbnail'}
                                   className="w-12 h-12 rounded-md object-cover border border-slate-200"
                                 />
-                              ) : null}
+                              ) : item.item_type === 'video' && item.poster_url ? (
+                                <div className="relative">
+                                  <img
+                                    src={item.poster_url}
+                                    alt={item.original_filename || 'Video preview'}
+                                    className="w-12 h-12 rounded-md object-cover border border-slate-200"
+                                  />
+                                  <span className="absolute inset-0 flex items-center justify-center text-white">
+                                    <span className="flex items-center justify-center w-6 h-6 rounded-full bg-black/60">
+                                      <Play className="w-3 h-3" />
+                                    </span>
+                                  </span>
+                                </div>
+                              ) : item.item_type === 'video' ? (
+                                <div className="w-12 h-12 rounded-md border border-slate-200 flex items-center justify-center text-slate-400">
+                                  <Video className="w-5 h-5" />
+                                </div>
+                              ) : item.item_type === 'audio' ? (
+                                <div className="w-12 h-12 rounded-md border border-slate-200 flex items-center justify-center text-slate-400">
+                                  <Mic className="w-5 h-5" />
+                                </div>
+                              ) : (
+                                <div className="w-12 h-12 rounded-md border border-slate-200 flex items-center justify-center text-slate-400">
+                                  <FileText className="w-5 h-5" />
+                                </div>
+                              )}
                               <div>
                                 <p className="text-slate-800 font-medium">
                                   {item.original_filename || item.storage_key}

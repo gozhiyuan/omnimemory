@@ -11,12 +11,13 @@ from loguru import logger
 import re
 from pathlib import Path
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, or_
 
 from ..celery_app import celery_app
 from ..db.models import DEFAULT_TEST_USER_ID, DataConnection, SourceItem, User
 from ..db.session import isolated_session
 from ..google_photos import (
+    extract_picker_location,
     extract_picker_media_fields,
     fetch_picker_media_item,
     fetch_picker_media_items,
@@ -59,6 +60,14 @@ def _infer_filename(media_id: str, filename: Optional[str], mime_type: Optional[
     return _safe_filename(media_id + ext)
 
 
+def _build_download_url(base_url: str, mime_type: Optional[str]) -> str:
+    if not base_url:
+        return base_url
+    suffix = "dv" if mime_type and mime_type.startswith("video/") else "d"
+    base = base_url.split("=", 1)[0]
+    return f"{base}={suffix}"
+
+
 async def _fetch_media_items(access_token: str, session_id: str) -> list[dict[str, Any]]:
     items = await fetch_picker_media_items(access_token, session_id)
     return [item for item in items if isinstance(item, dict)]
@@ -79,6 +88,7 @@ async def _ingest_media_item(
     if not media_id:
         return None
     base_url, filename, mime_type, creation_time = extract_picker_media_fields(item)
+    provider_location = extract_picker_location(item)
     if not base_url:
         try:
             hydrated = await fetch_picker_media_item(access_token, session_id, media_id)
@@ -86,6 +96,8 @@ async def _ingest_media_item(
             logger.warning("Failed to hydrate picker item {}: {}", media_id, exc)
             hydrated = {}
         base_url, _, mime_type, creation_time = extract_picker_media_fields(hydrated)
+        if not provider_location:
+            provider_location = extract_picker_location(hydrated)
     if not base_url:
         logger.warning(
             "Skipping media item {} without baseUrl (keys={} session={})",
@@ -94,7 +106,7 @@ async def _ingest_media_item(
             session_id,
         )
         return None
-    download_url = f"{base_url}=d"
+    download_url = _build_download_url(base_url, mime_type)
     storage_key = f"google_photos/{connection.user_id}/{media_id}/{_infer_filename(media_id, filename, mime_type)}"
     mime_type = mime_type or "application/octet-stream"
     captured_at = parse_google_timestamp(creation_time)
@@ -105,7 +117,10 @@ async def _ingest_media_item(
         result = await session.execute(
             select(SourceItem).where(
                 SourceItem.connection_id == connection.id,
-                SourceItem.storage_key.in_([storage_key, download_url]),
+                or_(
+                    SourceItem.external_id == media_id,
+                    SourceItem.storage_key.in_([storage_key, download_url]),
+                ),
             )
         )
         existing = result.scalar_one_or_none()
@@ -113,6 +128,14 @@ async def _ingest_media_item(
             existing.storage_key = storage_key
             existing.content_type = existing.content_type or mime_type
             existing.original_filename = existing.original_filename or filename
+            existing.provider = existing.provider or "google_photos"
+            existing.external_id = existing.external_id or media_id
+            if captured_at and not existing.captured_at:
+                existing.captured_at = captured_at
+            if captured_at and not existing.event_time_utc:
+                existing.event_time_utc = captured_at
+                existing.event_time_source = "provider"
+                existing.event_time_confidence = 0.85
             existing.processing_status = "pending"
             existing.processing_error = None
             existing.updated_at = datetime.now(timezone.utc)
@@ -126,11 +149,16 @@ async def _ingest_media_item(
                 id=uuid4(),
                 user_id=connection.user_id,
                 connection_id=connection.id,
+                provider="google_photos",
+                external_id=media_id,
                 storage_key=storage_key,
                 item_type=_media_item_type(mime_type),
                 content_type=mime_type,
                 original_filename=filename,
                 captured_at=captured_at,
+                event_time_utc=captured_at,
+                event_time_source="provider",
+                event_time_confidence=0.85,
                 processing_status="pending",
             )
             session.add(source_item)
@@ -142,7 +170,7 @@ async def _ingest_media_item(
     # Download and store the media in our storage to survive token revocation.
     headers = {"Authorization": f"Bearer {access_token}"}
     async with httpx.AsyncClient(timeout=60) as client:
-        response = await client.get(download_url, headers=headers)
+        response = await client.get(download_url, headers=headers, follow_redirects=True)
         response.raise_for_status()
         blob = response.content
     storage.store(storage_key, blob, mime_type)
@@ -156,6 +184,7 @@ async def _ingest_media_item(
             "captured_at": captured_at.isoformat() if captured_at else None,
             "content_type": mime_type,
             "original_filename": filename,
+            "provider_location": provider_location,
         }
     )
     return source_item.id

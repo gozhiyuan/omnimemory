@@ -131,6 +131,10 @@ stores derived records in Postgres, and seeds Qdrant. Enqueue a processing job b
 uv run python -c "from app.tasks.process_item import process_item; process_item.delay({'item_id': '...', 'storage_key': '...'})"
 ```
 
+Video/audio processing uses `ffmpeg`/`ffprobe` for metadata, keyframes, and transcription chunking.
+Ensure both binaries are available on your PATH for full media support.
+Uploads are rejected when `MEDIA_MAX_BYTES`, `VIDEO_MAX_DURATION_SEC`, or `AUDIO_MAX_DURATION_SEC` limits are exceeded.
+
 ### Seed ingest flow (`scripts/seed_ingest_flow.py`)
 
 This script exercises presigned uploads + ingest + processing and then verifies counts in Postgres:

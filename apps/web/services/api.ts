@@ -41,3 +41,9 @@ export const apiGet = async <T>(path: string): Promise<T> => apiRequest<T>(path)
 
 export const apiPost = async <T>(path: string, json?: unknown): Promise<T> =>
   apiRequest<T>(path, { method: 'POST', json });
+
+export const apiPatch = async <T>(path: string, json?: unknown): Promise<T> =>
+  apiRequest<T>(path, { method: 'PATCH', json });
+
+export const apiDelete = async <T>(path: string): Promise<T> =>
+  apiRequest<T>(path, { method: 'DELETE' });

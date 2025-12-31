@@ -1,7 +1,7 @@
 # Lifelog AI - MVP Product Requirements Document
 
 > **Status:** MVP-focused version emphasizing core data and memory architecture
-> **Last Updated:** December 29, 2025
+> **Last Updated:** December 31, 2025
 >
 > **Canonical detailed design:** `docs/minecontext/lifelog_ingestion_rag_design.md`
 
@@ -31,6 +31,7 @@ Build an AI-powered personal memory assistant that ingests multimodal data from 
 
 **Measurement & Instrumentation**
 - Supabase event tables + Prometheus counters for ingestion success/failure, latency, and queue depth
+- AI usage events (tokens + cost) logged per model call and surfaced in the Dashboard
 - Frontend feedback modal with structured thumbs-up/down + free-form notes logged per chat turn
 - OpenTelemetry traces stitched across upload → processing → retrieval for p95 latency tracking
 - Weekly metric review dashboard (Metabase) covering completeness, accuracy, retention, and cost per user
@@ -42,38 +43,44 @@ Build an AI-powered personal memory assistant that ingests multimodal data from 
 ### IN SCOPE ✅
 
 **3.1 Data Layer**
-- Manual upload (drag-and-drop or folder selection) for photos, videos, and audio files with batch support
+- Manual upload for photos/videos/audio with batch support and optional time window overrides per day
 - Google Photos connector (OAuth + Picker API): user launches the picker, selects items, we copy the chosen media into Supabase Storage for rendering, and enqueue ingestion; no automated full-library/delta sync (API limitation)
-- Metadata extraction (MVP): content type, file size, EXIF/video container metadata, provider metadata, normalized timestamps (`event_time_utc`)
-- Deduplication (MVP): exact dedup (SHA256) + near-duplicate dedup (pHash for images, signature for video) to control costs for frequent capture sources
+- Metadata extraction (MVP): content type, file size, EXIF/container metadata, provider metadata, normalized timestamps (`event_time_utc`)
+- Deduplication (MVP): exact dedup (SHA256) + near-duplicate dedup for images (pHash) to control costs for frequent capture sources
 - Multi-context extraction per media item (1..N contexts) using a taxonomy (activity/social/location/food/emotion/entity/knowledge)
 
 **3.2 Processing Pipeline**
 - Shared pre-processing: download/fetch bytes, sniff MIME, extract technical metadata, compute `content_hash` and perceptual hash where applicable
 - Image: OCR + VLM batch analysis → 1..N contexts per image → optional semantic merge into episode contexts → text embeddings → Qdrant upsert (context IDs)
-- Video: keyframes/scenes + audio extraction → transcript (timestamps) → VLM analysis on selected frames (+ transcript grounding) → contexts → embeddings → Qdrant upsert
-- Audio: transcript (+ optional diarization) → entities/topics → contexts + transcript chunks → embeddings → Qdrant upsert
-- Document: text extraction + chunking → `knowledge_context` chunks → embeddings → Qdrant upsert
+- Video: keyframes + t=0 poster → chunked Gemini understanding (transcript + contexts per chunk) → contexts → embeddings → Qdrant upsert
+- Audio: chunked Gemini understanding (transcript + contexts per chunk) → contexts → embeddings → Qdrant upsert
+- Document: MVP stores metadata + a generic context (full text extraction is post-MVP)
 - Derived artifacts are versioned and cacheable so reprocessing is possible without re-uploading media (see `docs/minecontext/lifelog_ingestion_rag_design.md`)
+- Media guardrails + tooling (MVP defaults):
+  - Hard limits: `media_max_bytes=1GB`, `video_max_duration_sec=300`, `audio_max_duration_sec=3600`
+  - Gemini request caps enforced: `video_understanding_max_bytes≈19MB`, `audio_understanding_max_bytes≈19MB`
+  - Chunking targets: `media_chunk_target_bytes≈10MB`, `video_chunk_duration_sec=60`, `audio_chunk_duration_sec=300`, `media_chunk_max_chunks=240`
+  - `ffmpeg` is required for media metadata, keyframes, and chunking; if missing, media-understanding steps are skipped
+  - Transcript payloads > `transcription_storage_max_bytes` are stored in object storage and referenced by key
 
 **3.3 Memory Layer**
 - **Vector store (Qdrant):** store embeddings for `processed_contexts` (and optional transcript/doc chunks) keyed by **context_id**
 - **Postgres:** source item metadata + derived artifacts + processed contexts + daily summaries; supports time/entity filtering
 - **Episode contexts:** merge raw contexts into higher-signal “episodes” (time-window clustering + LLM merge decision)
-- **Daily summaries:** nightly job over episode contexts; summary is embedded and indexed for fast “broad” queries
+- **Daily summaries:** updated whenever episodes change (stored as `processed_contexts` with `context_type=daily_summary`); embedded + indexed for fast “broad” queries
 - **Retrieval-first principle:** pre-filter by time/type/entity, then vector search within the filtered set, then synthesize with citations
 
 **3.4 Model Layer**
-- LLM API integration: GPT-4o, Claude 3.5/4, or Gemini for chat and summarization
-- Vision API: GPT-4V or Gemini Vision for image understanding
-- Text embeddings: OpenAI `text-embedding-3-*` or a local embedding model; store vectors in Qdrant
+- LLM/VLM/ASR: Gemini 2.5 Flash-Lite for image/video/audio understanding + summarization
+- Text embeddings: Gemini `gemini-embedding-001` stored in Qdrant
+- Chat (web): Gemini via `@google/genai` with RAG citations
 
 **3.5 Application Layer (Web Only)**
 - User authentication (Supabase Auth: email/password + Google OAuth) gating a single React + Vite SPA shell (`Layout` + `App.tsx` view switcher)
 - **Ingest Tab:** Combined drag-and-drop upload interface and Google Photos connection card with OAuth + Picker launch, selection count, and ingest status
 - **Chat Tab:** Conversational UI with memory-powered responses, source citations, and daily summary context chips
-- **Timeline Tab:** Calendar/timeline visualization of per-day events; clicking a day opens a detail drawer with summaries, thumbnails, video clips, and external (Google Photos) deep links
-- **Dashboard Tab:** Weekly/monthly summaries, ingestion statistics, storage usage, and connected-source health indicators
+- **Timeline Tab:** Day/week/month/year views, episode list with drill-down details, daily summary, search bar, and per-day upload flow
+- **Dashboard Tab:** Ingestion stats, storage usage, connected-source health indicators, and AI usage (tokens + cost) with date-range filtering
 
 **3.6 Infrastructure**
 - **Auth/DB/Storage:** Supabase (Postgres + Auth + Object Storage)
@@ -96,6 +103,7 @@ Build an AI-powered personal memory assistant that ingests multimodal data from 
 - Shareable mini-chatbots
 - Advanced graph visualizations
 - Multi-user collaboration
+- Face/voice identity (enrollment, matching, confirmation)
 
 ---
 
@@ -124,37 +132,37 @@ User-driven ingest (per picker session):
 
 > **Note:** Automated backfill/delta sync is blocked by the Picker API. To achieve passive ingestion later, consider an additional capture path (e.g., ESP32 camera agent) or future connector work once API/permissions allow.
 
-#### Week 3 ingestion pipeline requirements (implementation guidance)
-
-Week 3 is about turning “upload + enqueue” into a robust, reprocessable ingestion pipeline.
+#### MVP ingestion pipeline (current implementation)
 
 1) **Canonical timeline timestamp**
-   - Add `event_time_utc`, `event_time_source`, `event_time_confidence` to `source_items`.
-   - Implement timestamp priority: EXIF/container → provider metadata → client-provided → server receive time.
+   - `event_time_utc`, `event_time_source`, `event_time_confidence` stored on `source_items`.
+   - Priority: EXIF/container → provider metadata → client-provided → server receive time.
+   - Client upload includes `client_tz_offset_minutes` to resolve naive EXIF timestamps.
 
 2) **Dedup gates (cost control)**
    - Exact dedup: `content_hash` (SHA256) per user/provider.
-   - Near-duplicate: `pHash` for images (rolling window) + simple video signatures to skip redundant VLM/ASR.
+   - Near-duplicate: `pHash` for images with rolling-window comparison.
 
 3) **Versioned derived artifacts**
-   - Persist step outputs as versioned artifacts (`derived_artifacts`) with `producer_version` + `input_fingerprint`.
-   - Make the pipeline idempotent (safe retries) and cacheable (skip recomputation).
+   - All step outputs persist as `derived_artifacts` with `producer_version` + `input_fingerprint`.
+   - Pipeline is idempotent and cacheable.
 
-4) **Multi-context extraction (start with images)**
-   - Generate 1..N contexts per media item using the taxonomy in `docs/minecontext/lifelog_ingestion_rag_design.md`.
-   - Require `activity_context` for every image; add `entity/social/location/food/emotion` as detected.
+4) **Multi-context extraction**
+   - Images: OCR + Gemini VLM → 1..N contexts (taxonomy in `docs/minecontext/lifelog_ingestion_rag_design.md`).
+   - Video/audio: chunked Gemini understanding → transcript + contexts per chunk.
 
 5) **Context-level embeddings in Qdrant**
-   - Upsert vectors for `processed_contexts` (context IDs), not raw item IDs.
-   - Include filterable payload fields: `user_id`, `context_type`, `event_time_utc`, `source_item_ids`, `entities`.
+   - Embeddings stored per `processed_contexts` (context IDs).
+   - Payload includes `user_id`, `context_type`, `event_time_utc`, `source_item_ids`, `is_episode`.
 
-6) **Design for episode merge + daily summary (Week 4)**
-   - Define the merge window + prompt contract now so you can add episode contexts and daily summaries without redoing storage/indexing.
+6) **Episodes + daily summaries**
+   - Episodes generated from item contexts (time gap + similarity).
+   - Daily summaries updated when episodes change, stored as `processed_contexts` (`context_type=daily_summary`).
 
 **Storage Strategy:**
-- **Metadata only:** Store photo IDs, timestamps, and provider metadata in your DB
-- **Processed artifacts:** Store captions, embeddings, OCR text in your DB
-- **Original files:** For Google Photos picker selections, copy media into Supabase Storage (preview/original as needed) so the app can render reliably; keep provider IDs for dedupe
+- **Source metadata:** Store provider IDs, timestamps, and normalized metadata in Postgres
+- **Processed artifacts:** Store captions, contexts, OCR text, transcripts, and embeddings metadata in Postgres + Qdrant
+- **Original files:** For Google Photos picker selections and manual uploads, copy media into Supabase Storage (originals + previews/posters) so the app can render reliably; keep provider IDs for dedupe
 
 #### Storage Policy (MVP)
 

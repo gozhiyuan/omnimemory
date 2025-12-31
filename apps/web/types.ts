@@ -31,6 +31,7 @@ export interface TimelineItem {
   item_type: 'photo' | 'video' | 'audio' | 'document';
   captured_at?: string;
   processed: boolean;
+  processing_status?: string;
   storage_key: string;
   content_type?: string | null;
   original_filename?: string | null;
@@ -43,6 +44,30 @@ export interface TimelineDay {
   date: string;
   item_count: number;
   items: TimelineItem[];
+}
+
+export interface TimelineContext {
+  context_type: string;
+  title: string;
+  summary: string;
+  keywords: string[];
+  entities: Array<Record<string, unknown>>;
+  location: Record<string, unknown>;
+  processor_versions: Record<string, unknown>;
+}
+
+export interface TranscriptSegment {
+  start_ms: number;
+  end_ms: number;
+  text: string;
+  status?: string | null;
+  error?: string | null;
+}
+
+export interface TimelineItemDetail extends TimelineItem {
+  contexts: TimelineContext[];
+  transcript_text?: string | null;
+  transcript_segments?: TranscriptSegment[];
 }
 
 export interface DashboardActivityPoint {

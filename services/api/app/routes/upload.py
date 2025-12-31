@@ -42,6 +42,10 @@ class IngestRequest(BaseModel):
         default=None,
         description="Re-run expensive steps even if the item is a duplicate",
     )
+    event_time_override: Optional[bool] = Field(
+        default=None,
+        description="Use the provided captured_at as the event time even if metadata exists",
+    )
 
 
 class IngestResponse(BaseModel):
@@ -87,6 +91,9 @@ async def ingest_item(
     if not request.captured_at:
         event_time_source = "server"
         event_time_confidence = 0.4
+    elif request.event_time_override:
+        event_time_source = "manual"
+        event_time_confidence = 0.95
     source_item = SourceItem(
         id=item_id,
         user_id=request.user_id,
@@ -106,18 +113,20 @@ async def ingest_item(
     await session.commit()
 
     payload = {
-            "item_id": str(item_id),
-            "storage_key": request.storage_key,
-            "item_type": request.item_type.value,
-            "user_id": str(request.user_id),
-            "captured_at": request.captured_at.isoformat() if request.captured_at else None,
-            "content_type": request.content_type,
-            "original_filename": request.original_filename,
-            "size_bytes": request.size_bytes,
-            "duration_sec": request.duration_sec,
+        "item_id": str(item_id),
+        "storage_key": request.storage_key,
+        "item_type": request.item_type.value,
+        "user_id": str(request.user_id),
+        "captured_at": request.captured_at.isoformat() if request.captured_at else None,
+        "content_type": request.content_type,
+        "original_filename": request.original_filename,
+        "size_bytes": request.size_bytes,
+        "duration_sec": request.duration_sec,
     }
     if request.reprocess_duplicates is not None:
         payload["reprocess_duplicates"] = request.reprocess_duplicates
+    if request.event_time_override is not None:
+        payload["event_time_override"] = request.event_time_override
 
     task = process_item.delay(payload)
 

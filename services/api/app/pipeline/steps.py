@@ -737,6 +737,11 @@ class EventTimeStep:
     is_expensive = False
 
     async def run(self, item: SourceItem, artifacts: PipelineArtifacts, config: PipelineConfig) -> None:
+        override_enabled = bool(config.payload.get("event_time_override"))
+        override_time = parse_iso_datetime(config.payload.get("captured_at"))
+        if not override_time and item.captured_at:
+            override_time = item.captured_at
+
         exif_payload = artifacts.get("exif") or {}
         exif_time = parse_iso_datetime(exif_payload.get("event_time_utc"))
         if not exif_time:
@@ -749,7 +754,11 @@ class EventTimeStep:
         event_time: Optional[datetime] = None
         source = None
         confidence = None
-        if exif_time:
+        if override_enabled and override_time:
+            event_time = override_time
+            source = "manual"
+            confidence = 0.95
+        elif exif_time:
             event_time = exif_time
             source = "exif"
             confidence = 0.9 if exif_payload.get("event_time_utc") else 0.75

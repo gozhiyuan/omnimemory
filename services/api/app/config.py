@@ -117,6 +117,14 @@ class Settings(BaseSettings):
     chat_history_limit: int = Field(default=6, ge=0)
     chat_entity_extraction_enabled: bool = True
 
+    # Agent settings
+    agent_enabled: bool = True
+    agent_prompt_model: str = "gemini-2.5-pro"
+    agent_prompt_temperature: float = 0.4
+    agent_image_provider: Literal["gemini", "none"] = "none"
+    agent_image_model: str = "gemini-2.5-flash-image"
+    agent_image_timeout_seconds: int = 60
+
     # Media extraction settings
     media_max_bytes: int = Field(default=1_000_000_000, ge=1)
     media_chunk_target_bytes: int = Field(default=10_000_000, ge=1)

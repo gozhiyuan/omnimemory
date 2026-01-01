@@ -1,4 +1,4 @@
-# Lifelog AI - MVP Product Requirements Document
+# OmniMemory - MVP Product Requirements Document
 
 > **Status:** MVP-focused version emphasizing core data and memory architecture
 > **Last Updated:** December 31, 2025
@@ -9,7 +9,7 @@
 
 ## 1. Executive Summary
 
-Build an AI-powered personal memory assistant that ingests multimodal data from 3rd-party sources and user uploads, processes and organizes it into a queryable knowledge base, and provides conversational access through a web-based chat interface.
+Build OmniMemory, an AI-powered personal memory assistant that ingests multimodal data from 3rd-party sources and user uploads, processes and organizes it into a queryable knowledge base, and provides conversational access through a web-based chat interface.
 
 **MVP Scope (8-12 weeks):** React + Vite single-page web app (tabs: Dashboard, Timeline, Chat, Ingest) backed by FastAPI + Celery, focusing on manual uploads, Google Photos picker-based ingest, the ingestion pipeline, timeline/day summaries, and RAG-powered chat.
 
@@ -68,19 +68,20 @@ Build an AI-powered personal memory assistant that ingests multimodal data from 
 - **Postgres:** source item metadata + derived artifacts + processed contexts + daily summaries; supports time/entity filtering
 - **Episode contexts:** merge raw contexts into higher-signal “episodes” (time-window clustering + LLM merge decision)
 - **Daily summaries:** updated whenever episodes change (stored as `processed_contexts` with `context_type=daily_summary`); embedded + indexed for fast “broad” queries
-- **Retrieval-first principle:** pre-filter by time/type/entity, then vector search within the filtered set, then synthesize with citations
+- **Retrieval-first principle:** vector search + date filters + entity boosts, then synthesize with citations
 
 **3.4 Model Layer**
 - LLM/VLM/ASR: Gemini 2.5 Flash-Lite for image/video/audio understanding + summarization
 - Text embeddings: Gemini `gemini-embedding-001` stored in Qdrant
-- Chat (web): Gemini via `@google/genai` with RAG citations
+- Chat (web): Gemini via FastAPI RAG pipeline (citations + recent summaries)
 
 **3.5 Application Layer (Web Only)**
-- User authentication (Supabase Auth: email/password + Google OAuth) gating a single React + Vite SPA shell (`Layout` + `App.tsx` view switcher)
-- **Ingest Tab:** Combined drag-and-drop upload interface and Google Photos connection card with OAuth + Picker launch, selection count, and ingest status
-- **Chat Tab:** Conversational UI with memory-powered responses, source citations, and daily summary context chips
-- **Timeline Tab:** Day/week/month/year views, episode list with drill-down details, daily summary, search bar, and per-day upload flow
-- **Dashboard Tab:** Ingestion stats, storage usage, connected-source health indicators, and AI usage (tokens + cost) with date-range filtering
+- Single-page React + Vite app with shared layout and tabbed views (auth deferred; current dev flow uses a test user)
+- **Ingest Tab:** Drag-and-drop uploads + Google Photos connection card with OAuth + Picker launch, selection count, and ingest status
+- **Chat Tab:** RAG chat with citations, session history, image upload, and chat attachments
+- **Agents (Studio sidebar):** Cartoon Day Summary + Day Insights Infographic (image + stats + surprise moment)
+- **Timeline Tab:** Day/week/month/year views, episode list with drill-down details, daily summary, search bar, per-day upload flow
+- **Dashboard Tab:** Ingestion stats, storage usage, connected-source health indicators, and AI usage (tokens + cost)
 
 **3.6 Infrastructure**
 - **Auth/DB/Storage:** Supabase (Postgres + Auth + Object Storage)
@@ -93,6 +94,7 @@ Build an AI-powered personal memory assistant that ingests multimodal data from 
 - **Security Baseline:** Encrypt at rest/in transit, store OAuth tokens with AES-256 + rotation, implement user data deletion workflow within 24h, document GDPR-compliant privacy policy
 
 ### OUT OF SCOPE (Post-MVP) ❌
+- Authentication + multi-user RBAC (current dev mode uses a test user)
 - Mobile apps (iOS/Android)
 - Desktop capture agent
 - Automated screenshot/video capture
@@ -104,6 +106,10 @@ Build an AI-powered personal memory assistant that ingests multimodal data from 
 - Advanced graph visualizations
 - Multi-user collaboration
 - Face/voice identity (enrollment, matching, confirmation)
+- mem0 conversation memory and graph-based retrieval
+- Scheduled clustering jobs for event/memory aggregation
+- “Surprise me” insights and customizable ingestion pipeline
+- Full Settings surface for user preferences
 
 ---
 
@@ -306,6 +312,8 @@ async def batch_upload(files: list[UploadFile], user: User):
 ---
 
 ### 4.2 Memory Layer Architecture
+
+**Status note (current implementation):** OmniMemory uses context-level vector retrieval with date filters, entity boosts, and time decay. Memory graph traversal and event clustering are not implemented yet (tables exist but are not populated).
 
 #### Problem: How to organize data for precise retrieval?
 
@@ -628,61 +636,9 @@ Summarize the following day in 3 sections:
 Use friendly tone, reference timestamps, and avoid inventing details. Return Markdown.
 ```
 
-#### Using mem0 for MVP
+#### Chat memory (current)
 
-**Evaluation of mem0:**
-- ✅ Good for: Session memory, conversation history, lightweight entity tracking
-- ❌ Not ideal for: Large-scale multimodal data, complex temporal queries, custom retrieval logic
-
-**Recommendation:** Use mem0 as a **conversation memory layer** on top of your core retrieval system
-
-```python
-from mem0 import Memory
-
-# Initialize mem0 for conversation history
-conversation_memory = Memory()
-
-# In chat handler
-def chat_handler(user_id: str, message: str, session_id: str):
-    # 1. Add user message to conversation memory
-    conversation_memory.add(
-        messages=[{"role": "user", "content": message}],
-        user_id=user_id,
-        session_id=session_id
-    )
-    
-    # 2. Retrieve relevant memories from YOUR system
-    relevant_context = memory_system.retrieve(message, user_id)
-    
-    # 3. Get conversation context from mem0
-    conversation_context = conversation_memory.get_all(
-        user_id=user_id,
-        session_id=session_id
-    )
-    
-    # 4. Construct prompt
-    prompt = f"""
-    Conversation history:
-    {conversation_context}
-    
-    Relevant memories:
-    {format_context(relevant_context)}
-    
-    User: {message}
-    """
-    
-    # 5. Get LLM response
-    response = await call_llm(prompt)
-    
-    # 6. Add response to mem0
-    conversation_memory.add(
-        messages=[{"role": "assistant", "content": response}],
-        user_id=user_id,
-        session_id=session_id
-    )
-    
-    return response
-```
+Chat history is stored in Postgres (`chat_sessions`, `chat_messages`, `chat_attachments`). The chat prompt includes the most recent turns (up to `chat_history_limit`) plus recent daily summaries.
 
 ---
 
@@ -692,11 +648,11 @@ def chat_handler(user_id: str, message: str, session_id: str):
 
 | Task | Model | Rationale |
 |------|-------|-----------|
-| Chat & Reasoning | GPT-4o / Claude 3.5 Sonnet | Best reasoning, long context |
-| Image Understanding | GPT-4V / Gemini Vision Pro | Multimodal understanding |
-| Embeddings | OpenAI text-embedding-3-small | Good quality/cost ratio |
-| Summarization | Claude 3.5 Sonnet | Great at concise summaries |
-| Entity Extraction | GPT-4o-mini | Cost-effective for structured extraction |
+| Chat & Reasoning | Gemini 2.5 Flash-Lite | Fast and cost-effective for RAG |
+| Image Understanding | Gemini 2.5 Flash-Lite | Multimodal understanding for pipeline + chat image |
+| Embeddings | Gemini `gemini-embedding-001` | Matches current Qdrant embedding pipeline |
+| Summarization | Gemini 2.5 Flash-Lite | Consistent with pipeline outputs |
+| Entity Extraction | Gemini 2.5 Flash-Lite (query parsing) | Lightweight entity extraction for query boosts |
 
 **Cost Optimization:**
 - Cache embeddings (never recompute)
@@ -711,7 +667,7 @@ def chat_handler(user_id: str, message: str, session_id: str):
 - **Framework:** React 19 + TypeScript SPA (Vite)
 - **UI:** Tailwind (current repo uses CDN styling)
 - **State/data:** TanStack Query (optional Zustand for UI state)
-- **Auth:** Supabase Auth
+- **Auth:** Deferred (current dev flow uses a test user)
 - **Deployment:** Static hosting + CDN (or Vercel/Netlify) + API/worker on a container runtime
 
 **Key Views (Tabs):**
@@ -809,6 +765,7 @@ POST   /storage/download-url            # Get presigned download URL
 POST   /upload/ingest                   # Create SourceItem + enqueue processing
 
 GET    /timeline                        # Timeline feed (grouped by day)
+GET    /timeline/items                  # Timeline items (paged)
 GET    /dashboard/stats                 # Dashboard aggregates
 GET    /search?q=...                    # Qdrant-backed search
 
@@ -819,7 +776,14 @@ POST   /integrations/google/photos/picker-session
 GET    /integrations/google/photos/picker-items?session_id=...
 POST   /integrations/google/photos/sync # Enqueue ingest of picker selections
 
-POST   /chat                            # (Week 7+) RAG chat endpoint
+POST   /chat                            # RAG chat endpoint
+POST   /chat/image                      # RAG chat with image upload
+POST   /chat/agents/cartoon             # Cartoon Day Summary (image)
+POST   /chat/agents/insights            # Day Insights Infographic (image + stats)
+POST   /chat/attachments                # Upload attachment to chat
+GET    /chat/sessions                   # List chat sessions
+GET    /chat/sessions/{session_id}      # Load session detail
+POST   /chat/feedback                   # Per-message feedback
 ```
 
 ---
@@ -887,7 +851,7 @@ POST   /chat                            # (Week 7+) RAG chat endpoint
            ↓
 [API] → [Context Construction]
          └→ Build prompt with:
-            - Conversation history (mem0)
+            - Conversation history (Postgres chat messages)
             - Retrieved memories (ranked)
             - Query
            ↓
@@ -930,7 +894,7 @@ POST   /chat                            # (Week 7+) RAG chat endpoint
 - [ ] Create memory graph population logic
 - [ ] Build hybrid retrieval function (vector + temporal + entity)
 - [ ] Implement query understanding (parse dates, entities)
-- [ ] Set up mem0 for conversation memory
+- [x] Persist chat sessions + messages in Postgres (no mem0)
 
 ### Week 7-8: Chat & UI
 - [ ] Build chat API endpoint with RAG logic
@@ -962,10 +926,14 @@ POST   /chat                            # (Week 7+) RAG chat endpoint
 
 ### Phase 2: Enhanced Memory (Weeks 13-18)
 - Advanced graph queries (shortest path, community detection)
+- mem0-assisted memory and graph retrieval
+- Scheduled clustering jobs for episodes/events
 - Face recognition and person clustering
 - Location intelligence (frequent places, route patterns)
-- Vlog generation (video montage + narration)
+- Daily vlog generation (storyboard + montage + narration)
 - Weekly/monthly summary reports
+- “Surprise me” insights and customizable ingestion pipeline
+- Settings page for user preferences (retention, AI, agents, privacy)
 
 ### Phase 3: Expansion (Weeks 19-26)
 - Mobile apps (iOS, Android)

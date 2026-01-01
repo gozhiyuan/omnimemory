@@ -270,3 +270,55 @@ def build_lifelog_episode_summary_prompt(
         OMITTED_COUNT=omitted_count,
         EPISODE_ITEMS=items_json.strip() or "[]",
     )
+
+
+LIFELOG_CHAT_SYSTEM_PROMPT = """\
+You are a personal memory assistant. Answer the user's questions using the provided memories.
+
+Guidelines:
+- Be warm, concise, and helpful.
+- Use only the provided context. If you are unsure, say you do not have enough information.
+- When referencing a memory, mention the date/time and the source index in brackets (e.g., [1]).
+- Prefer 2-4 sentences unless the user asks for more detail.
+- Use first-person perspective when referencing the user's memories.
+"""
+
+
+def build_lifelog_chat_system_prompt() -> str:
+    return LIFELOG_CHAT_SYSTEM_PROMPT
+
+
+LIFELOG_QUERY_ENTITY_PROMPT = """\
+Extract entity names from the user query below.
+Return JSON ONLY with this exact shape:
+{
+  "people": [],
+  "places": [],
+  "objects": [],
+  "organizations": [],
+  "topics": [],
+  "food": []
+}
+
+Query:
+{QUERY}
+"""
+
+
+def build_lifelog_query_entities_prompt(query: str) -> str:
+    return LIFELOG_QUERY_ENTITY_PROMPT.replace("{QUERY}", query.strip())
+
+
+LIFELOG_SESSION_TITLE_PROMPT = """\
+Create a concise 6-10 word title for a chat session.
+- Capture the full request.
+- Include dates or places if present.
+
+Request:
+"{FIRST_MESSAGE}"
+Return plain text only.
+"""
+
+
+def build_lifelog_session_title_prompt(first_message: str) -> str:
+    return LIFELOG_SESSION_TITLE_PROMPT.replace("{FIRST_MESSAGE}", first_message.strip())

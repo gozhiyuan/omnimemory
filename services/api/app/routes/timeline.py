@@ -447,10 +447,13 @@ async def get_timeline(
         local_date = (base_time - offset).date()
         if local_date in daily_summaries_by_date:
             continue
+        title = context.title or "Daily summary"
+        if title.startswith("Daily summary - "):
+            title = f"Daily summary - {local_date.isoformat()}"
         daily_summaries_by_date[local_date] = TimelineDailySummary(
             context_id=str(context.id),
             summary_date=local_date,
-            title=context.title or "Daily summary",
+            title=title,
             summary=context.summary or "",
             keywords=context.keywords or [],
         )

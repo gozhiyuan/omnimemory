@@ -295,10 +295,10 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
         setAnchorDate(parsed);
       }
     }
-    if (focus.itemId) {
+    if (focus.itemId || focus.episodeContextId) {
       setSelectedEpisodeId(null);
       setSelectedItemId(null);
-      setPendingSelection({ itemId: focus.itemId });
+      setPendingSelection({ itemId: focus.itemId, episodeContextId: focus.episodeContextId });
     }
     if (focus.viewMode === 'all') {
       setSelectedEpisodeId(null);
@@ -550,6 +550,15 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
       }
     }
     if (pendingSelection.itemId) {
+      const match = days
+        .flatMap((day) => day.episodes ?? [])
+        .find((episode) => episode.source_item_ids?.includes(pendingSelection.itemId ?? ''));
+      if (match) {
+        setSelectedEpisodeId(match.episode_id);
+        setSelectedItemId(null);
+        setPendingSelection(null);
+        return;
+      }
       setSelectedItemId(pendingSelection.itemId);
       setSelectedEpisodeId(null);
       setPendingSelection(null);

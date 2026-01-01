@@ -2076,6 +2076,21 @@ class EpisodeEnqueueStep:
         celery_app.send_task("episodes.update_for_item", args=[str(item.id)])
 
 
+class MemoryGraphEnqueueStep:
+    name = "memory_graph"
+    version = "v1"
+    is_expensive = False
+
+    async def run(self, item: SourceItem, artifacts: PipelineArtifacts, config: PipelineConfig) -> None:
+        if not getattr(config.settings, "memory_graph_enabled", True):
+            return
+        try:
+            from ..celery_app import celery_app
+        except Exception:  # pragma: no cover - import guard
+            return
+        celery_app.send_task("memory_graph.update_for_item", args=[str(item.id)])
+
+
 COMMON_STEPS: list[PipelineStep] = [
     FetchBlobStep(),
     ContentHashStep(),
@@ -2095,6 +2110,7 @@ IMAGE_STEPS: list[PipelineStep] = [
     VlmStep(),
     ContextPersistStep(),
     EmbeddingStep(),
+    MemoryGraphEnqueueStep(),
     EpisodeEnqueueStep(),
 ]
 
@@ -2107,6 +2123,7 @@ VIDEO_STEPS: list[PipelineStep] = [
     GenericContextStep(),
     ContextPersistStep(),
     EmbeddingStep(),
+    MemoryGraphEnqueueStep(),
     EpisodeEnqueueStep(),
 ]
 
@@ -2117,6 +2134,7 @@ AUDIO_STEPS: list[PipelineStep] = [
     GenericContextStep(),
     ContextPersistStep(),
     EmbeddingStep(),
+    MemoryGraphEnqueueStep(),
     EpisodeEnqueueStep(),
 ]
 
@@ -2124,6 +2142,7 @@ GENERIC_STEPS: list[PipelineStep] = [
     GenericContextStep(),
     ContextPersistStep(),
     EmbeddingStep(),
+    MemoryGraphEnqueueStep(),
     EpisodeEnqueueStep(),
 ]
 

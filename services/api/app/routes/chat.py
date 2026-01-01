@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
 from uuid import UUID, uuid4
@@ -17,6 +18,7 @@ from ..ai import analyze_image_with_vlm, generate_image_with_gemini, summarize_t
 from ..ai.prompts import (
     build_lifelog_cartoon_agent_prompt,
     build_lifelog_chat_system_prompt,
+    build_lifelog_day_insights_agent_prompt,
     build_lifelog_image_prompt,
     build_lifelog_session_title_prompt,
 )
@@ -89,6 +91,15 @@ class AgentImageRequest(BaseModel):
     tz_offset_minutes: Optional[int] = None
 
 
+class AgentInsightsRequest(BaseModel):
+    session_id: Optional[UUID] = None
+    date: Optional[str] = None
+    end_date: Optional[str] = None
+    prompt: Optional[str] = None
+    tz_offset_minutes: Optional[int] = None
+    include_image: bool = True
+
+
 class AgentImageResponse(BaseModel):
     message: str
     session_id: UUID
@@ -149,6 +160,11 @@ def _truncate_text(value: str, limit: int = 1200) -> str:
 DEFAULT_CARTOON_AGENT_INSTRUCTION = (
     "Create a whimsical cartoon illustration that summarizes the day. "
     "Highlight the main activity, mood, and setting."
+)
+
+DEFAULT_INSIGHTS_AGENT_INSTRUCTION = (
+    "Create a daily insights summary with key stats, top keywords, and a surprise moment. "
+    "Also generate an infographic image prompt."
 )
 
 
@@ -279,6 +295,19 @@ def _resolve_agent_date(
     return (datetime.now(timezone.utc) - offset).date()
 
 
+def _resolve_agent_date_range(
+    start_value: Optional[str],
+    end_value: Optional[str],
+    *,
+    tz_offset_minutes: Optional[int],
+) -> tuple[date, date]:
+    start = _resolve_agent_date(start_value, tz_offset_minutes=tz_offset_minutes)
+    end = date.fromisoformat(end_value) if end_value else start
+    if end < start:
+        return end, start
+    return start, end
+
+
 async def _load_agent_day_context(
     session: AsyncSession,
     user_id: UUID,
@@ -319,6 +348,70 @@ async def _load_agent_day_context(
     ctx_rows = await session.execute(ctx_stmt)
     contexts = list(ctx_rows.scalars().all())
     return summary_context, contexts
+
+
+async def _load_agent_range_context(
+    session: AsyncSession,
+    user_id: UUID,
+    start_date: date,
+    end_date: date,
+    *,
+    tz_offset_minutes: Optional[int],
+    limit: int = 60,
+) -> tuple[list[ProcessedContext], list[ProcessedContext]]:
+    offset = timedelta(minutes=tz_offset_minutes or 0)
+    start = datetime.combine(start_date, time.min, tzinfo=timezone.utc) + offset
+    end = datetime.combine(end_date, time.min, tzinfo=timezone.utc) + offset + timedelta(days=1)
+
+    summary_stmt = (
+        select(ProcessedContext)
+        .where(
+            ProcessedContext.user_id == user_id,
+            ProcessedContext.context_type == "daily_summary",
+            ProcessedContext.start_time_utc >= start,
+            ProcessedContext.start_time_utc < end,
+        )
+        .order_by(ProcessedContext.start_time_utc.asc())
+    )
+    summary_rows = await session.execute(summary_stmt)
+    summaries = list(summary_rows.scalars().all())
+
+    ctx_stmt = (
+        select(ProcessedContext)
+        .where(
+            ProcessedContext.user_id == user_id,
+            ProcessedContext.context_type != "daily_summary",
+            ProcessedContext.event_time_utc >= start,
+            ProcessedContext.event_time_utc < end,
+        )
+        .order_by(ProcessedContext.event_time_utc.asc())
+        .limit(limit)
+    )
+    ctx_rows = await session.execute(ctx_stmt)
+    contexts = list(ctx_rows.scalars().all())
+    return summaries, contexts
+
+
+def _build_agent_range_memory_context(
+    summaries: list[ProcessedContext],
+    contexts: list[ProcessedContext],
+) -> str:
+    sections: list[str] = []
+    if summaries:
+        summary_lines = [
+            f"{ensure_tz_aware(summary.start_time_utc).date().isoformat()}: {summary.summary.strip()}"
+            for summary in summaries
+            if summary.summary and summary.start_time_utc
+        ]
+        if summary_lines:
+            sections.append("Daily summaries:\n" + "\n".join(summary_lines))
+    if contexts:
+        block = _format_context_block([(ctx, {}) for ctx in contexts])
+        if block:
+            sections.append(f"Memories:\n{block}")
+    if not sections:
+        return "No memories available for this date range."
+    return "\n\n".join(sections)
 
 
 def _build_agent_memory_context(
@@ -1023,6 +1116,229 @@ async def agent_cartoon_day_summary(
         session_id=session_record.id,
         attachments=attachments,
         prompt=image_prompt,
+        caption=caption,
+    )
+
+
+@router.post("/agents/insights", response_model=AgentImageResponse)
+async def agent_day_insights(
+    payload: AgentInsightsRequest,
+    user_id: UUID = DEFAULT_TEST_USER_ID,
+    session: AsyncSession = Depends(get_session),
+) -> AgentImageResponse:
+    settings = get_settings()
+    if not settings.agent_enabled:
+        raise HTTPException(status_code=503, detail="Agent features are disabled")
+
+    start_date, end_date = _resolve_agent_date_range(
+        payload.date,
+        payload.end_date,
+        tz_offset_minutes=payload.tz_offset_minutes,
+    )
+    summaries, contexts = await _load_agent_range_context(
+        session,
+        user_id,
+        start_date,
+        end_date,
+        tz_offset_minutes=payload.tz_offset_minutes,
+    )
+    memory_context = _build_agent_range_memory_context(summaries, contexts)
+    instruction = (payload.prompt or "").strip() or DEFAULT_INSIGHTS_AGENT_INSTRUCTION
+    date_label = (
+        start_date.isoformat()
+        if start_date == end_date
+        else f"{start_date.isoformat()} to {end_date.isoformat()}"
+    )
+
+    offset = timedelta(minutes=payload.tz_offset_minutes or 0)
+    start = datetime.combine(start_date, time.min, tzinfo=timezone.utc) + offset
+    end = datetime.combine(end_date, time.min, tzinfo=timezone.utc) + offset + timedelta(days=1)
+    event_time_expr = func.coalesce(SourceItem.event_time_utc, SourceItem.created_at)
+    item_stmt = (
+        select(SourceItem.item_type, func.count(SourceItem.id))
+        .where(
+            SourceItem.user_id == user_id,
+            SourceItem.processing_status == "completed",
+            event_time_expr >= start,
+            event_time_expr < end,
+        )
+        .group_by(SourceItem.item_type)
+    )
+    item_rows = await session.execute(item_stmt)
+    item_counts = {row[0]: int(row[1]) for row in item_rows.fetchall() if row and row[0]}
+
+    keyword_counts: dict[str, int] = {}
+    context_type_counts: dict[str, int] = {}
+    entity_names: list[str] = []
+    for context in contexts:
+        context_type_counts[context.context_type] = context_type_counts.get(context.context_type, 0) + 1
+        for keyword in context.keywords or []:
+            key = str(keyword or "").strip().lower()
+            if not key:
+                continue
+            keyword_counts[key] = keyword_counts.get(key, 0) + 1
+        for entity in context.entities or []:
+            if isinstance(entity, dict):
+                name = entity.get("name")
+            else:
+                name = None
+            if name:
+                entity_names.append(str(name))
+
+    top_keywords = sorted(keyword_counts.items(), key=lambda pair: pair[1], reverse=True)[:10]
+    stats_payload = {
+        "date_range": date_label,
+        "item_counts": item_counts,
+        "context_type_counts": context_type_counts,
+        "top_keywords": [word for word, _ in top_keywords],
+        "entities": list(dict.fromkeys(entity_names))[:20],
+    }
+    stats_json = json.dumps(stats_payload, indent=2)
+
+    prompt = build_lifelog_day_insights_agent_prompt(
+        instruction=instruction,
+        memory_context=memory_context,
+        date_range_label=date_label,
+        stats_json=stats_json,
+    )
+    prompt_response = await summarize_text_with_gemini(
+        prompt=prompt,
+        settings=settings,
+        model=settings.agent_prompt_model,
+        temperature=settings.agent_prompt_temperature,
+        max_output_tokens=512,
+        timeout_seconds=settings.chat_timeout_seconds,
+        step_name="agent_insights_prompt",
+        user_id=user_id,
+    )
+    parsed = prompt_response.get("parsed")
+    if not isinstance(parsed, dict):
+        parsed = {}
+    headline = (parsed.get("headline") or f"Daily insights for {date_label}").strip()
+    summary = (parsed.get("summary") or "").strip()
+    labels = parsed.get("labels") if isinstance(parsed.get("labels"), list) else []
+    keywords = parsed.get("top_keywords") if isinstance(parsed.get("top_keywords"), list) else []
+    surprise = (parsed.get("surprise_moment") or "").strip()
+    image_prompt = (parsed.get("image_prompt") or "").strip()
+
+    if not keywords:
+        keywords = [word for word, _ in top_keywords][:8]
+    if not labels:
+        labels = list(context_type_counts.keys())[:6]
+    if not image_prompt:
+        image_prompt = (
+            "Create a clean infographic poster summarizing the day. "
+            f"Include the title '{headline}' and 3-5 stat callouts."
+        )
+
+    lines = [headline]
+    if summary:
+        lines.append(f"Summary: {summary}")
+    if item_counts:
+        counts_text = ", ".join(f"{key}: {value}" for key, value in item_counts.items())
+        lines.append(f"Stats: {counts_text}")
+    if keywords:
+        lines.append(f"Top keywords: {', '.join(str(word) for word in keywords)}")
+    if labels:
+        lines.append(f"Labels: {', '.join(str(label) for label in labels)}")
+    if surprise:
+        lines.append(f"Surprise: {surprise}")
+    assistant_content = "\n".join(lines).strip()
+
+    attachments: list[ChatAttachmentOut] = []
+    prompt_used: Optional[str] = None
+    caption = headline
+    attachment_payload = None
+    image_bytes: Optional[bytes] = None
+    image_content_type: Optional[str] = None
+    if payload.include_image:
+        if settings.agent_image_provider != "gemini" or not settings.gemini_api_key:
+            raise HTTPException(status_code=503, detail="Image model not configured")
+        model = settings.agent_image_model or "gemini-2.5-flash-image"
+        image_result = await generate_image_with_gemini(
+            image_prompt,
+            settings,
+            model,
+            settings.agent_image_timeout_seconds,
+            user_id=user_id,
+            step_name="agent_insights_image",
+        )
+        images = image_result.get("images") or []
+        if not images:
+            raise HTTPException(status_code=502, detail="Image generation failed")
+        image = images[0]
+        image_bytes = image.data
+        image_content_type = image.content_type
+        prompt_used = image_prompt
+
+    session_record = await _get_or_create_session(
+        session,
+        user_id,
+        payload.session_id,
+        f"Day insights {date_label}",
+    )
+    now = datetime.now(timezone.utc)
+    session_record.updated_at = now
+    session_record.last_message_at = now
+
+    user_msg = ChatMessage(
+        session_id=session_record.id,
+        user_id=user_id,
+        role="user",
+        content=f"Day insights for {date_label}",
+        sources=[],
+        created_at=now,
+    )
+    assistant_msg = ChatMessage(
+        session_id=session_record.id,
+        user_id=user_id,
+        role="assistant",
+        content=assistant_content,
+        sources=[],
+        created_at=now + timedelta(milliseconds=1),
+    )
+    session.add_all([user_msg, assistant_msg])
+    await session.flush()
+
+    if image_bytes:
+        attachment_payload = await _store_attachment_bytes(
+            user_id=user_id,
+            session_id=session_record.id,
+            image_bytes=image_bytes,
+            content_type=image_content_type,
+            original_filename=f"insights-{start_date.isoformat()}-{end_date.isoformat()}.png",
+        )
+        attachment = ChatAttachment(
+            user_id=user_id,
+            session_id=session_record.id,
+            message_id=assistant_msg.id,
+            storage_key=attachment_payload.get("storage_key"),
+            content_type=attachment_payload.get("content_type"),
+            original_filename=attachment_payload.get("original_filename"),
+            size_bytes=attachment_payload.get("size_bytes"),
+        )
+        session.add(attachment)
+        await session.flush()
+
+        storage = get_storage_provider()
+        url = await _sign_storage_url(storage, settings, attachment.storage_key)
+        if url:
+            attachments.append(
+                ChatAttachmentOut(
+                    id=attachment.id,
+                    url=url,
+                    content_type=attachment.content_type,
+                    created_at=attachment.created_at,
+                )
+            )
+
+    await session.commit()
+
+    return AgentImageResponse(
+        message=assistant_content,
+        session_id=session_record.id,
+        attachments=attachments,
+        prompt=prompt_used,
         caption=caption,
     )
 

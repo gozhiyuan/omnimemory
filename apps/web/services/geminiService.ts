@@ -25,7 +25,7 @@ export const sendMessageToGemini = async (
       `- Date: ${new Date(m.date).toLocaleDateString()}, Location: ${m.location}, Description: ${m.caption}`
     ).join('\n');
 
-    const systemInstruction = `You are Lifelog AI, a helpful and warm personal memory assistant. 
+    const systemInstruction = `You are OmniMemory, a helpful and warm personal memory assistant. 
     You have access to the user's memories (photos, logs, events) provided in the context below.
     Answer the user's questions based primarily on this context. 
     If the answer isn't in the context, say you don't recall that specific memory but allow general conversation.

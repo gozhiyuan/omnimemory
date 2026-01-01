@@ -61,9 +61,14 @@ This service handles synchronous requests (uploads, storage signing, timeline/da
    uv run python -m app.db.migrator
    ```
 
-4. Configure storage for uploads:
-   - `STORAGE_PROVIDER=supabase` plus `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are required for `/storage/upload-url` and the web upload flow.
-   - If you do not set these, you can still call `/upload/ingest` directly (no presigned uploads), but the UI upload flow will fail with a 501.
+4. Configure storage for uploads (default: S3/RustFS):
+   - For S3-compatible storage (RustFS/MinIO/AWS): set `STORAGE_PROVIDER=s3` plus
+     `S3_ENDPOINT_URL`, `S3_ACCESS_KEY_ID`, and `S3_SECRET_ACCESS_KEY` (and `S3_FORCE_PATH_STYLE=true`
+     for RustFS/MinIO). The API will issue presigned URLs for `/storage/upload-url`.
+   - For Supabase: set `STORAGE_PROVIDER=supabase` plus `SUPABASE_URL` and
+     `SUPABASE_SERVICE_ROLE_KEY`.
+   - If you do not configure a provider that supports presigned URLs, you can still call
+     `/upload/ingest` directly (no presigned uploads), but the UI upload flow will fail with a 501.
 
 Subsequent commands can be executed through `uv run <command>` which automatically reuses the virtual
 environment.
@@ -116,10 +121,11 @@ uv run python -c "from app.vectorstore import ensure_collection; ensure_collecti
 
 ### Storage abstraction (`app/storage.py`)
 
-The `get_storage_provider()` factory returns the Supabase storage implementation when
-`STORAGE_PROVIDER=supabase` and `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` are configured. The
-default in-memory provider does not issue presigned URLs, so `/storage/upload-url` will respond
-with 501 unless Supabase is enabled.
+The `get_storage_provider()` factory returns the S3-compatible storage implementation when
+`STORAGE_PROVIDER=s3` and the S3 settings are configured, or the Supabase implementation when
+`STORAGE_PROVIDER=supabase` and `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` are set. The default
+in-memory provider does not issue presigned URLs, so `/storage/upload-url` will respond with 501
+unless S3 or Supabase is enabled.
 
 ### Processing pipeline (`app/tasks/process_item.py`)
 
@@ -147,6 +153,21 @@ uv run python scripts/seed_ingest_flow.py ./fixtures/sample.jpg \
 
 Use `--direct-upload` to upload directly to Supabase without relying on `/storage/upload-url`.
 
+### Storage migration (`scripts/migrate_supabase_to_rustfs.py`)
+
+Copy existing objects from Supabase Storage into a RustFS/S3 bucket while preserving keys:
+
+```bash
+uv run python scripts/migrate_supabase_to_rustfs.py \
+  --supabase-url https://<project>.supabase.co \
+  --supabase-key <service-role-key> \
+  --supabase-bucket originals \
+  --s3-endpoint-url http://localhost:9000 \
+  --s3-access-key-id <access-key> \
+  --s3-secret-access-key <secret-key> \
+  --s3-bucket originals
+```
+
 ## HTTP endpoints (current)
 
 - `GET /health`, `GET /health/db`, `GET /health/celery`
@@ -163,7 +184,7 @@ Client
   │
   ├─ POST /storage/upload-url  ───────────────▶ API (presigned URL)
   │
-  ├─ PUT <signed URL> ───────────────────────▶ Supabase Storage (object upload)
+  ├─ PUT <signed URL> ───────────────────────▶ Object Storage (S3/RustFS/Supabase)
   │
   └─ POST /upload/ingest (storage_key) ──────▶ API
                                │

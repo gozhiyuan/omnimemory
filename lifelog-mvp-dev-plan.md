@@ -15,7 +15,7 @@ Implemented:
 - Dashboard aggregates + usage metrics.
 
 Deferred or not implemented yet:
-- Authentication (Supabase Auth / JWT) and multi-user support.
+- Authentication (provider TBD / JWT) and multi-user support.
 - Memory graph population and graph-based retrieval.
 - Scheduled lifecycle retention jobs.
 - Notion integration and other connectors.
@@ -51,13 +51,14 @@ Deferred or not implemented yet:
 - [ ] Create `.env.example` files for all services
 
 **Cloud Infrastructure**
-- [ ] Create Supabase project:
+- [ ] Provision self-hosted core services (Postgres + RustFS + Valkey) for OSS-first deployment
+- [ ] Optional: create Supabase project if using managed Postgres/Auth later
   - [ ] Enable Email auth provider (if using Supabase Auth for login)
   - [ ] Enable Google OAuth provider later with Google Photos integration
 - [ ] Set up GitHub repository and enable GitHub Actions
 
 **Database Setup**
-- [ ] Create database schema in Supabase:
+- [ ] Create database schema in Postgres (local; optional Supabase if managed later):
   ```sql
   -- migrations/001_initial_schema.sql
   CREATE TABLE users (...);
@@ -69,9 +70,9 @@ Deferred or not implemented yet:
   CREATE TABLE memory_nodes (...);
   CREATE TABLE memory_edges (...);
   ```
-- [ ] Create database migration scripts and apply them to local Postgres and Supabase (keep schemas in sync)
+- [ ] Create database migration scripts and apply them to local Postgres (and Supabase if used)
 - [ ] Skip `pgvector` for now (using Qdrant); enable later only if hybrid Postgres vector search is needed
-- [ ] Defer Row-Level Security (RLS) until the frontend talks directly to Supabase
+- [ ] Defer Row-Level Security (RLS) until auth provider + direct DB access is finalized
 - [ ] Defer encryption key storage (`vault.secrets`/KMS) until OAuth or other app-specific tokens are stored
 
 **Backend API (FastAPI)**
@@ -81,6 +82,7 @@ Deferred or not implemented yet:
   dependencies = [
       "fastapi",
       "uvicorn",
+      "boto3",
       "supabase",
       "celery",
       "redis",
@@ -92,7 +94,7 @@ Deferred or not implemented yet:
   ```
 - [ ] Implement health check endpoint (`/health`) — done
 - [ ] Add CORS middleware for frontend — done
-- [ ] Set up Supabase storage integration with environment variables (for presigned uploads) — done
+- [ ] Set up S3-compatible storage integration (RustFS/MinIO/AWS) for presigned uploads — done
 - [ ] Defer JWT authentication middleware until auth is wired
 - [ ] Defer structlog + OpenTelemetry tracing until observability setup
 - [ ] Defer token encryption helper (AES-256-GCM with key rotation schedule) until OAuth tokens are stored
@@ -106,16 +108,16 @@ Deferred or not implemented yet:
   - `GET /search` (Qdrant-backed search)
 
 **Storage Abstraction & Presigned URLs**
-- [ ] Implement storage provider interface (memory + Supabase) — done
-- [ ] Configure Supabase storage env vars for presigned uploads (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `STORAGE_PROVIDER=supabase`) — done
+- [ ] Implement storage provider interface (memory + S3/RustFS, optional Supabase) — done
+- [ ] Configure S3 storage env vars for presigned uploads (`S3_*`, `STORAGE_PROVIDER=s3`) — done
 - [ ] Add API endpoints for presigned flows (`POST /storage/upload-url`, `POST /storage/download-url`) — done
 - [ ] Use presigned URL TTL from config (`presigned_url_ttl_seconds`) — done
 - [ ] Use storage fetch helper in the processing pipeline — done
 - [ ] Defer `thumbnails` bucket setup until thumbnail generation lands
 
 **Task Queue (Celery)**
-- [ ] Set up Redis locally (Docker) — done
-- [ ] Initialize Celery app with Redis broker + result backend — done
+- [ ] Set up Valkey locally (Docker) — done
+- [ ] Initialize Celery app with Valkey/Redis broker + result backend — done
 - [ ] Implement background tasks (`process_item`, `health.ping`) — done
 - [ ] Wire `/upload/ingest` to enqueue processing tasks — done
 - [ ] Add Celery beat schedule skeleton (health + lifecycle cleanup) — done
@@ -130,7 +132,7 @@ Deferred or not implemented yet:
 - [ ] Flesh out the Ingest tab so manual uploads use `POST /storage/upload-url` + `PUT <signed url>` + `POST /upload/ingest`, and the Google Photos connector UI triggers OAuth, shows sync status, and surfaces retry/manage actions
 - [ ] Build chat + ingestion workflows against the Gemini API via `@google/genai` services, reusing hooks/utilities under `apps/web/services`
 - [ ] Drive the Timeline view from the `/timeline` API (daily activity heatmap + detail drawer per day showing photos, videos, summaries) and hydrate the Dashboard components with stats returned by `/dashboard/stats`
-- [ ] Add lightweight routing or state persistence as needed (URL params or Zustand) instead of server-side routing, and gate authenticated data fetches through supabase/api clients once backend endpoints exist
+- [ ] Add lightweight routing or state persistence as needed (URL params or Zustand) instead of server-side routing, and gate authenticated data fetches through the future auth layer once backend endpoints exist
 
 **Docker Compose for Local Development**
 - [ ] Create `docker-compose.yml`:
@@ -220,7 +222,7 @@ Deferred or not implemented yet:
 Reference: `docs/minecontext/lifelog_ingestion_rag_design.md`
 
 - [x] Manual uploads flow: `POST /storage/upload-url` → `PUT <signed url>` → `POST /upload/ingest` with optional `captured_at` + `client_tz_offset_minutes`.
-- [x] Google Photos Picker sync: OAuth + session ingest (`integrations.google_photos.sync`) writes originals into Supabase and enqueues pipeline.
+- [x] Google Photos Picker sync: OAuth + session ingest (`integrations.google_photos.sync`) writes originals into object storage (RustFS/S3) and enqueues pipeline.
 - [x] Schema migrations shipped:
   - `002_ingestion_core.sql`: `event_time_utc`, `content_hash`, `phash`, `derived_artifacts`, `processed_contexts`.
   - `003_dedup_canonical.sql`: `canonical_item_id` for dedupe linkage.
@@ -637,7 +639,7 @@ Reference: `docs/minecontext/lifelog_ingestion_rag_design.md`
   CREATE INDEX idx_events_user_date ON events(user_id, start_time DESC);
   CREATE INDEX idx_memory_nodes_user_type ON memory_nodes(user_id, node_type);
   ```
-- [ ] Enable caching for dashboard stats (Redis)
+- [ ] Enable caching for dashboard stats (Valkey/Redis)
 - [ ] Optimize Qdrant queries with filters
 - [ ] Add CDN for static assets
 
@@ -720,7 +722,7 @@ Reference: `docs/minecontext/lifelog_ingestion_rag_design.md`
   ```
 
 **Production Deployment**
-- [ ] Set up production Supabase project
+- [ ] Provision production Postgres + object storage (RustFS/S3); Supabase optional
 - [ ] Provision Qdrant Cloud production cluster
 - [ ] Deploy API to Cloud Run (or Railway):
   ```yaml
@@ -737,7 +739,7 @@ Reference: `docs/minecontext/lifelog_ingestion_rag_design.md`
   ```
 - [ ] Deploy Celery workers as separate service
 - [ ] Provision GPU-backed media processing workers (RunPod/Modal) for Whisper + captioning
-- [ ] Set up Redis on Cloud Memorystore (or Upstash)
+- [ ] Set up Valkey/Redis on Cloud Memorystore (or Upstash)
 - [ ] Deploy the React + Vite SPA (Vercel/Netlify or Cloud Storage + CDN):
   ```bash
   vercel --prod
@@ -749,7 +751,7 @@ Reference: `docs/minecontext/lifelog_ingestion_rag_design.md`
 - [ ] Set up pnpm workspaces or Turborepo (only if/when shared JS packages are introduced)
 - [ ] Initialize Git hooks with Husky (pre-commit linting)
 - [ ] Create Qdrant Cloud instance (1GB dev) for shared dev/staging usage if local Qdrant isn't sufficient
-- [ ] Provision staging environment (Supabase + Qdrant) with seeded demo data for onboarding tests
+- [ ] Provision staging environment (Postgres + RustFS/S3 + Qdrant) with seeded demo data for onboarding tests
 
 **Monitoring & Observability**
 - [ ] Set up Sentry for error tracking:
@@ -875,7 +877,7 @@ Reference: `docs/minecontext/lifelog_ingestion_rag_design.md`
 **Google Drive Connector (Cloud Sync Bridge)**
 - [ ] Add `google_drive` as a `data_connections.provider` and implement OAuth + folder picker
 - [ ] Backfill + incremental sync for a specific folder using the Drive Changes API (or folder query + modifiedTime cursor)
-- [ ] Map Drive files into the existing pipeline by writing to Supabase Storage (or using signed URLs) and then calling `/upload/ingest`
+- [ ] Map Drive files into the existing pipeline by writing to object storage (RustFS/S3 or signed URLs) and then calling `/upload/ingest`
 - [ ] De-dupe by `(connection_id, external_id)` plus optional SHA256 if available
 
 **Oura Ring Connector**
@@ -921,7 +923,7 @@ Reference: `docs/minecontext/lifelog_ingestion_rag_design.md`
 - **Optional: ML Engineer:** Optimize embedding and retrieval (Week 6+)
 
 ### Infrastructure Costs (Estimated Monthly)
-- Supabase Pro: $25
+- Managed Supabase (optional): $25
 - Qdrant Cloud: $0-50 (depending on data volume)
 - Railway/Cloud Run: $20-50
 - Vercel: $0 (hobby) or $20 (pro)
@@ -934,7 +936,7 @@ Reference: `docs/minecontext/lifelog_ingestion_rag_design.md`
 
 | Metric | Target | Measurement |
 |--------|--------|-------------|
-| User signups | 20 pilot users | Supabase Auth count |
+| User signups | 20 pilot users | Auth provider user count |
 | Data sources connected | 80% of pilots connect both Google + Apple | `data_connections` table filtered by provider |
 | Media assets processed | 10,000+ mixed items | `source_items` count + processing metrics |
 | Chat queries | 100+ total | OpenTelemetry traces + API logs |

@@ -4,8 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Dict, Protocol
+from typing import Any, Dict, Protocol
 from urllib.parse import quote
+
+try:  # Optional dependency for S3-compatible storage.
+    import boto3
+    from botocore.config import Config as BotoConfig
+    from botocore.exceptions import ClientError
+except ImportError:  # pragma: no cover - handled at runtime if S3 provider is used.
+    boto3 = None
+    BotoConfig = None
+    ClientError = None
 
 import httpx
 from loguru import logger
@@ -56,6 +65,85 @@ class MemoryStorageProvider(StorageProvider):
     def store(self, key: str, data: bytes, content_type: str) -> None:
         logger.info("MemoryStorageProvider store called for key={} size={}", key, len(data))
         self.objects[key] = data
+
+
+@dataclass
+class S3StorageProvider(StorageProvider):
+    """S3-compatible storage implementation (RustFS/MinIO/AWS)."""
+
+    settings: Settings
+    client: Any = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if boto3 is None or BotoConfig is None:
+            raise RuntimeError("boto3 is required for S3 storage; install boto3")
+
+        if self.settings.s3_endpoint_url and (
+            not self.settings.s3_access_key_id or not self.settings.s3_secret_access_key
+        ):
+            raise RuntimeError("S3 endpoint requires access key and secret access key")
+
+        addressing_style = "path" if self.settings.s3_force_path_style else "virtual"
+        config = BotoConfig(s3={"addressing_style": addressing_style})
+        client_kwargs: dict[str, Any] = {
+            "service_name": "s3",
+            "region_name": self.settings.s3_region,
+            "endpoint_url": str(self.settings.s3_endpoint_url)
+            if self.settings.s3_endpoint_url
+            else None,
+            "config": config,
+        }
+        if self.settings.s3_access_key_id and self.settings.s3_secret_access_key:
+            client_kwargs["aws_access_key_id"] = self.settings.s3_access_key_id
+            client_kwargs["aws_secret_access_key"] = self.settings.s3_secret_access_key
+        self.client = boto3.client(**client_kwargs)
+
+    def _bucket(self) -> str:
+        return self.settings.bucket_originals
+
+    def get_presigned_upload(self, key: str, content_type: str, expires_s: int) -> Dict[str, str]:
+        url = self.client.generate_presigned_url(
+            "put_object",
+            Params={"Bucket": self._bucket(), "Key": key, "ContentType": content_type},
+            ExpiresIn=expires_s,
+        )
+        return {"key": key, "url": url, "headers": {"Content-Type": content_type}}
+
+    def get_presigned_download(self, key: str, expires_s: int) -> Dict[str, str]:
+        url = self.client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": self._bucket(), "Key": key},
+            ExpiresIn=expires_s,
+        )
+        return {"key": key, "url": url}
+
+    def delete(self, key: str) -> None:
+        try:
+            self.client.delete_object(Bucket=self._bucket(), Key=key)
+        except ClientError as exc:
+            logger.error("S3 delete failed key={} error={}", key, exc)
+            raise
+
+    def fetch(self, key: str) -> bytes:
+        try:
+            resp = self.client.get_object(Bucket=self._bucket(), Key=key)
+        except ClientError as exc:
+            logger.error("S3 fetch failed key={} error={}", key, exc)
+            raise
+        body = resp.get("Body")
+        return body.read() if body else b""
+
+    def store(self, key: str, data: bytes, content_type: str) -> None:
+        try:
+            self.client.put_object(
+                Bucket=self._bucket(),
+                Key=key,
+                Body=data,
+                ContentType=content_type,
+            )
+        except ClientError as exc:
+            logger.error("S3 store failed key={} error={}", key, exc)
+            raise
 
 
 @dataclass
@@ -225,4 +313,6 @@ def get_storage_provider() -> StorageProvider:
     settings = get_settings()
     if settings.storage_provider == "supabase":
         return SupabaseStorageProvider(settings=settings)
+    if settings.storage_provider == "s3":
+        return S3StorageProvider(settings=settings)
     return MemoryStorageProvider()

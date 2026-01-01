@@ -208,6 +208,67 @@ class ProcessedContext(Base):
     )
 
 
+class MemoryNode(Base):
+    __tablename__ = "memory_nodes"
+    __table_args__ = (
+        UniqueConstraint("user_id", "node_type", "name", name="memory_nodes_user_type_name_idx"),
+        Index("memory_nodes_user_type_idx", "user_id", "node_type"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"))
+    node_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    attributes: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    first_seen: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("NOW()"), nullable=False
+    )
+    last_seen: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("NOW()"), nullable=False
+    )
+    mention_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+
+
+class MemoryEdge(Base):
+    __tablename__ = "memory_edges"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "source_node_id",
+            "target_node_id",
+            "relation_type",
+            name="memory_edges_unique_idx",
+        ),
+        Index("memory_edges_user_source_idx", "user_id", "source_node_id"),
+        Index("memory_edges_user_target_idx", "user_id", "target_node_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"))
+    source_node_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("memory_nodes.id", ondelete="CASCADE")
+    )
+    target_node_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("memory_nodes.id", ondelete="CASCADE")
+    )
+    relation_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    strength: Mapped[float] = mapped_column(Float, nullable=False, server_default=text("1.0"))
+    mention_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    last_connected: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("NOW()"), nullable=False
+    )
+    source_item_id: Mapped[Optional[UUID]] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("source_items.id", ondelete="SET NULL"), nullable=True
+    )
+    source_context_id: Mapped[Optional[UUID]] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("processed_contexts.id", ondelete="SET NULL"), nullable=True
+    )
+
+
 class DailySummary(Base):
     __tablename__ = "daily_summaries"
     __table_args__ = (UniqueConstraint("user_id", "summary_date", name="daily_summaries_user_date_idx"),)
@@ -228,6 +289,103 @@ class DailySummary(Base):
     user: Mapped[User] = relationship()
 
 
+class ChatSession(Base):
+    __tablename__ = "chat_sessions"
+    __table_args__ = (Index("chat_sessions_user_idx", "user_id", "last_message_at"),)
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"))
+    title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("NOW()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("NOW()"), nullable=False
+    )
+    last_message_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("NOW()"), nullable=False
+    )
+
+    messages: Mapped[list["ChatMessage"]] = relationship(
+        back_populates="session", cascade="all, delete-orphan", passive_deletes=True
+    )
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+    __table_args__ = (
+        CheckConstraint(
+            "role IN ('user','assistant','system')",
+            name="chat_messages_role_check",
+        ),
+        Index("chat_messages_session_idx", "session_id", "created_at"),
+        Index("chat_messages_user_idx", "user_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    session_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("chat_sessions.id", ondelete="CASCADE")
+    )
+    user_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"))
+    role: Mapped[str] = mapped_column(String(32), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    sources: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("NOW()"), nullable=False
+    )
+
+    session: Mapped["ChatSession"] = relationship(back_populates="messages")
+
+
+class ChatFeedback(Base):
+    __tablename__ = "chat_feedback"
+    __table_args__ = (
+        CheckConstraint("rating IN (-1, 1)", name="chat_feedback_rating_check"),
+        UniqueConstraint("user_id", "message_id", name="chat_feedback_user_message_idx"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"))
+    message_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("chat_messages.id", ondelete="CASCADE")
+    )
+    rating: Mapped[int] = mapped_column(Integer, nullable=False)
+    comment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("NOW()"), nullable=False
+    )
+
+
+class ChatAttachment(Base):
+    __tablename__ = "chat_attachments"
+    __table_args__ = (
+        Index("chat_attachments_session_idx", "session_id", "created_at"),
+        Index("chat_attachments_message_idx", "message_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"))
+    session_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("chat_sessions.id", ondelete="CASCADE")
+    )
+    message_id: Mapped[Optional[UUID]] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("chat_messages.id", ondelete="CASCADE"), nullable=True
+    )
+    storage_key: Mapped[str] = mapped_column(Text, nullable=False)
+    content_type: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    original_filename: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    size_bytes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("NOW()"), nullable=False
+    )
 class AiUsageEvent(Base):
     __tablename__ = "ai_usage_events"
     __table_args__ = (

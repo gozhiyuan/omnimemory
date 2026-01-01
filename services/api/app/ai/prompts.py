@@ -270,3 +270,138 @@ def build_lifelog_episode_summary_prompt(
         OMITTED_COUNT=omitted_count,
         EPISODE_ITEMS=items_json.strip() or "[]",
     )
+
+
+LIFELOG_CHAT_SYSTEM_PROMPT = """\
+You are a personal memory assistant. Answer the user's questions using the provided memories.
+
+Guidelines:
+- Be warm, concise, and helpful.
+- Use only the provided context. If you are unsure, say you do not have enough information.
+- When referencing a memory, mention the date/time and the source index in brackets (e.g., [1]).
+- Prefer 2-4 sentences unless the user asks for more detail.
+- If the user asks multiple questions, answer each in order.
+- Use first-person perspective when referencing the user's memories.
+"""
+
+
+def build_lifelog_chat_system_prompt() -> str:
+    return LIFELOG_CHAT_SYSTEM_PROMPT
+
+
+LIFELOG_CARTOON_AGENT_PROMPT = """\
+You are an art director creating a single cartoon illustration.
+Return JSON ONLY with this exact shape:
+{
+  "image_prompt": "",
+  "caption": ""
+}
+
+Guidelines:
+- image_prompt should be vivid, concrete, and mention "cartoon illustration".
+- caption should be 8-16 words.
+- Use the memory context to pick the main scene, mood, and setting.
+- If details are missing, keep the scene generic and cozy.
+
+Date: {DATE}
+
+User instruction:
+{INSTRUCTION}
+
+Memory context:
+{MEMORY_CONTEXT}
+"""
+
+
+def build_lifelog_cartoon_agent_prompt(
+    instruction: str,
+    memory_context: str,
+    date_label: str,
+) -> str:
+    return LIFELOG_CARTOON_AGENT_PROMPT.replace("{DATE}", date_label).replace(
+        "{INSTRUCTION}", instruction.strip()
+    ).replace("{MEMORY_CONTEXT}", memory_context.strip() or "None")
+
+
+LIFELOG_DAY_INSIGHTS_AGENT_PROMPT = """\
+You are an analyst and visual designer creating a daily memory insights summary.
+Return JSON ONLY with this exact shape:
+{
+  "headline": "",
+  "summary": "",
+  "top_keywords": [],
+  "labels": [],
+  "surprise_moment": "",
+  "image_prompt": ""
+}
+
+Guidelines:
+- headline: 6-12 words that name the day or range.
+- summary: 2-4 sentences, user-centric and factual.
+- top_keywords: 5-10 lowercase keywords.
+- labels: 3-6 short labels describing dominant themes.
+- surprise_moment: 1-2 sentences about an unexpected detail.
+- image_prompt: create a clean infographic poster; include the headline and 3-5 stat callouts.
+- If details are missing, keep things generic and avoid guessing.
+
+Date range: {DATE_RANGE}
+
+User instruction:
+{INSTRUCTION}
+
+Stats JSON:
+{STATS_JSON}
+
+Memory context:
+{MEMORY_CONTEXT}
+"""
+
+
+def build_lifelog_day_insights_agent_prompt(
+    instruction: str,
+    memory_context: str,
+    date_range_label: str,
+    stats_json: str,
+) -> str:
+    return (
+        LIFELOG_DAY_INSIGHTS_AGENT_PROMPT.replace("{DATE_RANGE}", date_range_label)
+        .replace("{INSTRUCTION}", instruction.strip())
+        .replace("{STATS_JSON}", stats_json.strip() or "{}")
+        .replace("{MEMORY_CONTEXT}", memory_context.strip() or "None")
+    )
+
+
+LIFELOG_QUERY_ENTITY_PROMPT = """\
+Extract entity names from the user query below.
+Return JSON ONLY with this exact shape:
+{
+  "people": [],
+  "places": [],
+  "objects": [],
+  "organizations": [],
+  "topics": [],
+  "food": []
+}
+
+Query:
+{QUERY}
+"""
+
+
+def build_lifelog_query_entities_prompt(query: str) -> str:
+    return LIFELOG_QUERY_ENTITY_PROMPT.replace("{QUERY}", query.strip())
+
+
+LIFELOG_SESSION_TITLE_PROMPT = """\
+Create a concise 6-10 word title for a chat session.
+- Capture the full request.
+- Include dates or places if present.
+
+Request:
+"{FIRST_MESSAGE}"
+Return plain text only.
+"""
+
+
+def build_lifelog_session_title_prompt(first_message: str) -> str:
+    return LIFELOG_SESSION_TITLE_PROMPT.replace("{FIRST_MESSAGE}", first_message.strip())

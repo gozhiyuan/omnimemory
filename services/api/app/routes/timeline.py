@@ -447,10 +447,13 @@ async def get_timeline(
         local_date = (base_time - offset).date()
         if local_date in daily_summaries_by_date:
             continue
+        title = context.title or "Daily summary"
+        if title.startswith("Daily summary - "):
+            title = f"Daily summary - {local_date.isoformat()}"
         daily_summaries_by_date[local_date] = TimelineDailySummary(
             context_id=str(context.id),
             summary_date=local_date,
-            title=context.title or "Daily summary",
+            title=title,
             summary=context.summary or "",
             keywords=context.keywords or [],
         )
@@ -507,6 +510,7 @@ async def get_timeline_items(
     offset: int = 0,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    provider: Optional[str] = None,
     tz_offset_minutes: Optional[int] = None,
 ) -> TimelineItemsPage:
     offset_minutes = tz_offset_minutes or 0
@@ -524,13 +528,21 @@ async def get_timeline_items(
         end_dt = datetime.combine(end_date, time.min, tzinfo=timezone.utc) + offset_delta + timedelta(days=1)
         filters.append(event_time_expr < end_dt)
 
-    total_stmt = select(func.count(SourceItem.id)).where(*filters)
+    total_stmt = select(func.count(SourceItem.id)).select_from(SourceItem)
+    if provider:
+        total_stmt = total_stmt.join(DataConnection, SourceItem.connection_id == DataConnection.id).where(
+            DataConnection.provider == provider
+        )
+    total_stmt = total_stmt.where(*filters)
     total = (await session.execute(total_stmt)).scalar_one()
 
+    stmt = select(SourceItem).where(*filters)
+    if provider:
+        stmt = stmt.join(DataConnection, SourceItem.connection_id == DataConnection.id).where(
+            DataConnection.provider == provider
+        )
     stmt = (
-        select(SourceItem)
-        .where(*filters)
-        .order_by(SourceItem.event_time_utc.desc().nulls_last(), SourceItem.created_at.desc())
+        stmt.order_by(SourceItem.event_time_utc.desc().nulls_last(), SourceItem.created_at.desc())
         .limit(limit)
         .offset(offset)
     )

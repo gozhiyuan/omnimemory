@@ -859,12 +859,20 @@ class EventTimeStep:
 
         exif_payload = artifacts.get("exif") or {}
         exif_time = parse_iso_datetime(exif_payload.get("event_time_utc"))
+        exif_time_usable = exif_time is not None
         if not exif_time:
             exif_time = parse_exif_datetime(exif_payload.get("datetime_original"))
+            exif_time_usable = exif_time is not None
         client_offset = config.payload.get("client_tz_offset_minutes")
-        if exif_time and exif_time.tzinfo is None and isinstance(client_offset, (int, float)):
-            tzinfo = timezone(timedelta(minutes=-int(client_offset)))
-            exif_time = exif_time.replace(tzinfo=tzinfo).astimezone(timezone.utc)
+        if exif_time and exif_time.tzinfo is None:
+            if isinstance(client_offset, (int, float)):
+                tzinfo = timezone(timedelta(minutes=-int(client_offset)))
+                exif_time = exif_time.replace(tzinfo=tzinfo).astimezone(timezone.utc)
+                exif_time_usable = True
+            elif item.provider == "upload":
+                exif_time_usable = True
+            else:
+                exif_time_usable = False
         media_metadata = artifacts.get("media_metadata") or {}
         media_time = None
         if isinstance(media_metadata, dict):
@@ -877,7 +885,7 @@ class EventTimeStep:
             event_time = override_time
             source = "manual"
             confidence = 0.95
-        elif exif_time:
+        elif exif_time and exif_time_usable:
             event_time = exif_time
             source = "exif"
             confidence = 0.9 if exif_payload.get("event_time_utc") else 0.75

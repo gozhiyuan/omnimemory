@@ -30,7 +30,7 @@ Build OmniMemory, an AI-powered personal memory assistant that ingests multimoda
 - **User satisfaction:** 4/5 rating from pilot users (n=20)
 
 **Measurement & Instrumentation**
-- Supabase event tables + Prometheus counters for ingestion success/failure, latency, and queue depth
+- Postgres event tables + Prometheus counters for ingestion success/failure, latency, and queue depth
 - AI usage events (tokens + cost) logged per model call and surfaced in the Dashboard
 - Frontend feedback modal with structured thumbs-up/down + free-form notes logged per chat turn
 - OpenTelemetry traces stitched across upload → processing → retrieval for p95 latency tracking
@@ -44,7 +44,7 @@ Build OmniMemory, an AI-powered personal memory assistant that ingests multimoda
 
 **3.1 Data Layer**
 - Manual upload for photos/videos/audio with batch support and optional time window overrides per day
-- Google Photos connector (OAuth + Picker API): user launches the picker, selects items, we copy the chosen media into Supabase Storage for rendering, and enqueue ingestion; no automated full-library/delta sync (API limitation)
+- Google Photos connector (OAuth + Picker API): user launches the picker, selects items, we copy the chosen media into object storage (RustFS/S3) for rendering, and enqueue ingestion; no automated full-library/delta sync (API limitation)
 - Metadata extraction (MVP): content type, file size, EXIF/container metadata, provider metadata, normalized timestamps (`event_time_utc`)
 - Deduplication (MVP): exact dedup (SHA256) + near-duplicate dedup for images (pHash) to control costs for frequent capture sources
 - Multi-context extraction per media item (1..N contexts) using a taxonomy (activity/social/location/food/emotion/entity/knowledge)
@@ -84,13 +84,13 @@ Build OmniMemory, an AI-powered personal memory assistant that ingests multimoda
 - **Dashboard Tab:** Ingestion stats, storage usage, connected-source health indicators, and AI usage (tokens + cost)
 
 **3.6 Infrastructure**
-- **Auth/DB/Storage:** Supabase (Postgres + Auth + Object Storage)
+- **Auth/DB/Storage:** Postgres + RustFS/S3 (auth provider TBD; Supabase optional)
 - **Vector DB:** Qdrant Cloud (start) → self-hosted Qdrant (scale)
 - **API Backend:** FastAPI (Python)
-- **Task Queue:** Celery + Redis for async processing
+- **Task Queue:** Celery + Valkey (Redis-compatible) for async processing
 - **Web Frontend:** React 19 + TypeScript SPA bundled with Vite (local dev `npm run dev`, prod via Cloud Storage + Cloud CDN or Cloud Run static hosting)
-- **Local Tooling:** Make targets wrap `orchestration/docker-compose.dev.yml` to launch Postgres/Redis/Qdrant; backend uses `uv` for dependency management
-- **Cloud:** Start with Supabase + Qdrant Cloud + Cloud Run (FastAPI + Celery) while serving the SPA from Cloud Storage/Cloud CDN; migrate to more GCP-native services if commercialization requires
+- **Local Tooling:** Make targets wrap `orchestration/docker-compose.dev.yml` to launch Postgres/Valkey/Qdrant; backend uses `uv` for dependency management
+- **Cloud:** Start with Postgres + RustFS/S3 + Qdrant Cloud + Cloud Run (FastAPI + Celery) while serving the SPA from Cloud Storage/Cloud CDN; migrate to more GCP-native services if commercialization requires
 - **Security Baseline:** Encrypt at rest/in transit, store OAuth tokens with AES-256 + rotation, implement user data deletion workflow within 24h, document GDPR-compliant privacy policy
 
 ### OUT OF SCOPE (Post-MVP) ❌
@@ -123,7 +123,7 @@ Build OmniMemory, an AI-powered personal memory assistant that ingests multimoda
 
 **Rationale:**
 1. **API constraint:** Google Photos API does not allow unattended full-library sync; Picker requires user selection.
-2. **Reliable rendering:** Copying selected items into Supabase Storage avoids expired Google URLs and enables signed delivery in the app.
+2. **Reliable rendering:** Copying selected items into object storage (RustFS/S3) avoids expired Google URLs and enables signed delivery in the app.
 3. **Deterministic ingestion:** User explicitly chooses what to ingest; dedupe skips already imported media IDs.
 
 **Implementation Pattern:**
@@ -132,7 +132,7 @@ Build OmniMemory, an AI-powered personal memory assistant that ingests multimoda
 User-driven ingest (per picker session):
 1. User connects Google Photos via OAuth, then opens the Picker.
 2. Picker returns selected media IDs; backend fetches bytes for those items.
-3. Copy media to Supabase Storage (previews/original as configured) and create source_item records.
+3. Copy media to object storage (previews/original as configured) and create source_item records.
 4. Enqueue processing (captions/OCR/embeddings) and emit timeline entries.
 ```
 
@@ -168,14 +168,14 @@ User-driven ingest (per picker session):
 **Storage Strategy:**
 - **Source metadata:** Store provider IDs, timestamps, and normalized metadata in Postgres
 - **Processed artifacts:** Store captions, contexts, OCR text, transcripts, and embeddings metadata in Postgres + Qdrant
-- **Original files:** For Google Photos picker selections and manual uploads, copy media into Supabase Storage (originals + previews/posters) so the app can render reliably; keep provider IDs for dedupe
+- **Original files:** For Google Photos picker selections and manual uploads, copy media into object storage (RustFS/S3) so the app can render reliably; keep provider IDs for dedupe
 
 #### Storage Policy (MVP)
 
 Objectives: minimize storage cost, avoid duplicate originals, ensure fast UX with thumbnails/previews, and keep derived artifacts for retrieval.
 
 - Google Photos (Picker)
-  - Mirror user-selected items into Supabase Storage for thumbnails/timeline playback; keep provider IDs to avoid duplicate ingests.
+  - Mirror user-selected items into object storage (RustFS/S3) for thumbnails/timeline playback; keep provider IDs to avoid duplicate ingests.
   - Fetch only selected items; full-library or unattended delta sync is out-of-scope/blocked by API.
 - Future connectors (Apple Photos, Notion, others) follow the same rule set once implemented, but are deferred until after the MVP.
 
@@ -534,7 +534,7 @@ def route_query(query: str) -> dict:
 
 | Source | Long-term memory (embed + store) | Live MCP usage |
 |--------|----------------------------------|----------------|
-| Google Photos | Ingest user-selected Picker items; store metadata/captions/OCR/embeddings and Supabase copies for rendering | Fetch full-res on demand for already-selected items |
+| Google Photos | Ingest user-selected Picker items; store metadata/captions/OCR/embeddings and object storage copies for rendering | Fetch full-res on demand for already-selected items |
 | Google Maps | Ingest timeline events + places into structured events and embeddings | "Where am I now", live navigation/traffic, current ETA |
 | Spotify | Ingest listening history, playlists, artist metadata, embeddings | "What is playing now", control playback, latest queue |
 | Oura Ring | Ingest daily aggregates (sleep, readiness, activity) into structured tables | "Current readiness", today's live metrics before nightly sync |
@@ -721,13 +721,13 @@ Chat history is stored in Postgres (`chat_sessions`, `chat_messages`, `chat_atta
 **Data Security Measures:**
 
 1. **Encryption:**
-   - At rest: Supabase default encryption (AES-256)
+   - At rest: object storage default encryption (if managed) or disk encryption
    - In transit: TLS 1.3 for all connections
    - OAuth tokens: Encrypted in DB using application-level encryption
 
 2. **Access Control:**
    - Row-Level Security (RLS) in Postgres for all user data tables
-   - API authentication: JWT tokens from Supabase Auth
+   - API authentication: JWT tokens from auth provider (TBD)
    - Rate limiting: 100 requests/min per user
 
 3. **Privacy:**
@@ -811,7 +811,7 @@ POST   /chat/feedback                   # Per-message feedback
            ↓
 [API] → [Fetch selected media bytes]
            ↓
-[API] → [Copy to Supabase Storage] → [Create source_items]
+[API] → [Copy to object storage] → [Create source_items]
            ↓
 [API] → [Queue: process_item task]
            ↓
@@ -870,12 +870,12 @@ POST   /chat/feedback                   # Per-message feedback
 
 ### Week 1-2: Foundation
 - [ ] Set up monorepo structure
-- [ ] Initialize Supabase project (Postgres + Auth + Storage)
+- [ ] Initialize Postgres + object storage (RustFS/S3) for MVP
 - [ ] Set up Qdrant Cloud instance
-- [ ] Implement FastAPI boilerplate with Supabase Auth integration
+- [ ] Implement FastAPI boilerplate with auth integration (provider TBD)
 - [ ] Create initial database schema (users, data_connections, source_items, processed_content, daily_summaries)
-- [ ] Set up Celery + Redis for task queue
-- [ ] Create/maintain React + Vite SPA with Supabase Auth
+- [ ] Set up Celery + Valkey (Redis-compatible) for task queue
+- [ ] Create/maintain React + Vite SPA with auth integration (provider TBD)
 - [ ] Implement login/logout flow
 
 ### Week 3-4: Data Ingestion

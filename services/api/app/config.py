@@ -48,12 +48,19 @@ class Settings(BaseSettings):
     postgres_user: str = "lifelog"
     postgres_password: str = "lifelog"
 
-    # Supabase (optional for local filesystem development)
+    # Supabase (optional for managed storage)
     supabase_url: Optional[AnyUrl] = Field(default=None)
     supabase_service_role_key: Optional[str] = Field(default=None)
 
+    # S3-compatible storage (RustFS/MinIO/AWS)
+    s3_endpoint_url: Optional[AnyUrl] = Field(default=None)
+    s3_access_key_id: Optional[str] = None
+    s3_secret_access_key: Optional[str] = None
+    s3_region: str = "us-east-1"
+    s3_force_path_style: bool = True
+
     # Storage buckets/strategy
-    storage_provider: Literal["supabase", "memory"] = "memory"
+    storage_provider: Literal["supabase", "memory", "s3"] = "s3"
     bucket_originals: str = "originals"
     bucket_previews: str = "previews"
     bucket_thumbnails: str = "thumbnails"
@@ -177,6 +184,9 @@ class Settings(BaseSettings):
         for key in (
             "supabase_url",
             "supabase_service_role_key",
+            "s3_endpoint_url",
+            "s3_access_key_id",
+            "s3_secret_access_key",
             "ocr_google_api_key",
             "gemini_api_key",
             "ocr_language_hints_raw",

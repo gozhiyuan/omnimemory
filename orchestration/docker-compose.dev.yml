@@ -19,15 +19,28 @@ services:
       retries: 10
 
   redis:
-    image: redis:7-alpine
+    image: valkey/valkey:7-alpine
     container_name: lifelog-redis
     ports:
       - "6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "valkey-cli ping || redis-cli ping"]
       interval: 10s
       timeout: 5s
       retries: 5
+
+  rustfs:
+    image: ${RUSTFS_IMAGE:-rustfs/rustfs:latest}
+    container_name: lifelog-rustfs
+    ports:
+      - "9000:9000"   # S3-compatible API
+      - "9001:9001"   # optional console (if enabled by the image)
+    # Adjust env/command to match the RustFS image you use.
+    environment:
+      - RUSTFS_ACCESS_KEY=${S3_ACCESS_KEY_ID:-rustfs}
+      - RUSTFS_SECRET_KEY=${S3_SECRET_ACCESS_KEY:-rustfs123}
+    volumes:
+      - rustfs_data:/data
 
   qdrant:
     image: qdrant/qdrant:latest
@@ -115,3 +128,4 @@ services:
 volumes:
   pg_data:
   qdrant_data:
+  rustfs_data:

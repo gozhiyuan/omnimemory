@@ -43,6 +43,14 @@ export interface ChatResponse {
   sources: ChatSource[];
 }
 
+export interface AgentImageResponse {
+  message: string;
+  session_id: string;
+  attachments: ChatAttachment[];
+  prompt?: string | null;
+  caption?: string | null;
+}
+
 export interface ChatSessionSummary {
   session_id: string;
   title?: string | null;

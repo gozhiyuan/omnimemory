@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
 from uuid import UUID, uuid4
 
@@ -13,8 +13,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..ai import analyze_image_with_vlm, summarize_text_with_gemini
+from ..ai import analyze_image_with_vlm, generate_image_with_gemini, summarize_text_with_gemini
 from ..ai.prompts import (
+    build_lifelog_cartoon_agent_prompt,
     build_lifelog_chat_system_prompt,
     build_lifelog_image_prompt,
     build_lifelog_session_title_prompt,
@@ -81,6 +82,21 @@ class ChatAttachmentResponse(BaseModel):
     url: str
 
 
+class AgentImageRequest(BaseModel):
+    session_id: Optional[UUID] = None
+    date: Optional[str] = None
+    prompt: Optional[str] = None
+    tz_offset_minutes: Optional[int] = None
+
+
+class AgentImageResponse(BaseModel):
+    message: str
+    session_id: UUID
+    attachments: list[ChatAttachmentOut] = []
+    prompt: Optional[str] = None
+    caption: Optional[str] = None
+
+
 class ChatSessionSummary(BaseModel):
     session_id: UUID
     title: Optional[str] = None
@@ -128,6 +144,12 @@ def _truncate_text(value: str, limit: int = 1200) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[:limit].rstrip() + "..."
+
+
+DEFAULT_CARTOON_AGENT_INSTRUCTION = (
+    "Create a whimsical cartoon illustration that summarizes the day. "
+    "Highlight the main activity, mood, and setting."
+)
 
 
 def _dedupe_sources(sources: list[ChatSource]) -> list[ChatSource]:
@@ -244,6 +266,75 @@ def _format_history_block(history: list[ChatMessage]) -> str:
         if content:
             lines.append(f"{role}: {content}")
     return "\n".join(lines)
+
+
+def _resolve_agent_date(
+    date_value: Optional[str],
+    *,
+    tz_offset_minutes: Optional[int],
+) -> date:
+    offset = timedelta(minutes=tz_offset_minutes or 0)
+    if date_value:
+        return date.fromisoformat(date_value)
+    return (datetime.now(timezone.utc) - offset).date()
+
+
+async def _load_agent_day_context(
+    session: AsyncSession,
+    user_id: UUID,
+    local_date: date,
+    *,
+    tz_offset_minutes: Optional[int],
+    limit: int = 24,
+) -> tuple[Optional[ProcessedContext], list[ProcessedContext]]:
+    offset = timedelta(minutes=tz_offset_minutes or 0)
+    start = datetime.combine(local_date, time.min, tzinfo=timezone.utc) + offset
+    end = start + timedelta(days=1)
+
+    summary_stmt = (
+        select(ProcessedContext)
+        .where(
+            ProcessedContext.user_id == user_id,
+            ProcessedContext.context_type == "daily_summary",
+            ProcessedContext.start_time_utc >= start,
+            ProcessedContext.start_time_utc < end,
+        )
+        .order_by(ProcessedContext.created_at.desc())
+        .limit(1)
+    )
+    summary_row = await session.execute(summary_stmt)
+    summary_context = summary_row.scalar_one_or_none()
+
+    ctx_stmt = (
+        select(ProcessedContext)
+        .where(
+            ProcessedContext.user_id == user_id,
+            ProcessedContext.context_type != "daily_summary",
+            ProcessedContext.event_time_utc >= start,
+            ProcessedContext.event_time_utc < end,
+        )
+        .order_by(ProcessedContext.event_time_utc.asc())
+        .limit(limit)
+    )
+    ctx_rows = await session.execute(ctx_stmt)
+    contexts = list(ctx_rows.scalars().all())
+    return summary_context, contexts
+
+
+def _build_agent_memory_context(
+    summary_context: Optional[ProcessedContext],
+    contexts: list[ProcessedContext],
+) -> str:
+    sections: list[str] = []
+    if summary_context and summary_context.summary:
+        sections.append(f"Daily summary: {summary_context.summary.strip()}")
+    if contexts:
+        block = _format_context_block([(ctx, {}) for ctx in contexts])
+        if block:
+            sections.append(f"Memories:\n{block}")
+    if not sections:
+        return "No memories available for this date."
+    return "\n\n".join(sections)
 
 
 async def _generate_session_title(first_message: str) -> str:
@@ -800,6 +891,139 @@ async def chat_with_image(
         tz_offset_minutes=tz_offset_minutes,
         image_context=image_context,
         attachments=[attachment_payload],
+    )
+
+
+@router.post("/agents/cartoon", response_model=AgentImageResponse)
+async def agent_cartoon_day_summary(
+    payload: AgentImageRequest,
+    user_id: UUID = DEFAULT_TEST_USER_ID,
+    session: AsyncSession = Depends(get_session),
+) -> AgentImageResponse:
+    settings = get_settings()
+    if not settings.agent_enabled:
+        raise HTTPException(status_code=503, detail="Agent features are disabled")
+    if settings.agent_image_provider != "gemini" or not settings.gemini_api_key:
+        raise HTTPException(status_code=503, detail="Image model not configured")
+
+    local_date = _resolve_agent_date(payload.date, tz_offset_minutes=payload.tz_offset_minutes)
+    summary_context, contexts = await _load_agent_day_context(
+        session,
+        user_id,
+        local_date,
+        tz_offset_minutes=payload.tz_offset_minutes,
+    )
+    memory_context = _build_agent_memory_context(summary_context, contexts)
+    instruction = (payload.prompt or "").strip() or DEFAULT_CARTOON_AGENT_INSTRUCTION
+
+    prompt = build_lifelog_cartoon_agent_prompt(
+        instruction=instruction,
+        memory_context=memory_context,
+        date_label=local_date.isoformat(),
+    )
+    prompt_response = await summarize_text_with_gemini(
+        prompt=prompt,
+        settings=settings,
+        model=settings.agent_prompt_model,
+        temperature=settings.agent_prompt_temperature,
+        max_output_tokens=512,
+        timeout_seconds=settings.chat_timeout_seconds,
+        step_name="agent_cartoon_prompt",
+        user_id=user_id,
+    )
+    parsed = prompt_response.get("parsed")
+    image_prompt = None
+    caption = None
+    if isinstance(parsed, dict):
+        image_prompt = parsed.get("image_prompt")
+        caption = parsed.get("caption")
+    image_prompt = (image_prompt or instruction).strip()
+    if not caption:
+        caption = f"Cartoon day summary for {local_date.isoformat()}."
+
+    model = settings.agent_image_model or "gemini-2.5-flash-image"
+    image_result = await generate_image_with_gemini(
+        image_prompt,
+        settings,
+        model,
+        settings.agent_image_timeout_seconds,
+        user_id=user_id,
+        step_name="agent_cartoon_image",
+    )
+    images = image_result.get("images") or []
+    if not images:
+        raise HTTPException(status_code=502, detail="Image generation failed")
+    image = images[0]
+
+    session_record = await _get_or_create_session(
+        session,
+        user_id,
+        payload.session_id,
+        f"Cartoon day summary {local_date.isoformat()}",
+    )
+    now = datetime.now(timezone.utc)
+    session_record.updated_at = now
+    session_record.last_message_at = now
+
+    user_msg = ChatMessage(
+        session_id=session_record.id,
+        user_id=user_id,
+        role="user",
+        content=f"Cartoon day summary for {local_date.isoformat()}",
+        sources=[],
+        created_at=now,
+    )
+    assistant_content = f"{caption}\n\nPrompt:\n{image_prompt}".strip()
+    assistant_msg = ChatMessage(
+        session_id=session_record.id,
+        user_id=user_id,
+        role="assistant",
+        content=assistant_content,
+        sources=[],
+        created_at=now + timedelta(milliseconds=1),
+    )
+    session.add_all([user_msg, assistant_msg])
+    await session.flush()
+
+    attachment_payload = await _store_attachment_bytes(
+        user_id=user_id,
+        session_id=session_record.id,
+        image_bytes=image.data,
+        content_type=image.content_type,
+        original_filename=f"cartoon-{local_date.isoformat()}.png",
+    )
+    attachment = ChatAttachment(
+        user_id=user_id,
+        session_id=session_record.id,
+        message_id=assistant_msg.id,
+        storage_key=attachment_payload.get("storage_key"),
+        content_type=attachment_payload.get("content_type"),
+        original_filename=attachment_payload.get("original_filename"),
+        size_bytes=attachment_payload.get("size_bytes"),
+    )
+    session.add(attachment)
+    await session.flush()
+    await session.commit()
+
+    storage = get_storage_provider()
+    url = await _sign_storage_url(storage, settings, attachment.storage_key)
+    attachments = []
+    if url:
+        attachments.append(
+            ChatAttachmentOut(
+                id=attachment.id,
+                url=url,
+                content_type=attachment.content_type,
+                created_at=attachment.created_at,
+            )
+        )
+
+    return AgentImageResponse(
+        message=assistant_content,
+        session_id=session_record.id,
+        attachments=attachments,
+        prompt=image_prompt,
+        caption=caption,
     )
 
 

@@ -1,5 +1,15 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Send, Bot, User, Sparkles, Loader2, Image as ImageIcon, Plus } from 'lucide-react';
+import {
+  Send,
+  Bot,
+  User,
+  Sparkles,
+  Loader2,
+  Image as ImageIcon,
+  Plus,
+  Video,
+  X,
+} from 'lucide-react';
 import { apiGet, apiPost, apiPostForm } from '../services/api';
 import {
   ChatMessage,
@@ -8,9 +18,70 @@ import {
   ChatSessionSummary,
   ChatSource,
   TimelineItemDetail,
+  AgentImageResponse,
 } from '../types';
 
 const CHAT_SESSION_KEY = 'lifelog.chat.session';
+const CHAT_AGENT_PROMPTS_KEY = 'lifelog.chat.agent_prompts';
+
+type AgentSpec = {
+  id: string;
+  name: string;
+  description: string;
+  defaultPrompt: string;
+  outputLabel: string;
+  icon: typeof ImageIcon;
+  disabled?: boolean;
+  disabledLabel?: string;
+};
+
+const buildLocalDate = () => {
+  const now = new Date();
+  const offset = now.getTimezoneOffset();
+  return new Date(now.getTime() - offset * 60 * 1000).toISOString().slice(0, 10);
+};
+
+const AGENTS: AgentSpec[] = [
+  {
+    id: 'daily_cartoon',
+    name: 'Cartoon Day Summary',
+    description: 'Generate a playful cartoon scene prompt that captures the day.',
+    defaultPrompt:
+      'Create a whimsical cartoon illustration that summarizes my day on {date}. Highlight the main activities, mood, and setting. Return a concise image prompt and a one-line caption.',
+    outputLabel: 'Image prompt',
+    icon: ImageIcon,
+  },
+  {
+    id: 'daily_vlog',
+    name: 'Daily Vlog Plan',
+    description: 'Draft a short vlog outline using memories from the day.',
+    defaultPrompt:
+      'Create a 45-60 second vlog plan for {date}. Provide a title, 5-7 shot list, a one-line narration hook, and suggested music mood.',
+    outputLabel: 'Vlog outline',
+    icon: Video,
+    disabled: true,
+    disabledLabel: 'Post-MVP',
+  },
+];
+
+const dedupeSources = (sources: ChatSource[]) => {
+  const seenItems = new Set<string>();
+  const seenContexts = new Set<string>();
+  return sources.filter((source) => {
+    if (source.source_item_id) {
+      if (seenItems.has(source.source_item_id)) {
+        return false;
+      }
+      seenItems.add(source.source_item_id);
+      return true;
+    }
+    if (seenContexts.has(source.context_id)) {
+      return false;
+    }
+    seenContexts.add(source.context_id);
+    return true;
+  });
+};
 
 export const ChatInterface: React.FC = () => {
   const buildWelcomeMessage = (): ChatMessage => ({
@@ -31,6 +102,23 @@ export const ChatInterface: React.FC = () => {
   });
   const [selectedImage, setSelectedImage] = useState<File | null>(null);
   const [selectedImagePreview, setSelectedImagePreview] = useState<string | null>(null);
+  const [agentDate, setAgentDate] = useState(buildLocalDate);
+  const [agentPromptOverrides, setAgentPromptOverrides] = useState<Record<string, string>>(() => {
+    if (typeof window === 'undefined') return {};
+    try {
+      const raw = localStorage.getItem(CHAT_AGENT_PROMPTS_KEY);
+      return raw ? (JSON.parse(raw) as Record<string, string>) : {};
+    } catch (err) {
+      console.error('Failed to load agent prompts', err);
+      return {};
+    }
+  });
+  const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
+  const [agentPromptDraft, setAgentPromptDraft] = useState('');
+  const [previewAttachment, setPreviewAttachment] = useState<{
+    url: string;
+    name: string;
+  } | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const objectUrlsRef = useRef<string[]>([]);
@@ -79,6 +167,15 @@ export const ChatInterface: React.FC = () => {
       objectUrlsRef.current = [];
     };
   }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      localStorage.setItem(CHAT_AGENT_PROMPTS_KEY, JSON.stringify(agentPromptOverrides));
+    } catch (err) {
+      console.error('Failed to save agent prompts', err);
+    }
+  }, [agentPromptOverrides]);
 
   const loadSession = async (targetId: string) => {
     setLoadingHistory(true);
@@ -177,13 +274,59 @@ export const ChatInterface: React.FC = () => {
     );
   };
 
-  const handleSend = async (e?: React.FormEvent) => {
-    e?.preventDefault();
-    if ((!input.trim() && !selectedImage) || loading) return;
+  const resolveAgentPrompt = (agentId: string) => {
+    const agent = AGENTS.find((item) => item.id === agentId);
+    if (!agent) {
+      return '';
+    }
+    return agentPromptOverrides[agentId] || agent.defaultPrompt;
+  };
 
-    const imageFile = selectedImage;
-    const imagePreview = selectedImagePreview;
-    const messageText = input.trim();
+  const openAgentPromptEditor = (agentId: string) => {
+    setEditingAgentId(agentId);
+    setAgentPromptDraft(resolveAgentPrompt(agentId));
+  };
+
+  const closeAgentPromptEditor = () => {
+    setEditingAgentId(null);
+    setAgentPromptDraft('');
+  };
+
+  const saveAgentPrompt = () => {
+    if (!editingAgentId) {
+      return;
+    }
+    const cleaned = agentPromptDraft.trim();
+    setAgentPromptOverrides((prev) => {
+      const next = { ...prev };
+      if (cleaned) {
+        next[editingAgentId] = cleaned;
+      } else {
+        delete next[editingAgentId];
+      }
+      return next;
+    });
+    closeAgentPromptEditor();
+  };
+
+  const resetAgentPrompt = () => {
+    if (!editingAgentId) {
+      return;
+    }
+    const agent = AGENTS.find((item) => item.id === editingAgentId);
+    setAgentPromptDraft(agent?.defaultPrompt || '');
+  };
+
+  const sendMessage = async ({
+    messageText,
+    imageFile,
+    imagePreview,
+  }: {
+    messageText: string;
+    imageFile?: File | null;
+    imagePreview?: string | null;
+  }) => {
+    if ((!messageText.trim() && !imageFile) || loading) return;
 
     const userMsg: ChatMessage = {
       id: Date.now().toString(),
@@ -202,10 +345,7 @@ export const ChatInterface: React.FC = () => {
         : undefined,
     };
 
-    setMessages(prev => [...prev, userMsg]);
-    setInput('');
-    setSelectedImage(null);
-    setSelectedImagePreview(null);
+    setMessages((prev) => [...prev, userMsg]);
     setLoading(true);
 
     try {
@@ -231,7 +371,7 @@ export const ChatInterface: React.FC = () => {
         setSessionId(response.session_id);
         localStorage.setItem(CHAT_SESSION_KEY, response.session_id);
       }
-      
+
       const aiMsg: ChatMessage = {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
@@ -240,7 +380,7 @@ export const ChatInterface: React.FC = () => {
         sources: response.sources,
       };
 
-      setMessages(prev => [...prev, aiMsg]);
+      setMessages((prev) => [...prev, aiMsg]);
       await refreshSessions();
     } catch (err) {
       console.error(err);
@@ -250,10 +390,101 @@ export const ChatInterface: React.FC = () => {
         content: "I'm having trouble connecting right now. Please try again.",
         timestamp: new Date(),
       };
-      setMessages(prev => [...prev, errorMsg]);
+      setMessages((prev) => [...prev, errorMsg]);
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleSend = async (e?: React.FormEvent) => {
+    e?.preventDefault();
+    if ((!input.trim() && !selectedImage) || loading) return;
+
+    const imageFile = selectedImage;
+    const imagePreview = selectedImagePreview;
+    const messageText = input.trim();
+
+    setInput('');
+    setSelectedImage(null);
+    setSelectedImagePreview(null);
+
+    await sendMessage({ messageText, imageFile, imagePreview });
+  };
+
+  const handleAgentRun = async (agentId: string) => {
+    const agent = AGENTS.find((item) => item.id === agentId);
+    if (!agent || agent.disabled || loading) {
+      return;
+    }
+    const rawPrompt = resolveAgentPrompt(agentId);
+    const resolvedPrompt = rawPrompt.replace(/\{date\}/g, agentDate);
+    const finalPrompt = resolvedPrompt.includes(agentDate)
+      ? resolvedPrompt
+      : `${resolvedPrompt}\n\nUse memories from ${agentDate} only.`;
+
+    if (agent.id === 'daily_cartoon') {
+      const userMsg: ChatMessage = {
+        id: Date.now().toString(),
+        role: 'user',
+        content: `Run agent: ${agent.name} (${agentDate})`,
+        timestamp: new Date(),
+      };
+      setMessages((prev) => [...prev, userMsg]);
+      setLoading(true);
+      try {
+        const response = await apiPost<AgentImageResponse>('/chat/agents/cartoon', {
+          prompt: finalPrompt,
+          date: agentDate,
+          session_id: sessionId || undefined,
+          tz_offset_minutes: new Date().getTimezoneOffset(),
+        });
+        if (!sessionId || sessionId !== response.session_id) {
+          setSessionId(response.session_id);
+          localStorage.setItem(CHAT_SESSION_KEY, response.session_id);
+        }
+        const aiMsg: ChatMessage = {
+          id: (Date.now() + 1).toString(),
+          role: 'assistant',
+          content: response.message,
+          timestamp: new Date(),
+          attachments: response.attachments,
+        };
+        setMessages((prev) => [...prev, aiMsg]);
+        await refreshSessions();
+      } catch (err) {
+        console.error(err);
+        const errorMsg: ChatMessage = {
+          id: (Date.now() + 1).toString(),
+          role: 'assistant',
+          content: "I'm having trouble generating that image right now.",
+          timestamp: new Date(),
+        };
+        setMessages((prev) => [...prev, errorMsg]);
+      } finally {
+        setLoading(false);
+      }
+      return;
+    }
+
+    const messageText = `[Agent: ${agent.name}]\n${finalPrompt}`;
+    await sendMessage({ messageText });
+  };
+
+  const editingAgent = editingAgentId
+    ? AGENTS.find((item) => item.id === editingAgentId) || null
+    : null;
+
+  const buildAttachmentName = (url: string, fallback: string) => {
+    try {
+      const parsed = new URL(url);
+      const name = parsed.pathname.split('/').pop();
+      if (name) {
+        return name;
+      }
+    } catch (err) {
+      console.error('Failed to parse attachment URL', err);
+    }
+    return fallback;
   };
 
   return (
@@ -302,7 +533,7 @@ export const ChatInterface: React.FC = () => {
         </div>
       </aside>
 
-      <div className="flex flex-col flex-1">
+      <div className="flex flex-col flex-1 min-w-0">
         {/* Header */}
         <div className="px-6 py-4 bg-white border-b border-slate-200 flex justify-between items-center shadow-sm z-10">
           <div>
@@ -322,13 +553,15 @@ export const ChatInterface: React.FC = () => {
           {loadingHistory && (
             <p className="text-center text-xs text-slate-400">Loading chat history...</p>
           )}
-          {messages.map((msg) => (
-            <div
-              key={msg.id}
-              className={`flex items-start max-w-3xl mx-auto ${
-                msg.role === 'user' ? 'flex-row-reverse' : 'flex-row'
-              }`}
-            >
+          {messages.map((msg) => {
+            const uniqueSources = msg.sources ? dedupeSources(msg.sources) : [];
+            return (
+              <div
+                key={msg.id}
+                className={`flex items-start max-w-3xl mx-auto ${
+                  msg.role === 'user' ? 'flex-row-reverse' : 'flex-row'
+                }`}
+              >
             {/* Avatar */}
             <div
               className={`flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center ${
@@ -347,12 +580,24 @@ export const ChatInterface: React.FC = () => {
               {msg.attachments && msg.attachments.length > 0 && (
                 <div className="mb-2 flex gap-2 flex-wrap">
                   {msg.attachments.map((attachment) => (
-                    <img
+                    <button
                       key={attachment.id}
-                      src={attachment.url}
-                      alt="Uploaded"
-                      className="w-48 h-32 object-cover rounded-xl border border-slate-200"
-                    />
+                      type="button"
+                      onClick={() =>
+                        setPreviewAttachment({
+                          url: attachment.url,
+                          name: buildAttachmentName(attachment.url, `attachment-${attachment.id}`),
+                        })
+                      }
+                      className="rounded-xl border border-slate-200 overflow-hidden"
+                      title="View image"
+                    >
+                      <img
+                        src={attachment.url}
+                        alt="Uploaded"
+                        className="w-48 h-32 object-cover cursor-zoom-in"
+                      />
+                    </button>
                   ))}
                 </div>
               )}
@@ -367,11 +612,11 @@ export const ChatInterface: React.FC = () => {
               </div>
               
               {/* Sources (assistant only) */}
-              {msg.role === 'assistant' && msg.sources && msg.sources.length > 0 && (
+              {msg.role === 'assistant' && uniqueSources.length > 0 && (
                 <div className="mt-3 ml-1">
                    <p className="text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">Relevant Memories</p>
                    <div className="flex space-x-3 overflow-x-auto pb-2 no-scrollbar max-w-full">
-                     {msg.sources.map(src => (
+                     {uniqueSources.map((src) => (
                        <div
                          key={src.context_id}
                          onClick={() => handleSourceClick(src)}
@@ -405,7 +650,8 @@ export const ChatInterface: React.FC = () => {
               </span>
             </div>
           </div>
-        ))}
+        );
+        })}
         {loading && (
           <div className="flex items-start max-w-3xl mx-auto">
              <div className="flex-shrink-0 w-8 h-8 rounded-full bg-primary-100 mr-3 flex items-center justify-center">
@@ -422,14 +668,26 @@ export const ChatInterface: React.FC = () => {
 
         {/* Input */}
         <div className="bg-white border-t border-slate-200 p-4 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)]">
-          {selectedImagePreview && (
+              {selectedImagePreview && (
             <div className="max-w-3xl mx-auto mb-3 flex items-center justify-between gap-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
               <div className="flex items-center gap-3">
-                <img
-                  src={selectedImagePreview}
-                  alt="Selected"
-                  className="w-14 h-14 rounded-md object-cover border border-slate-200"
-                />
+                <button
+                  type="button"
+                  onClick={() =>
+                    setPreviewAttachment({
+                      url: selectedImagePreview,
+                      name: 'selected-image',
+                    })
+                  }
+                  className="rounded-md border border-slate-200 overflow-hidden"
+                  title="View image"
+                >
+                  <img
+                    src={selectedImagePreview}
+                    alt="Selected"
+                    className="w-14 h-14 object-cover cursor-zoom-in"
+                  />
+                </button>
                 <div className="text-xs text-slate-600">
                   <p className="font-medium">Image attached</p>
                   <p className="text-slate-400">Ask a question to find related memories.</p>
@@ -488,6 +746,184 @@ export const ChatInterface: React.FC = () => {
           </p>
         </div>
       </div>
+
+      <aside className="hidden xl:flex w-80 bg-white border-l border-slate-200 flex-col">
+        <div className="px-4 py-4 border-b border-slate-200">
+          <p className="text-xs uppercase tracking-wider text-slate-400">Studio</p>
+          <p className="text-sm font-semibold text-slate-800">Downstream agents</p>
+          <div className="mt-3">
+            <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+              Target day
+            </label>
+            <input
+              type="date"
+              value={agentDate}
+              onChange={(event) => setAgentDate(event.target.value)}
+              className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700 focus:border-primary-400 focus:outline-none focus:ring-2 focus:ring-primary-100"
+            />
+            <p className="mt-1 text-[10px] text-slate-400">Prompts support {`{date}`}.</p>
+          </div>
+        </div>
+        <div className="flex-1 overflow-y-auto p-4 space-y-3">
+          {AGENTS.map((agent) => {
+            const AgentIcon = agent.icon;
+            const isCustomized = Boolean(agentPromptOverrides[agent.id]);
+            return (
+              <div
+                key={agent.id}
+                className={`rounded-2xl border border-slate-200 bg-white p-4 shadow-sm ${
+                  agent.disabled ? 'opacity-70' : ''
+                }`}
+              >
+                <div className="flex items-start gap-3">
+                  <div className="h-10 w-10 rounded-xl bg-slate-100 flex items-center justify-center">
+                    <AgentIcon className="h-5 w-5 text-slate-600" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-semibold text-slate-900">{agent.name}</p>
+                    <p className="text-xs text-slate-500 mt-1">{agent.description}</p>
+                    <div className="mt-2 flex flex-wrap gap-2 text-[10px] text-slate-400">
+                      <span className="rounded-full bg-slate-100 px-2 py-0.5 text-slate-500">
+                        {agent.outputLabel}
+                      </span>
+                      {isCustomized && (
+                        <span className="rounded-full bg-primary-50 px-2 py-0.5 text-primary-600">
+                          Custom
+                        </span>
+                      )}
+                      {agent.disabled && agent.disabledLabel && (
+                        <span className="rounded-full bg-slate-200 px-2 py-0.5 text-slate-600">
+                          {agent.disabledLabel}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+                <div className="mt-3 flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => handleAgentRun(agent.id)}
+                    disabled={loading || agent.disabled}
+                    className="flex-1 rounded-lg bg-primary-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-primary-700 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400"
+                  >
+                    {agent.disabled ? 'Disabled' : 'Run'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => openAgentPromptEditor(agent.id)}
+                    className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 hover:border-slate-300 hover:text-slate-800"
+                    disabled={agent.disabled}
+                  >
+                    Edit prompt
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div className="px-4 py-3 border-t border-slate-200 text-[11px] text-slate-400">
+          Agents run through the same memory context as chat. Wire in image/video APIs to
+          generate media outputs.
+        </div>
+      </aside>
+
+      {editingAgent && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4">
+          <div className="w-full max-w-xl rounded-2xl border border-slate-200 bg-white shadow-xl">
+            <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
+              <div>
+                <p className="text-xs uppercase tracking-wider text-slate-400">Edit agent prompt</p>
+                <p className="text-sm font-semibold text-slate-800">{editingAgent.name}</p>
+              </div>
+              <button
+                type="button"
+                onClick={closeAgentPromptEditor}
+                className="rounded-full p-1 text-slate-400 hover:text-slate-600"
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className="px-5 py-4 space-y-3">
+              <textarea
+                value={agentPromptDraft}
+                onChange={(event) => setAgentPromptDraft(event.target.value)}
+                rows={6}
+                className="w-full rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700 focus:border-primary-400 focus:outline-none focus:ring-2 focus:ring-primary-100"
+              />
+              <p className="text-[11px] text-slate-400">
+                Use {`{date}`} to inject the target day. Prompts are saved per browser.
+              </p>
+            </div>
+            <div className="flex items-center justify-between border-t border-slate-200 px-5 py-4">
+              <button
+                type="button"
+                onClick={resetAgentPrompt}
+                className="text-xs font-semibold text-slate-500 hover:text-slate-700"
+              >
+                Reset to default
+              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={closeAgentPromptEditor}
+                  className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 hover:border-slate-300 hover:text-slate-800"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={saveAgentPrompt}
+                  className="rounded-lg bg-primary-600 px-3 py-2 text-xs font-semibold text-white hover:bg-primary-700"
+                >
+                  Save prompt
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {previewAttachment && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 p-4">
+          <div className="w-full max-w-4xl rounded-2xl border border-slate-200 bg-white shadow-xl overflow-hidden">
+            <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
+              <p className="text-sm font-semibold text-slate-800">Image preview</p>
+              <button
+                type="button"
+                onClick={() => setPreviewAttachment(null)}
+                className="rounded-full p-1 text-slate-400 hover:text-slate-600"
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className="bg-slate-50 px-5 py-4 flex items-center justify-center">
+              <img
+                src={previewAttachment.url}
+                alt="Preview"
+                className="max-h-[70vh] w-auto rounded-xl border border-slate-200"
+              />
+            </div>
+            <div className="flex items-center justify-between border-t border-slate-200 px-5 py-3">
+              <a
+                href={previewAttachment.url}
+                download={previewAttachment.name}
+                target="_blank"
+                rel="noreferrer"
+                className="rounded-lg bg-primary-600 px-3 py-2 text-xs font-semibold text-white hover:bg-primary-700"
+              >
+                Download
+              </a>
+              <button
+                type="button"
+                onClick={() => setPreviewAttachment(null)}
+                className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 hover:border-slate-300 hover:text-slate-800"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

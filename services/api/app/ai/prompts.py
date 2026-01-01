@@ -280,12 +280,47 @@ Guidelines:
 - Use only the provided context. If you are unsure, say you do not have enough information.
 - When referencing a memory, mention the date/time and the source index in brackets (e.g., [1]).
 - Prefer 2-4 sentences unless the user asks for more detail.
+- If the user asks multiple questions, answer each in order.
 - Use first-person perspective when referencing the user's memories.
 """
 
 
 def build_lifelog_chat_system_prompt() -> str:
     return LIFELOG_CHAT_SYSTEM_PROMPT
+
+
+LIFELOG_CARTOON_AGENT_PROMPT = """\
+You are an art director creating a single cartoon illustration.
+Return JSON ONLY with this exact shape:
+{
+  "image_prompt": "",
+  "caption": ""
+}
+
+Guidelines:
+- image_prompt should be vivid, concrete, and mention "cartoon illustration".
+- caption should be 8-16 words.
+- Use the memory context to pick the main scene, mood, and setting.
+- If details are missing, keep the scene generic and cozy.
+
+Date: {DATE}
+
+User instruction:
+{INSTRUCTION}
+
+Memory context:
+{MEMORY_CONTEXT}
+"""
+
+
+def build_lifelog_cartoon_agent_prompt(
+    instruction: str,
+    memory_context: str,
+    date_label: str,
+) -> str:
+    return LIFELOG_CARTOON_AGENT_PROMPT.replace("{DATE}", date_label).replace(
+        "{INSTRUCTION}", instruction.strip()
+    ).replace("{MEMORY_CONTEXT}", memory_context.strip() or "None")
 
 
 LIFELOG_QUERY_ENTITY_PROMPT = """\

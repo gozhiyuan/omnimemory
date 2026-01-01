@@ -62,6 +62,15 @@ const AGENTS: AgentSpec[] = [
     disabled: true,
     disabledLabel: 'Post-MVP',
   },
+  {
+    id: 'daily_insights',
+    name: 'Day Insights Infographic',
+    description: 'Summarize the day with stats, themes, and a surprise moment.',
+    defaultPrompt:
+      'Create a daily insights report for {date}. Include key stats, top keywords, labels, and a surprise detail. Return an infographic image prompt.',
+    outputLabel: 'Infographic',
+    icon: Sparkles,
+  },
 ];
 
 const dedupeSources = (sources: ChatSource[]) => {
@@ -87,7 +96,7 @@ export const ChatInterface: React.FC = () => {
   const buildWelcomeMessage = (): ChatMessage => ({
     id: 'welcome',
     role: 'assistant',
-    content: "Hi there! I'm Lifelog AI. I've analyzed your photos and logs. Ask me anything about your memories!",
+    content: "Hi there! I'm OmniMemory. I've analyzed your photos and logs. Ask me anything about your memories!",
     timestamp: new Date(),
   });
 
@@ -466,6 +475,51 @@ export const ChatInterface: React.FC = () => {
       return;
     }
 
+    if (agent.id === 'daily_insights') {
+      const userMsg: ChatMessage = {
+        id: Date.now().toString(),
+        role: 'user',
+        content: `Run agent: ${agent.name} (${agentDate})`,
+        timestamp: new Date(),
+      };
+      setMessages((prev) => [...prev, userMsg]);
+      setLoading(true);
+      try {
+        const response = await apiPost<AgentImageResponse>('/chat/agents/insights', {
+          prompt: finalPrompt,
+          date: agentDate,
+          session_id: sessionId || undefined,
+          tz_offset_minutes: new Date().getTimezoneOffset(),
+          include_image: true,
+        });
+        if (!sessionId || sessionId !== response.session_id) {
+          setSessionId(response.session_id);
+          localStorage.setItem(CHAT_SESSION_KEY, response.session_id);
+        }
+        const aiMsg: ChatMessage = {
+          id: (Date.now() + 1).toString(),
+          role: 'assistant',
+          content: response.message,
+          timestamp: new Date(),
+          attachments: response.attachments,
+        };
+        setMessages((prev) => [...prev, aiMsg]);
+        await refreshSessions();
+      } catch (err) {
+        console.error(err);
+        const errorMsg: ChatMessage = {
+          id: (Date.now() + 1).toString(),
+          role: 'assistant',
+          content: "I'm having trouble generating that insight right now.",
+          timestamp: new Date(),
+        };
+        setMessages((prev) => [...prev, errorMsg]);
+      } finally {
+        setLoading(false);
+      }
+      return;
+    }
+
     const messageText = `[Agent: ${agent.name}]\n${finalPrompt}`;
     await sendMessage({ messageText });
   };
@@ -742,7 +796,7 @@ export const ChatInterface: React.FC = () => {
             </button>
           </form>
           <p className="text-center text-[10px] text-slate-400 mt-2">
-            Lifelog AI may display inaccurate info. Verify important details.
+            OmniMemory may display inaccurate info. Verify important details.
           </p>
         </div>
       </div>

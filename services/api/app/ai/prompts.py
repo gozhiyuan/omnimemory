@@ -323,6 +323,54 @@ def build_lifelog_cartoon_agent_prompt(
     ).replace("{MEMORY_CONTEXT}", memory_context.strip() or "None")
 
 
+LIFELOG_DAY_INSIGHTS_AGENT_PROMPT = """\
+You are an analyst and visual designer creating a daily memory insights summary.
+Return JSON ONLY with this exact shape:
+{
+  "headline": "",
+  "summary": "",
+  "top_keywords": [],
+  "labels": [],
+  "surprise_moment": "",
+  "image_prompt": ""
+}
+
+Guidelines:
+- headline: 6-12 words that name the day or range.
+- summary: 2-4 sentences, user-centric and factual.
+- top_keywords: 5-10 lowercase keywords.
+- labels: 3-6 short labels describing dominant themes.
+- surprise_moment: 1-2 sentences about an unexpected detail.
+- image_prompt: create a clean infographic poster; include the headline and 3-5 stat callouts.
+- If details are missing, keep things generic and avoid guessing.
+
+Date range: {DATE_RANGE}
+
+User instruction:
+{INSTRUCTION}
+
+Stats JSON:
+{STATS_JSON}
+
+Memory context:
+{MEMORY_CONTEXT}
+"""
+
+
+def build_lifelog_day_insights_agent_prompt(
+    instruction: str,
+    memory_context: str,
+    date_range_label: str,
+    stats_json: str,
+) -> str:
+    return (
+        LIFELOG_DAY_INSIGHTS_AGENT_PROMPT.replace("{DATE_RANGE}", date_range_label)
+        .replace("{INSTRUCTION}", instruction.strip())
+        .replace("{STATS_JSON}", stats_json.strip() or "{}")
+        .replace("{MEMORY_CONTEXT}", memory_context.strip() or "None")
+    )
+
+
 LIFELOG_QUERY_ENTITY_PROMPT = """\
 Extract entity names from the user query below.
 Return JSON ONLY with this exact shape:

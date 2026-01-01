@@ -179,6 +179,7 @@ const VIEW_LABELS: Record<ViewMode, string> = {
 const VIEW_MODES: ViewMode[] = ['day', 'week', 'month', 'year', 'all'];
 
 const EPISODES_PAGE_SIZE = 6;
+const DAY_PAGE_SIZE = 20;
 const ALL_PAGE_SIZE = 24;
 
 interface TimelineProps {
@@ -223,6 +224,11 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [pendingSelection, setPendingSelection] = useState<{ itemId?: string; episodeContextId?: string } | null>(null);
+  const [dayItems, setDayItems] = useState<TimelineItem[]>([]);
+  const [dayOffset, setDayOffset] = useState(0);
+  const [dayTotal, setDayTotal] = useState(0);
+  const [dayLoading, setDayLoading] = useState(false);
+  const [dayError, setDayError] = useState<string | null>(null);
   const [allItems, setAllItems] = useState<TimelineItem[]>([]);
   const [allOffset, setAllOffset] = useState(0);
   const [allTotal, setAllTotal] = useState(0);
@@ -256,10 +262,11 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
       setError(null);
       try {
         const tzOffsetMinutes = range.start.getTimezoneOffset();
+        const limit = viewMode === 'day' ? '1' : '600';
         const query = new URLSearchParams({
           start_date: toDateKey(range.start),
           end_date: toDateKey(range.end),
-          limit: '600',
+          limit,
           tz_offset_minutes: tzOffsetMinutes.toString(),
         });
         const data = await apiGet<TimelineDay[]>(`/timeline?${query.toString()}`);
@@ -317,13 +324,6 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
   }, [days]);
 
   const dayKey = useMemo(() => toDateKey(anchorDate), [anchorDate]);
-  const dayItems = useMemo(() => {
-    if (viewMode !== 'day') {
-      return [];
-    }
-    return dayLookup.get(dayKey)?.items ?? [];
-  }, [dayLookup, dayKey, viewMode]);
-
   const dayEpisodes = useMemo(() => {
     if (viewMode !== 'day') {
       return [];
@@ -337,6 +337,33 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     }
     return dayLookup.get(dayKey)?.daily_summary ?? null;
   }, [dayLookup, dayKey, viewMode]);
+
+  const loadDayItems = async (reset = false) => {
+    if (dayLoading && !reset) {
+      return;
+    }
+    setDayLoading(true);
+    setDayError(null);
+    try {
+      const nextOffset = reset ? 0 : dayOffset;
+      const tzOffsetMinutes = anchorDate.getTimezoneOffset();
+      const query = new URLSearchParams({
+        start_date: toDateKey(anchorDate),
+        end_date: toDateKey(anchorDate),
+        limit: DAY_PAGE_SIZE.toString(),
+        offset: nextOffset.toString(),
+        tz_offset_minutes: tzOffsetMinutes.toString(),
+      });
+      const data = await apiGet<TimelineItemsResponse>(`/timeline/items?${query.toString()}`);
+      setDayItems((prev) => (reset ? data.items : [...prev, ...data.items]));
+      setDayTotal(data.total);
+      setDayOffset(nextOffset + data.items.length);
+    } catch (err) {
+      setDayError(err instanceof Error ? err.message : 'Failed to load memories.');
+    } finally {
+      setDayLoading(false);
+    }
+  };
 
   const loadAllItems = async (reset = false) => {
     if (allLoading) {
@@ -367,6 +394,17 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     }
     loadAllItems(true);
   }, [viewMode, reloadKey]);
+
+  useEffect(() => {
+    if (viewMode !== 'day') {
+      return;
+    }
+    setDayItems([]);
+    setDayOffset(0);
+    setDayTotal(0);
+    setDayError(null);
+    void loadDayItems(true);
+  }, [viewMode, dayKey, reloadKey]);
 
   useEffect(() => {
     setUploadOpen(false);
@@ -434,6 +472,11 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     [allItems.length, allTotal]
   );
 
+  const hasMoreDayItems = useMemo(
+    () => dayItems.length < dayTotal,
+    [dayItems.length, dayTotal]
+  );
+
   const dayStats = useMemo(() => {
     const totals: Record<string, number> = {
       photo: 0,
@@ -446,6 +489,36 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     });
     return totals;
   }, [dayItems]);
+
+  const dayItemThumbnails = useMemo(() => {
+    const map = new Map<string, string>();
+    if (viewMode !== 'day') {
+      return map;
+    }
+    dayItems.forEach((item) => {
+      const thumbnail = getThumbnail(item);
+      if (thumbnail) {
+        map.set(item.id, thumbnail);
+      }
+    });
+    return map;
+  }, [dayItems, viewMode]);
+
+  const getEpisodePreview = (episode: TimelineEpisode) => {
+    if (episode.preview_url) {
+      return episode.preview_url;
+    }
+    if (viewMode !== 'day') {
+      return null;
+    }
+    for (const itemId of episode.source_item_ids) {
+      const thumb = dayItemThumbnails.get(itemId);
+      if (thumb) {
+        return thumb;
+      }
+    }
+    return null;
+  };
 
   const memoryCount = useMemo(
     () => sortedDayEpisodes.length + sortedDayItems.length,
@@ -495,6 +568,10 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
         })
         .filter((day) => day.items.length > 0)
     );
+    setDayItems((prev) => prev.filter((item) => item.id !== itemId));
+    setDayTotal((prev) => Math.max(0, prev - 1));
+    setAllItems((prev) => prev.filter((item) => item.id !== itemId));
+    setAllTotal((prev) => Math.max(0, prev - 1));
     if (selectedItemId === itemId) {
       setSelectedItemId(null);
       setDetail(null);
@@ -1347,7 +1424,12 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
                     <h2 className="text-sm font-semibold text-slate-900">Daily timeline</h2>
-                    <p className="text-xs text-slate-500">{memoryCount} memories</p>
+                    <p className="text-xs text-slate-500">
+                      {memoryCount} memories
+                      {dayTotal > 0 && dayItems.length < dayTotal
+                        ? ` · Showing ${dayItems.length} of ${dayTotal} items`
+                        : ''}
+                    </p>
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
                     <div className="flex flex-wrap gap-1 text-[10px]">
@@ -1519,7 +1601,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                     </div>
                     {visibleDayEpisodes.map((episode) => {
                       const isActive = episode.episode_id === selectedEpisodeId;
-                      const preview = episode.preview_url;
+                      const preview = getEpisodePreview(episode);
                       return (
                         <button
                           key={episode.episode_id}
@@ -1579,7 +1661,15 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                   </div>
                 )}
 
-                {sortedDayItems.length === 0 && sortedDayEpisodes.length === 0 ? (
+                {dayError && (
+                  <div className="mt-3 text-xs text-red-600">{dayError}</div>
+                )}
+
+                {dayLoading && dayItems.length === 0 && sortedDayEpisodes.length === 0 ? (
+                  <div className="py-8 text-center text-sm text-slate-500">
+                    Loading memories...
+                  </div>
+                ) : sortedDayItems.length === 0 && sortedDayEpisodes.length === 0 ? (
                   <div className="py-8 text-center text-sm text-slate-500">
                     No memories for this day.
                   </div>
@@ -1661,6 +1751,16 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                       );
                     })}
                   </div>
+                )}
+                {hasMoreDayItems && (
+                  <button
+                    type="button"
+                    onClick={() => loadDayItems(false)}
+                    disabled={dayLoading}
+                    className="mt-4 w-full rounded-full border border-slate-200 px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-50 disabled:opacity-60"
+                  >
+                    {dayLoading ? 'Loading more...' : 'Load more memories'}
+                  </button>
                 )}
               </div>
 

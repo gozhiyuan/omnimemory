@@ -107,6 +107,24 @@ class Settings(BaseSettings):
     audio_understanding_timeout_seconds: int = 60
     audio_understanding_max_bytes: int = Field(default=19_000_000, ge=1)
 
+    # Chat/RAG settings
+    chat_provider: Literal["gemini", "none"] = "gemini"
+    chat_model: str = "gemini-2.5-flash"
+    chat_temperature: float = 0.7
+    chat_max_output_tokens: int = Field(default=512, ge=64)
+    chat_timeout_seconds: int = 30
+    chat_context_limit: int = Field(default=12, ge=1)
+    chat_history_limit: int = Field(default=6, ge=0)
+    chat_entity_extraction_enabled: bool = True
+
+    # Agent settings
+    agent_enabled: bool = True
+    agent_prompt_model: str = "gemini-2.5-pro"
+    agent_prompt_temperature: float = 0.4
+    agent_image_provider: Literal["gemini", "none"] = "none"
+    agent_image_model: str = "gemini-2.5-flash-image"
+    agent_image_timeout_seconds: int = 60
+
     # Media extraction settings
     media_max_bytes: int = Field(default=1_000_000_000, ge=1)
     media_chunk_target_bytes: int = Field(default=10_000_000, ge=1)
@@ -136,6 +154,7 @@ class Settings(BaseSettings):
     episode_merge_enabled: bool = True
     episode_merge_max_gap_minutes: int = Field(default=90, ge=1)
     episode_merge_similarity_threshold: float = Field(default=0.78, ge=0.0, le=1.0)
+    memory_graph_enabled: bool = True
 
     # Maps/Geocoding settings
     maps_geocoding_provider: Literal["google_maps", "none"] = "google_maps"

@@ -10,12 +10,14 @@ import {
   IngestResponse,
   GooglePhotosPickerItem,
   GooglePhotosPickerItemsResponse,
-  TimelineDay,
   TimelineItem,
+  TimelineItemsResponse,
   UploadUrlResponse,
 } from '../types';
 
 export const UploadManager: React.FC = () => {
+  const RECENT_PAGE_SIZE = 6;
+
   const [dragActive, setDragActive] = useState(false);
   const [files, setFiles] = useState<File[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -31,7 +33,10 @@ export const UploadManager: React.FC = () => {
   const [syncLoading, setSyncLoading] = useState(false);
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
   const [recentItems, setRecentItems] = useState<TimelineItem[]>([]);
+  const [recentLoading, setRecentLoading] = useState(false);
   const [recentError, setRecentError] = useState<string | null>(null);
+  const [recentOffset, setRecentOffset] = useState(0);
+  const [recentTotal, setRecentTotal] = useState(0);
   const [selectedItems, setSelectedItems] = useState<GooglePhotosPickerItem[]>([]);
   const [selectedLoading, setSelectedLoading] = useState(false);
   const [selectedError, setSelectedError] = useState<string | null>(null);
@@ -182,14 +187,27 @@ export const UploadManager: React.FC = () => {
     }
   };
 
-  const loadRecentItems = async () => {
+  const loadRecentItems = async (reset = false) => {
+    if (recentLoading) {
+      return;
+    }
     setRecentError(null);
+    setRecentLoading(true);
     try {
-      const days = await apiGet<TimelineDay[]>('/timeline?limit=12&provider=google_photos');
-      const flattened = days.flatMap((day) => day.items);
-      setRecentItems(flattened.slice(0, 8));
+      const nextOffset = reset ? 0 : recentOffset;
+      const query = new URLSearchParams({
+        provider: 'google_photos',
+        limit: RECENT_PAGE_SIZE.toString(),
+        offset: nextOffset.toString(),
+      });
+      const data = await apiGet<TimelineItemsResponse>(`/timeline/items?${query.toString()}`);
+      setRecentItems((prev) => (reset ? data.items : [...prev, ...data.items]));
+      setRecentTotal(data.total);
+      setRecentOffset(nextOffset + data.items.length);
     } catch (err) {
       setRecentError(err instanceof Error ? err.message : 'Failed to load recent items.');
+    } finally {
+      setRecentLoading(false);
     }
   };
 
@@ -204,6 +222,8 @@ export const UploadManager: React.FC = () => {
       setGoogleLoading(false);
     }
   };
+
+  const hasMoreRecent = recentItems.length < recentTotal;
 
   const handleGooglePicker = async () => {
     setPickerLoading(true);
@@ -252,7 +272,7 @@ export const UploadManager: React.FC = () => {
       const payload: GooglePhotosSyncRequest = { session_id: pickerSessionId };
       const response = await apiPost<GooglePhotosSyncResponse>('/integrations/google/photos/sync', payload);
       setSyncMessage(`Sync queued (task ${response.task_id}).`);
-      void loadRecentItems();
+      void loadRecentItems(true);
     } catch (err) {
       setPickerError(err instanceof Error ? err.message : 'Failed to queue Google Photos sync.');
     } finally {
@@ -262,7 +282,7 @@ export const UploadManager: React.FC = () => {
 
   useEffect(() => {
     void loadGoogleStatus();
-    void loadRecentItems();
+    void loadRecentItems(true);
   }, []);
 
   useEffect(() => {
@@ -490,11 +510,12 @@ export const UploadManager: React.FC = () => {
                       <div className="flex items-center justify-between">
                         <p className="text-sm text-slate-800 font-medium">Recently ingested from Google Photos</p>
                         <button
-                          className="text-xs text-slate-500 hover:text-slate-700"
-                          onClick={loadRecentItems}
+                          className="text-xs text-slate-500 hover:text-slate-700 disabled:opacity-50"
+                          onClick={() => loadRecentItems(true)}
+                          disabled={recentLoading}
                           type="button"
                         >
-                          Refresh
+                          {recentLoading ? 'Refreshing...' : 'Refresh'}
                         </button>
                       </div>
                       {recentError && <p className="text-xs text-red-600">{recentError}</p>}
@@ -509,31 +530,31 @@ export const UploadManager: React.FC = () => {
                                 <img
                                   src={item.download_url}
                                   alt={item.original_filename || 'Google Photos thumbnail'}
-                                  className="w-12 h-12 rounded-md object-cover border border-slate-200"
+                                  className="w-10 h-10 rounded-md object-cover border border-slate-200"
                                 />
                               ) : item.item_type === 'video' && item.poster_url ? (
                                 <div className="relative">
                                   <img
                                     src={item.poster_url}
                                     alt={item.original_filename || 'Video preview'}
-                                    className="w-12 h-12 rounded-md object-cover border border-slate-200"
+                                    className="w-10 h-10 rounded-md object-cover border border-slate-200"
                                   />
                                   <span className="absolute inset-0 flex items-center justify-center text-white">
-                                    <span className="flex items-center justify-center w-6 h-6 rounded-full bg-black/60">
-                                      <Play className="w-3 h-3" />
+                                    <span className="flex items-center justify-center w-5 h-5 rounded-full bg-black/60">
+                                      <Play className="w-2.5 h-2.5" />
                                     </span>
                                   </span>
                                 </div>
                               ) : item.item_type === 'video' ? (
-                                <div className="w-12 h-12 rounded-md border border-slate-200 flex items-center justify-center text-slate-400">
+                                <div className="w-10 h-10 rounded-md border border-slate-200 flex items-center justify-center text-slate-400">
                                   <Video className="w-5 h-5" />
                                 </div>
                               ) : item.item_type === 'audio' ? (
-                                <div className="w-12 h-12 rounded-md border border-slate-200 flex items-center justify-center text-slate-400">
+                                <div className="w-10 h-10 rounded-md border border-slate-200 flex items-center justify-center text-slate-400">
                                   <Mic className="w-5 h-5" />
                                 </div>
                               ) : (
-                                <div className="w-12 h-12 rounded-md border border-slate-200 flex items-center justify-center text-slate-400">
+                                <div className="w-10 h-10 rounded-md border border-slate-200 flex items-center justify-center text-slate-400">
                                   <FileText className="w-5 h-5" />
                                 </div>
                               )}
@@ -548,6 +569,23 @@ export const UploadManager: React.FC = () => {
                             </li>
                           ))}
                         </ul>
+                      )}
+                      {recentItems.length > 0 && (
+                        <div className="mt-2 flex items-center justify-between text-[11px] text-slate-500">
+                          <span>
+                            Showing {recentItems.length} of {Math.max(recentTotal, recentItems.length)}
+                          </span>
+                          {hasMoreRecent && (
+                            <button
+                              type="button"
+                              onClick={() => loadRecentItems(false)}
+                              className="text-xs text-slate-500 hover:text-slate-700 disabled:opacity-60"
+                              disabled={recentLoading}
+                            >
+                              {recentLoading ? 'Loading...' : 'Load more'}
+                            </button>
+                          )}
+                        </div>
                       )}
                     </div>
                   </div>

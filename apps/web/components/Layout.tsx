@@ -24,9 +24,9 @@ export const Layout: React.FC<LayoutProps> = ({ children, activeView, onChangeVi
         <div className="p-6">
           <div className="flex items-center space-x-2 text-white mb-6">
             <div className="w-8 h-8 bg-primary-600 rounded-lg flex items-center justify-center font-bold text-lg">
-              L
+              O
             </div>
-            <span className="text-xl font-bold tracking-tight">Lifelog AI</span>
+            <span className="text-xl font-bold tracking-tight">OmniMemory</span>
           </div>
           <p className="text-xs text-slate-500 uppercase tracking-wider font-semibold mb-4 pl-2">Menu</p>
           <nav className="space-y-1">
@@ -56,7 +56,7 @@ export const Layout: React.FC<LayoutProps> = ({ children, activeView, onChangeVi
              />
              <div className="flex-1 min-w-0">
                 <p className="text-sm font-medium text-white truncate">Demo User</p>
-                <p className="text-xs text-slate-500 truncate">demo@lifelog.ai</p>
+                <p className="text-xs text-slate-500 truncate">demo@omnimemory.ai</p>
              </div>
           </div>
           <button className="flex items-center space-x-2 text-xs text-slate-500 hover:text-white transition-colors">

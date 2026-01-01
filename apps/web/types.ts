@@ -13,10 +13,63 @@ export interface MemoryItem {
 
 export interface ChatMessage {
   id: string;
-  role: 'user' | 'model';
+  role: 'user' | 'assistant' | 'system';
   content: string;
   timestamp: Date;
-  sources?: MemoryItem[];
+  sources?: ChatSource[];
+  attachments?: ChatAttachment[];
+}
+
+export interface ChatSource {
+  context_id: string;
+  source_item_id?: string;
+  thumbnail_url?: string | null;
+  timestamp?: string | null;
+  snippet?: string | null;
+  score?: number | null;
+  title?: string | null;
+}
+
+export interface ChatAttachment {
+  id: string;
+  url: string;
+  content_type?: string | null;
+  created_at?: string | null;
+}
+
+export interface ChatResponse {
+  message: string;
+  session_id: string;
+  sources: ChatSource[];
+}
+
+export interface AgentImageResponse {
+  message: string;
+  session_id: string;
+  attachments: ChatAttachment[];
+  prompt?: string | null;
+  caption?: string | null;
+}
+
+export interface ChatSessionSummary {
+  session_id: string;
+  title?: string | null;
+  created_at: string;
+  last_message_at: string;
+  message_count: number;
+}
+
+export interface ChatSessionDetail {
+  session_id: string;
+  title?: string | null;
+  messages: Array<{
+    id: string;
+    role: 'user' | 'assistant' | 'system';
+    content: string;
+    sources?: ChatSource[];
+    attachments?: ChatAttachment[];
+    created_at: string;
+  }>;
 }
 
 export interface UserStats {
@@ -99,6 +152,7 @@ export interface TimelineFocus {
   viewMode?: TimelineViewMode;
   anchorDate?: string;
   itemId?: string;
+  episodeContextId?: string;
 }
 
 export interface TimelineEpisodeDetail {

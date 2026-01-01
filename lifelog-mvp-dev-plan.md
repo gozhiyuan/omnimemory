@@ -1,8 +1,25 @@
-# Lifelog AI - MVP Development Plan (12 Weeks)
+# OmniMemory - MVP Development Plan (12 Weeks)
 
 > **Goal:** Ship a working web app where users can connect data sources, upload files, and chat about their memories
 > **Timeline:** 12 weeks to pilot launch
 > **Team Size:** 1-2 developers
+
+## Current Status Snapshot (Actual Implementation)
+
+Implemented:
+- Ingestion pipeline (uploads + Google Photos Picker) with dedupe, derived artifacts, contexts, embeddings, episodes, daily summaries, and Qdrant indexing.
+- Timeline day view (episodes + daily summaries + item detail), timeline/all pagination, and ingestion recent list pagination.
+- RAG chat API with query parsing, rerank, citations, and chat session persistence in Postgres.
+- Chat image upload (VLM description) + chat attachments.
+- Downstream agents: Cartoon Day Summary and Day Insights Infographic.
+- Dashboard aggregates + usage metrics.
+
+Deferred or not implemented yet:
+- Authentication (Supabase Auth / JWT) and multi-user support.
+- Memory graph population and graph-based retrieval.
+- Scheduled lifecycle retention jobs.
+- Notion integration and other connectors.
+- Mobile/desktop apps and auto-capture.
 
 ---
 
@@ -325,666 +342,40 @@ Reference: `docs/minecontext/lifelog_ingestion_rag_design.md`
 
 ---
 
-## Week 5-6: Memory Layer & Event Clustering
+## Week 5-6: Memory Layer & Retrieval (Updated)
 
 ### Objectives
-- Implement entity extraction from content
-- Build memory graph
-- Create daily event clustering
-- Develop hybrid retrieval system
+- Use `processed_contexts` + Qdrant for retrieval.
+- Parse dates/entities and rerank results.
+- Keep memory graph and scheduled clustering deferred.
 
-### Tasks
+### Implemented
+- [x] Query parsing in `services/api/app/rag.py` (explicit dates, relative ranges, month/day parsing).
+- [x] Optional query entity extraction via Gemini (`chat_entity_extraction_enabled`).
+- [x] Context retrieval from Qdrant with boosts (episode, entity overlap) and time decay.
+- [x] Daily summaries stored in `processed_contexts` and injected into chat context; `daily_summaries` table used for recent summary preprompting.
+- [x] Chat history persistence in Postgres (`chat_sessions`, `chat_messages`) instead of mem0.
 
-**Entity Extraction**
-- [ ] Create entity extraction task:
-  ```python
-  @celery.task
-  def extract_entities(item_id: str):
-      item = db.get(source_items, item_id)
-      content = db.query(processed_content).filter(
-          source_item_id=item_id
-      ).all()
-      
-      # Combine all content
-      full_text = ' '.join([c.content_text for c in content])
-      
-      # Use LLM for entity extraction
-      entities = await extract_entities_llm(full_text, item.location)
-      
-      # Store in memory graph
-      for entity in entities:
-          node_id = upsert_memory_node(
-              user_id=item.user_id,
-              node_type=entity['type'],
-              name=entity['name'],
-              attributes=entity['attributes']
-          )
-          
-          # Create edge between item and entity
-          create_memory_edge(
-              source_node_id=item_id,
-              target_node_id=node_id,
-              relation_type=entity['relation']
-          )
-  ```
-- [ ] Implement LLM-based entity extraction:
-  ```python
-  async def extract_entities_llm(text: str, location: dict) -> List[dict]:
-      prompt = f"""
-      Extract entities from the following content:
-      {text}
-      
-      Location: {location}
-      
-      Return JSON with entities:
-      {{
-        "people": ["Alice", "Bob"],
-        "places": ["Central Park"],
-        "objects": ["camera", "bicycle"],
-        "activities": ["hiking", "photography"]
-      }}
-      """
-      
-      response = await openai.ChatCompletion.create(
-          model="gpt-4o-mini",
-          messages=[{"role": "user", "content": prompt}],
-          response_format={"type": "json_object"}
-      )
-      
-      return json.loads(response.choices[0].message.content)
-  ```
-- [ ] Add entity extraction to processing pipeline
-- [ ] Batch LLM requests with caching to cap cost (<$0.15 per 100 items)
-- [ ] Create evaluation set (50 items) to score precision/recall of extracted entities monthly
-- [ ] Emit entity extraction metrics (latency, token usage, error rate)
-
-**Memory Graph Implementation**
-- [ ] Create helper functions for graph operations:
-  ```python
-  def upsert_memory_node(user_id, node_type, name, attributes):
-      # Check if node exists
-      existing = db.query(memory_nodes).filter(
-          user_id=user_id,
-          node_type=node_type,
-          name=name
-      ).first()
-      
-      if existing:
-          # Update attributes and timestamps
-          db.update(memory_nodes, existing.id, {
-              'attributes': {**existing.attributes, **attributes},
-              'last_seen': datetime.now(),
-              'mention_count': existing.mention_count + 1
-          })
-          return existing.id
-      else:
-          # Create new node
-          return db.insert(memory_nodes, {
-              'user_id': user_id,
-              'node_type': node_type,
-              'name': name,
-              'attributes': attributes,
-              'first_seen': datetime.now(),
-              'last_seen': datetime.now(),
-              'mention_count': 1
-          })
-  
-  def create_memory_edge(source_node_id, target_node_id, relation_type, strength=1.0):
-      # Check if edge exists
-      existing = db.query(memory_edges).filter(
-          source_node_id=source_node_id,
-          target_node_id=target_node_id,
-          relation_type=relation_type
-      ).first()
-      
-      if existing:
-          db.update(memory_edges, existing.id, {
-              'strength': existing.strength + strength,
-              'last_connected': datetime.now()
-          })
-      else:
-          db.insert(memory_edges, {...})
-  ```
-- [ ] Create graph query helpers:
-  ```python
-  def get_related_entities(user_id, entity_name, relation_type=None, depth=1):
-      # Find all entities connected to given entity
-      query = """
-      WITH RECURSIVE entity_traverse AS (
-        SELECT id, name, node_type, 0 as depth
-        FROM memory_nodes
-        WHERE user_id = %s AND name = %s
-        
-        UNION ALL
-        
-        SELECT n.id, n.name, n.node_type, et.depth + 1
-        FROM memory_nodes n
-        JOIN memory_edges e ON e.target_node_id = n.id
-        JOIN entity_traverse et ON et.id = e.source_node_id
-        WHERE et.depth < %s
-      )
-      SELECT * FROM entity_traverse;
-      """
-      return db.execute(query, (user_id, entity_name, depth))
-  ```
-
-**Daily Event Clustering**
-- [ ] Create nightly event clustering job:
-  ```python
-  @celery.task
-  def generate_daily_events(user_id: str, date: datetime.date):
-      # Get all items for this date
-      items = db.query(source_items).filter(
-          user_id=user_id,
-          func.date(captured_at) == date,
-          processing_status='completed'
-      ).order_by(captured_at).all()
-      
-      if not items:
-          return
-      
-      # Cluster by time proximity (2-hour window)
-      events = cluster_by_time(items, gap_minutes=120)
-      
-      for event_items in events:
-          # Extract common attributes
-          location = most_common_location(event_items)
-          
-          # Get entities from graph
-          entity_ids = set()
-          for item in event_items:
-              entities = db.query(memory_edges).filter(
-                  source_node_id=item.id
-              ).all()
-              entity_ids.update([e.target_node_id for e in entities])
-          
-          entities = db.query(memory_nodes).filter(
-              id.in_(entity_ids)
-          ).all()
-          
-          # Generate event summary with LLM
-          summary = await generate_event_summary(event_items, entities)
-          
-          # Create event record
-          event_id = db.insert(events, {
-              'user_id': user_id,
-              'title': summary['title'],
-              'start_time': min(i.captured_at for i in event_items),
-              'end_time': max(i.captured_at for i in event_items),
-              'location': location,
-              'summary': summary['text'],
-              'source_item_ids': [i.id for i in event_items]
-          })
-          
-          # Create event node in graph
-          event_node_id = upsert_memory_node(
-              user_id=user_id,
-              node_type='event',
-              name=summary['title'],
-              attributes={'event_id': event_id}
-          )
-          
-          # Connect event to entities
-          for entity in entities:
-              create_memory_edge(
-                  source_node_id=event_node_id,
-                  target_node_id=entity.id,
-                  relation_type='involves'
-              )
-  ```
-- [ ] Implement time-based clustering:
-  ```python
-  def cluster_by_time(items, gap_minutes=120):
-      clusters = []
-      current_cluster = [items[0]]
-      
-      for i in range(1, len(items)):
-          time_gap = (items[i].captured_at - items[i-1].captured_at).total_seconds() / 60
-          
-          if time_gap <= gap_minutes:
-              current_cluster.append(items[i])
-          else:
-              clusters.append(current_cluster)
-              current_cluster = [items[i]]
-      
-      clusters.append(current_cluster)
-      return clusters
-  ```
-
-**Daily Summaries**
-- [ ] Implement Celery beat job to trigger `generate_daily_summary` for each active user at 02:00 local time
-- [ ] Define prompt templates + guardrails (Markdown format, event ID references, hallucination checks)
-- [ ] Persist summaries to `daily_summaries` table with traceable source event IDs
-- [ ] Surface summaries in dashboard + inject into chat context (preprompt hook)
-- [ ] Collect user feedback (thumbs up/down + comment) and log for quality tuning
-- [ ] Monitor summary generation latency + error rate with Prometheus counters
-- [ ] Set up Celery Beat for daily scheduling:
-  ```python
-  from celery.schedules import crontab
-  
-  app.conf.beat_schedule = {
-      'generate-daily-events': {
-          'task': 'tasks.generate_daily_events',
-          'schedule': crontab(hour=2, minute=0),  # Run at 2 AM
-      },
-  }
-  ```
-
-**Hybrid Retrieval System**
-- [ ] Implement query understanding:
-  ```python
-  from dateparser import parse as parse_date
-  
-  def parse_query(query: str, user_id: str):
-      # Extract dates
-      parsed_date = parse_date(query, settings={'RELATIVE_BASE': datetime.now()})
-      
-      # Extract entities using LLM
-      entities_response = await openai.ChatCompletion.create(
-          model="gpt-4o-mini",
-          messages=[{
-              "role": "user",
-              "content": f"Extract entity names from: '{query}'. Return JSON: {{\"people\": [], \"places\": [], \"objects\": []}}"
-          }],
-          response_format={"type": "json_object"}
-      )
-      entities = json.loads(entities_response.choices[0].message.content)
-      
-      # Determine query type
-      query_type = classify_query(query)
-      
-      return {
-          'date_range': get_date_range(parsed_date) if parsed_date else None,
-          'entities': entities,
-          'query_type': query_type,
-          'original': query
-      }
-  ```
-- [ ] Build composite retrieval function:
-  ```python
-  async def retrieve_relevant_context(query: str, user_id: str, top_k=10):
-      parsed = parse_query(query, user_id)
-      
-      # 1. Vector search
-      query_embedding = get_embedding(query)
-      vector_hits = qdrant.search(
-          collection_name=f"user_{user_id}",
-          query_vector=query_embedding,
-          limit=50,
-          score_threshold=0.6
-      )
-      
-      # 2. Apply temporal filter
-      if parsed['date_range']:
-          start, end = parsed['date_range']
-          vector_hits = [
-              h for h in vector_hits
-              if start <= h.payload['timestamp'] <= end
-          ]
-      
-      # 3. Graph-based entity boost
-      if parsed['entities'].get('people') or parsed['entities'].get('places'):
-          entity_names = parsed['entities']['people'] + parsed['entities']['places']
-          related_items = get_items_with_entities(user_id, entity_names)
-          related_item_ids = set(related_items)
-          
-          for hit in vector_hits:
-              if hit.payload['item_id'] in related_item_ids:
-                  hit.score *= 1.5
-      
-      # 4. Time decay (prefer recent items, but not too aggressive for MVP)
-      now = datetime.now()
-      for hit in vector_hits:
-          days_old = (now - hit.payload['timestamp']).days
-          time_decay = 1.0 / (1.0 + days_old * 0.01)
-          hit.score *= time_decay
-      
-      # 5. Re-rank and return top-k
-      ranked = sorted(vector_hits, key=lambda h: h.score, reverse=True)
-      return ranked[:top_k]
-  ```
-
-**Conversation Memory (mem0 integration)**
-- [ ] Install mem0: `pip install mem0ai`
-- [ ] Initialize mem0 client:
-  ```python
-  from mem0 import Memory
-  
-  memory = Memory()
-  ```
-- [ ] Store conversations:
-  ```python
-  def store_conversation_turn(user_id, session_id, role, content):
-      memory.add(
-          messages=[{"role": role, "content": content}],
-          user_id=user_id,
-          session_id=session_id
-      )
-  ```
-- [ ] Retrieve conversation history:
-  ```python
-  def get_conversation_context(user_id, session_id, limit=10):
-      return memory.get_all(
-          user_id=user_id,
-          session_id=session_id,
-          limit=limit
-      )
-  ```
-
-### Deliverables
-- ✅ Entities are extracted from all processed items
-- ✅ Memory graph contains people, places, objects, events
-- ✅ Daily events are automatically generated
-- ✅ Hybrid retrieval combines vector + temporal + entity signals
-- ✅ End-to-end ingest → process → retrieve smoke test passes with seed dataset
+### Deferred (Post-MVP)
+- [ ] Memory graph population + graph-based retrieval (tables exist).
+- [ ] Scheduled daily event clustering job.
+- [ ] mem0 integration (not used in current implementation).
 
 ---
 
-## Week 7-8: Chat Interface & RAG
+## Week 7-8: Chat Interface & RAG (Implemented)
 
-### Objectives
-- Build chat API with RAG logic
-- Create conversational web interface
-- Implement source citations
-- Add conversation history
+### Implemented
+- [x] RAG chat endpoint (`POST /chat`) with query parsing, Qdrant retrieval, reranking, and citations.
+- [x] Image chat endpoint (`POST /chat/image`) using VLM description + RAG.
+- [x] Chat sessions + messages persisted in Postgres (`chat_sessions`, `chat_messages`).
+- [x] Sources include thumbnails, timestamps, and snippets; UI surfaces relevant memories.
+- [x] Chat attachments stored in `chat_attachments` with signed download URLs.
+- [x] Downstream agents: Cartoon Day Summary and Day Insights Infographic.
 
-### Tasks
-
-**Chat API Endpoint**
-- [ ] Create chat endpoint:
-  ```python
-  @app.post("/chat")
-  async def chat(
-      request: ChatRequest,
-      user: User = Depends(get_current_user)
-  ):
-      # Parse query
-      parsed = parse_query(request.message, user.id)
-      
-      # Retrieve relevant context
-      context_hits = await retrieve_relevant_context(
-          query=request.message,
-          user_id=user.id,
-          top_k=10
-      )
-      
-      # Get conversation history from mem0
-      conversation_history = get_conversation_context(
-          user_id=user.id,
-          session_id=request.session_id,
-          limit=5
-      )
-      
-      # Fetch recent daily summaries to ground responses
-      daily_summaries = get_recent_daily_summaries(
-          user_id=user.id,
-          days=7
-      )
-      
-      # Build prompt
-      context_text = format_context(context_hits)
-      prompt = build_chat_prompt(
-          query=request.message,
-          context=context_text,
-          conversation_history=conversation_history,
-          daily_summaries=daily_summaries
-      )
-      
-      # Call LLM
-      response = await openai.ChatCompletion.create(
-          model="gpt-4o",
-          messages=prompt,
-          temperature=0.7,
-          max_tokens=500
-      )
-      
-      assistant_message = response.choices[0].message.content
-      
-      # Store in mem0
-      store_conversation_turn(user.id, request.session_id, "user", request.message)
-      store_conversation_turn(user.id, request.session_id, "assistant", assistant_message)
-      
-      # Format sources
-      sources = [
-          {
-              'item_id': hit.payload['item_id'],
-              'thumbnail': get_thumbnail_url(hit.payload['item_id']),
-              'timestamp': hit.payload['timestamp'],
-              'snippet': hit.payload['caption'][:150],
-              'score': hit.score
-          }
-          for hit in context_hits[:5]
-      ]
-      
-      return {
-          'message': assistant_message,
-          'sources': sources,
-          'session_id': request.session_id
-      }
-  ```
-- [ ] Enforce response time budget (<3s p95) and log latency to Prometheus histogram
-- [ ] Record per-turn feedback + thumbs UI to feed accuracy metric
-- [ ] Add guardrails for token usage (truncate context beyond 8k tokens, fallback to cheaper model on overflow)
-
-**Prompt Engineering**
-- [ ] Design system prompt:
-  ```python
-  SYSTEM_PROMPT = """You are a personal memory assistant. You help users recall and understand their past experiences based on their photos, videos, and notes.
-
-  Guidelines:
-  - Be warm, conversational, and helpful
-  - Use only the provided context - don't make up information
-  - If you're not sure, say "I don't have enough information"
-  - When referencing specific memories, mention the date/time
-  - Keep responses concise (2-3 sentences unless more detail is requested)
-  - Use first-person perspective when talking about the user's memories
-  """
-  ```
-- [ ] Create context formatting function:
-  ```python
-  def format_context(hits):
-      context_items = []
-      for i, hit in enumerate(hits):
-          timestamp = hit.payload['timestamp'].strftime('%Y-%m-%d %H:%M')
-          location = hit.payload.get('location', {})
-          location_str = location.get('place_name', 'Unknown location')
-          
-          context_items.append(f"""
-  [{i+1}] {timestamp} at {location_str}
-  Caption: {hit.payload['caption']}
-  OCR Text: {hit.payload.get('ocr_text', 'None')}
-  """)
-      
-      return '\n'.join(context_items)
-  ```
-- [ ] Build full prompt:
-```python
-def build_chat_prompt(query, context, conversation_history, daily_summaries):
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    
-    if daily_summaries:
-        summary_block = "\n".join(
-            f"{s['summary_date']}: {s['content_markdown']}"
-            for s in daily_summaries
-        )
-        messages.append({
-            "role": "system",
-            "content": f"Recent daily summaries:\n{summary_block}"
-        })
-    
-    for turn in conversation_history or []:
-        messages.append({"role": turn['role'], "content": turn['content']})
-    
-    user_message = f"""Here are relevant memories:
-
-{context}
-
-User question: {query}"""
-    
-    messages.append({"role": "user", "content": user_message})
-    return messages
-```
-
-**Chat Frontend**
-- [ ] Create `/chat` page with chat interface
-- [ ] Implement message list with auto-scroll:
-  ```typescript
-  const ChatMessages = ({ messages }) => {
-    const messagesEndRef = useRef<HTMLDivElement>(null);
-    
-    useEffect(() => {
-      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }, [messages]);
-    
-    return (
-      <div className="flex-1 overflow-y-auto p-4">
-        {messages.map((msg) => (
-          <MessageBubble key={msg.id} message={msg} />
-        ))}
-        <div ref={messagesEndRef} />
-      </div>
-    );
-  };
-  ```
-- [ ] Create message input component:
-  ```typescript
-  const ChatInput = ({ onSend, disabled }) => {
-    const [input, setInput] = useState('');
-    
-    const handleSubmit = (e) => {
-      e.preventDefault();
-      if (input.trim()) {
-        onSend(input);
-        setInput('');
-      }
-    };
-    
-    return (
-      <form onSubmit={handleSubmit} className="border-t p-4">
-        <div className="flex gap-2">
-          <input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder="Ask about your memories..."
-            disabled={disabled}
-            className="flex-1 px-4 py-2 border rounded-lg"
-          />
-          <button type="submit" disabled={disabled || !input.trim()}>
-            Send
-          </button>
-        </div>
-      </form>
-    );
-  };
-  ```
-- [ ] Implement chat hook with React Query:
-  ```typescript
-  const useChat = (sessionId: string) => {
-    const queryClient = useQueryClient();
-    
-    const { data: messages = [] } = useQuery({
-      queryKey: ['chat', sessionId],
-      queryFn: () => api.get(`/chat/sessions/${sessionId}`),
-    });
-    
-    const { mutate: sendMessage, isPending } = useMutation({
-      mutationFn: (message: string) => 
-        api.post('/chat', { message, session_id: sessionId }),
-      onSuccess: (response) => {
-        queryClient.setQueryData(['chat', sessionId], (old) => [
-          ...old,
-          { role: 'user', content: message },
-          { role: 'assistant', content: response.message, sources: response.sources }
-        ]);
-      },
-    });
-    
-    return { messages, sendMessage, isPending };
-  };
-  ```
-
-**Source Citations UI**
-- [ ] Create source card component:
-  ```typescript
-  const SourceCard = ({ source }) => {
-    return (
-      <div className="border rounded-lg p-2 hover:shadow-md transition">
-        <img
-          src={source.thumbnail}
-          alt="Memory"
-          className="w-full h-32 object-cover rounded"
-        />
-        <p className="text-xs text-gray-500 mt-1">
-          {new Date(source.timestamp).toLocaleString()}
-        </p>
-        <p className="text-sm mt-1 line-clamp-2">
-          {source.snippet}
-        </p>
-      </div>
-    );
-  };
-  ```
-- [ ] Show recent daily summaries sidebar with toggle + ability to pin summary into prompt
-- [ ] Add feedback controls (👍/👎 + optional comment) on assistant messages and send to `/feedback` API
-- [ ] Add sources section to assistant messages:
-  ```typescript
-  const AssistantMessage = ({ message }) => {
-    return (
-      <div className="bg-gray-100 rounded-lg p-4 max-w-2xl">
-        <p>{message.content}</p>
-        {message.sources && message.sources.length > 0 && (
-          <div className="mt-4">
-            <p className="text-xs text-gray-500 mb-2">Sources:</p>
-            <div className="grid grid-cols-3 gap-2">
-              {message.sources.map((src) => (
-                <SourceCard key={src.item_id} source={src} />
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
-    );
-  };
-  ```
-
-**Session Management**
-- [ ] Create session list endpoint:
-  ```python
-  @app.get("/chat/sessions")
-  async def list_sessions(user: User = Depends(get_current_user)):
-      # Get unique session IDs from mem0
-      sessions = memory.get_sessions(user_id=user.id)
-      return [
-          {
-              'session_id': s.id,
-              'title': s.title or f"Chat {s.created_at.strftime('%b %d')}",
-              'created_at': s.created_at,
-              'message_count': s.message_count
-          }
-          for s in sessions
-      ]
-  ```
-- [ ] Add session sidebar in UI
-- [ ] Implement "New Chat" button
-- [ ] Add session title generation:
-  ```python
-  async def generate_session_title(first_message: str):
-      response = await openai.ChatCompletion.create(
-          model="gpt-4o-mini",
-          messages=[{
-              "role": "user",
-              "content": f"Create a short 3-4 word title for a conversation that starts with: '{first_message}'"
-          }],
-          max_tokens=10
-      )
-      return response.choices[0].message.content
-  ```
-
-### Deliverables
-- ✅ User can chat with <3s p95 response time backed by hybrid retrieval
-- ✅ Responses include source citations + recent daily summary context
-- ✅ Conversation history persists across sessions with mem0 integration
-- ✅ Users can provide per-turn feedback captured in analytics
+### Remaining (if needed)
+- [ ] Feedback UI and `/chat/feedback` wiring (backend table exists).
+- [ ] Optional guardrails/timeout instrumentation in Prometheus.
 
 ---
 
@@ -1435,7 +826,8 @@ User question: {query}"""
 - Ingestion expansion: desktop capture, Drive/Oura/Apple Photos, ESP32 device ingest
 - Lifecycle + cost controls: storage retention, budget guardrails, monitoring
 - Live data access (MCP): tool routing + cached live context
-- Memory graph + analytics: richer entity/episode intelligence
+- Memory graph + analytics: graph search, clustering jobs, mem0-assisted memory
+- Surprise and customization: “surprise me” insights + configurable ingestion pipeline
 - Platform expansion: mobile apps, sharing, developer API
 
 ### Immediate Priorities (Week 13+)
@@ -1443,6 +835,12 @@ User question: {query}"""
 2. Fix critical bugs and UX issues
 3. Optimize processing speed and cost
 4. Add most requested features
+
+### Post-MVP Additions (Requested)
+- Improve RAG quality with mem0-assisted memory, graph search, and scheduled clustering jobs.
+- Daily vlog generation (storyboard + montage plan), with optional rendering later.
+- Settings page for user controls (retention, AI preferences, agent toggles).
+- “Surprise me” mode and customizable ingestion pipeline steps (per-user toggles/weights).
 
 ### Ingestion Expansion (Post-MVP)
 

@@ -42,6 +42,9 @@ export const apiGet = async <T>(path: string): Promise<T> => apiRequest<T>(path)
 export const apiPost = async <T>(path: string, json?: unknown): Promise<T> =>
   apiRequest<T>(path, { method: 'POST', json });
 
+export const apiPostForm = async <T>(path: string, form: FormData): Promise<T> =>
+  apiRequest<T>(path, { method: 'POST', body: form });
+
 export const apiPatch = async <T>(path: string, json?: unknown): Promise<T> =>
   apiRequest<T>(path, { method: 'PATCH', json });
 

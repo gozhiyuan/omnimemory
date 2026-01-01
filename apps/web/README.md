@@ -2,8 +2,8 @@
 
 **Prerequisites:** Node.js 20+, backend services running via `make dev-up`, FastAPI API running on
 http://localhost:8000 (see `services/api/README.md`). A Gemini API key is only required if you
-plan to use the Chat tab. Uploads require Supabase storage credentials (`STORAGE_PROVIDER=supabase`
-with `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`).
+plan to use the Chat tab. Uploads require a storage provider that supports presigned URLs (S3
+compat with `STORAGE_PROVIDER=s3` + `S3_*` settings, or Supabase with `STORAGE_PROVIDER=supabase`).
 
 1. Install dependencies (inside `apps/web/`):
 

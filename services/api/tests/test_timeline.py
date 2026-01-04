@@ -70,6 +70,7 @@ def test_timeline_groups_items_and_signs_urls(monkeypatch):
     fake_session = FakeSession(
         [
             FakeResult(scalars=[item]),
+            FakeResult(scalars=[]),
             FakeResult(rows=[caption_row]),
             FakeResult(scalars=[]),
             FakeResult(rows=[]),

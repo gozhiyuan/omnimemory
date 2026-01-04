@@ -14,6 +14,7 @@ from sqlalchemy import Integer, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
+from ..cache import get_cache_json, set_cache_json
 from ..config import get_settings
 from ..db.models import (
     DEFAULT_TEST_USER_ID,
@@ -95,11 +96,17 @@ async def get_dashboard_stats(
 ) -> DashboardStats:
     """Return aggregate counts used by the dashboard cards."""
 
+    settings = get_settings()
     since = datetime.utcnow() - timedelta(days=7)
     range_end = end_date or date.today()
     range_start = start_date or (range_end - timedelta(days=6))
     if range_start > range_end:
         range_start, range_end = range_end, range_start
+    cache_key = f"dashboard:stats:v1:{user_id}:{range_start.isoformat()}:{range_end.isoformat()}"
+    if settings.dashboard_cache_ttl_seconds > 0:
+        cached = await get_cache_json(cache_key)
+        if cached:
+            return DashboardStats.model_validate(cached)
     range_start_dt = datetime.combine(range_start, time.min, tzinfo=timezone.utc)
     range_end_dt = datetime.combine(range_end, time.min, tzinfo=timezone.utc) + timedelta(days=1)
     total_items_stmt = select(func.count(SourceItem.id)).where(
@@ -245,7 +252,6 @@ async def get_dashboard_stats(
                 if isinstance(first, dict) and first.get("storage_key"):
                     keyframe_keys[row.source_item_id] = first["storage_key"]
 
-    settings = get_settings()
     storage = get_storage_provider()
 
     connections: dict[UUID, DataConnection] = {}
@@ -337,7 +343,7 @@ async def get_dashboard_stats(
             )
         )
 
-    return DashboardStats(
+    stats = DashboardStats(
         total_items=total_items,
         processed_items=processed_items,
         failed_items=failed_items,
@@ -374,3 +380,6 @@ async def get_dashboard_stats(
         ),
         usage_daily=usage_daily,
     )
+    if settings.dashboard_cache_ttl_seconds > 0:
+        await set_cache_json(cache_key, stats.model_dump(), settings.dashboard_cache_ttl_seconds)
+    return stats

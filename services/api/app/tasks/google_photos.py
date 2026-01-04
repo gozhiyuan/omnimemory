@@ -106,10 +106,15 @@ async def _ingest_media_item(
             session_id,
         )
         return None
-    download_url = _build_download_url(base_url, mime_type)
-    storage_key = f"google_photos/{connection.user_id}/{media_id}/{_infer_filename(media_id, filename, mime_type)}"
     mime_type = mime_type or "application/octet-stream"
     captured_at = parse_google_timestamp(creation_time)
+    key_date = (captured_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    inferred_name = _infer_filename(media_id, filename, mime_type)
+    desired_storage_key = (
+        f"google_photos/{connection.user_id}/{key_date:%Y/%m/%d}/{media_id}-{inferred_name}"
+    )
+    download_url = _build_download_url(base_url, mime_type)
+    storage_key = desired_storage_key
 
     storage = get_storage_provider()
 
@@ -125,7 +130,11 @@ async def _ingest_media_item(
         )
         existing = result.scalar_one_or_none()
         if existing:
-            existing.storage_key = storage_key
+            if existing.storage_key and not existing.storage_key.startswith(("http://", "https://")):
+                storage_key = existing.storage_key
+            else:
+                existing.storage_key = desired_storage_key
+                storage_key = desired_storage_key
             existing.content_type = existing.content_type or mime_type
             existing.original_filename = existing.original_filename or filename
             existing.provider = existing.provider or "google_photos"

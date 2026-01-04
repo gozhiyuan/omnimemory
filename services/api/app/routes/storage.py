@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Optional
 import re
 
@@ -28,6 +29,7 @@ class UploadUrlRequest(BaseModel):
     filename: str = Field(..., description="Original filename for key generation")
     content_type: str = Field(..., description="MIME type")
     prefix: Optional[str] = Field(default=None, description="Optional path prefix")
+    path_date: Optional[date] = Field(default=None, description="Optional date for path prefix (YYYY-MM-DD)")
 
 
 class UploadUrlResponse(BaseModel):
@@ -52,6 +54,8 @@ def create_upload_url(request: UploadUrlRequest) -> UploadUrlResponse:
 
     prefix = (request.prefix or "uploads").strip("/")
     safe_name = sanitize_filename(request.filename)
+    if request.path_date:
+        prefix = f"{prefix}/{request.path_date:%Y/%m/%d}"
     key = f"{prefix}/{uuid.uuid4()}-{safe_name}"
     signed = storage.get_presigned_upload(key, request.content_type, settings.presigned_url_ttl_seconds)
     if not signed.get("url"):

@@ -15,6 +15,7 @@ import {
   TimelineViewMode,
   UploadUrlResponse,
 } from '../types';
+import { PageMotion } from './PageMotion';
 
 type ViewMode = TimelineViewMode;
 
@@ -32,6 +33,13 @@ const formatMonthLabel = (value: Date) =>
 
 const formatDayLabel = (value: Date) =>
   value.toLocaleDateString(undefined, { weekday: 'short' });
+
+const formatLocalDate = (value: Date) => {
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, '0');
+  const day = String(value.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
 
 const buildLabel = (item: TimelineItem) =>
   item.caption || item.original_filename || `${item.item_type} upload`;
@@ -760,6 +768,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     });
 
     const newPending: string[] = [];
+    const pathDate = formatLocalDate(anchorDate);
     try {
       for (const [index, file] of uploadFiles.entries()) {
         const contentType = file.type || 'application/octet-stream';
@@ -767,6 +776,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
           filename: file.name,
           content_type: contentType,
           prefix: 'uploads/ui',
+          path_date: pathDate,
         });
         if (!uploadMeta.url) {
           throw new Error(`Upload URL missing for ${file.name}`);
@@ -1026,10 +1036,10 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
   };
 
   return (
-    <div className="h-full overflow-y-auto p-4 md:p-8">
-      <div className="relative overflow-hidden rounded-[32px] border border-white/70 bg-gradient-to-br from-slate-50 via-white to-slate-100 shadow-[0_40px_120px_-60px_rgba(15,23,42,0.45)]">
-        <div className="absolute -top-32 -left-24 h-64 w-64 rounded-full bg-blue-200/40 blur-3xl" />
-        <div className="absolute -bottom-32 -right-20 h-64 w-64 rounded-full bg-indigo-200/40 blur-3xl" />
+    <PageMotion className="h-full overflow-y-auto p-4 md:p-8">
+      <div className="relative overflow-hidden rounded-[32px] border border-white/70 bg-gradient-to-br from-slate-50 via-white to-slate-100 shadow-[0_40px_120px_-60px_rgba(15,23,42,0.45)] dark:border-slate-800 dark:from-slate-950 dark:via-slate-900 dark:to-slate-950">
+        <div className="absolute -top-32 -left-24 h-64 w-64 rounded-full bg-blue-200/40 blur-3xl dark:bg-blue-900/30" />
+        <div className="absolute -bottom-32 -right-20 h-64 w-64 rounded-full bg-indigo-200/40 blur-3xl dark:bg-indigo-900/30" />
         <div className="relative z-10 space-y-6 p-6 md:p-10">
           <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
             <div>
@@ -1228,6 +1238,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                               src={thumbnail}
                               alt="Preview"
                               className="h-8 w-8 rounded-full object-cover"
+                              loading="lazy"
                             />
                           ) : (
                             <div className="flex h-8 w-8 items-center justify-center rounded-full bg-slate-100 text-slate-400">
@@ -1368,7 +1379,12 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                       >
                         <div className="relative h-14 w-14 flex-shrink-0 overflow-hidden rounded-xl bg-slate-100">
                           {thumbnail ? (
-                            <img src={thumbnail} alt={buildLabel(item)} className="h-full w-full object-cover" />
+                            <img
+                              src={thumbnail}
+                              alt={buildLabel(item)}
+                              className="h-full w-full object-cover"
+                              loading="lazy"
+                            />
                           ) : item.item_type === 'video' ? (
                             <div className="flex h-full w-full items-center justify-center text-slate-400">
                               <Video className="h-5 w-5" />
@@ -1619,7 +1635,12 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                           <div className="flex items-start gap-3">
                             <div className="h-12 w-12 flex-shrink-0 overflow-hidden rounded-xl bg-slate-100">
                               {preview ? (
-                                <img src={preview} alt={episode.title} className="h-full w-full object-cover" />
+                                <img
+                                  src={preview}
+                                  alt={episode.title}
+                                  className="h-full w-full object-cover"
+                                  loading="lazy"
+                                />
                               ) : (
                                 <div className="flex h-full w-full items-center justify-center text-slate-400">
                                   <ImageIcon className="h-4 w-4" />
@@ -1710,7 +1731,12 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                             >
                               <div className="relative h-14 w-14 flex-shrink-0 overflow-hidden rounded-xl bg-slate-100">
                                 {thumbnail ? (
-                                  <img src={thumbnail} alt={buildLabel(item)} className="h-full w-full object-cover" />
+                                  <img
+                                    src={thumbnail}
+                                    alt={buildLabel(item)}
+                                    className="h-full w-full object-cover"
+                                    loading="lazy"
+                                  />
                                 ) : item.item_type === 'video' ? (
                                   <div className="flex h-full w-full items-center justify-center text-slate-400">
                                     <Video className="h-5 w-5" />
@@ -1913,9 +1939,19 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                               >
                                 <div className="h-12 w-12 overflow-hidden rounded-xl bg-slate-100">
                                   {item.item_type === 'video' && item.poster_url ? (
-                                    <img src={item.poster_url} alt={buildLabel(item)} className="h-full w-full object-cover" />
+                                    <img
+                                      src={item.poster_url}
+                                      alt={buildLabel(item)}
+                                      className="h-full w-full object-cover"
+                                      loading="lazy"
+                                    />
                                   ) : item.item_type === 'photo' && item.download_url ? (
-                                    <img src={item.download_url} alt={buildLabel(item)} className="h-full w-full object-cover" />
+                                    <img
+                                      src={item.download_url}
+                                      alt={buildLabel(item)}
+                                      className="h-full w-full object-cover"
+                                      loading="lazy"
+                                    />
                                   ) : item.item_type === 'video' ? (
                                     <div className="flex h-full w-full items-center justify-center text-slate-400">
                                       <Video className="h-4 w-4" />
@@ -2002,7 +2038,12 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                               <div className="p-6 text-slate-400">Audio unavailable.</div>
                             )
                           ) : detail.download_url ? (
-                            <img src={detail.download_url} alt={buildLabel(detail)} className="w-full object-cover" />
+                            <img
+                              src={detail.download_url}
+                              alt={buildLabel(detail)}
+                              className="w-full object-cover"
+                              loading="lazy"
+                            />
                           ) : (
                             <div className="p-6 text-slate-400">Preview unavailable.</div>
                           )}
@@ -2070,6 +2111,6 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
           )}
         </div>
       </div>
-    </div>
+    </PageMotion>
   );
 };

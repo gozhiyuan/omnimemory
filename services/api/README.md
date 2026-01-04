@@ -119,6 +119,17 @@ initialisation (e.g. worker startup) to guarantee the collection exists:
 uv run python -c "from app.vectorstore import ensure_collection; ensure_collection()"
 ```
 
+### Load testing chat with k6
+
+Run a simple chat load test (p95 < 3s threshold) once the API is up:
+
+```bash
+BASE_URL=http://localhost:8000 \
+VUS=5 \
+DURATION=1m \
+k6 run services/api/scripts/k6_chat.js
+```
+
 ### Storage abstraction (`app/storage.py`)
 
 The `get_storage_provider()` factory returns the S3-compatible storage implementation when

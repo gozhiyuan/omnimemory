@@ -11,6 +11,7 @@ import {
   X,
 } from 'lucide-react';
 import { apiGet, apiPost, apiPostForm } from '../services/api';
+import { PageMotion } from './PageMotion';
 import {
   ChatMessage,
   ChatResponse,
@@ -130,6 +131,7 @@ export const ChatInterface: React.FC = () => {
   } | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
   const objectUrlsRef = useRef<string[]>([]);
 
   const activeSession = sessions.find((session) => session.session_id === sessionId) || null;
@@ -420,6 +422,27 @@ export const ChatInterface: React.FC = () => {
     await sendMessage({ messageText, imageFile, imagePreview });
   };
 
+  useEffect(() => {
+    const handleShortcut = (event: KeyboardEvent) => {
+      const isMeta = event.metaKey || event.ctrlKey;
+      if (!isMeta) return;
+      const key = event.key.toLowerCase();
+      if (key === 'k') {
+        event.preventDefault();
+        inputRef.current?.focus();
+        inputRef.current?.select();
+      }
+      if (key === 'enter' && document.activeElement === inputRef.current) {
+        event.preventDefault();
+        void handleSend();
+      }
+    };
+    window.addEventListener('keydown', handleShortcut);
+    return () => {
+      window.removeEventListener('keydown', handleShortcut);
+    };
+  }, [handleSend]);
+
   const handleAgentRun = async (agentId: string) => {
     const agent = AGENTS.find((item) => item.id === agentId);
     if (!agent || agent.disabled || loading) {
@@ -542,7 +565,7 @@ export const ChatInterface: React.FC = () => {
   };
 
   return (
-    <div className="flex h-full bg-slate-50">
+    <PageMotion className="flex h-full bg-slate-50">
       <aside className="w-72 bg-white border-r border-slate-200 flex flex-col">
         <div className="px-4 py-4 border-b border-slate-200 flex items-center justify-between">
           <div>
@@ -650,6 +673,7 @@ export const ChatInterface: React.FC = () => {
                         src={attachment.url}
                         alt="Uploaded"
                         className="w-48 h-32 object-cover cursor-zoom-in"
+                        loading="lazy"
                       />
                     </button>
                   ))}
@@ -680,7 +704,12 @@ export const ChatInterface: React.FC = () => {
                        >
                          <div className="h-20 w-full overflow-hidden bg-slate-100 flex items-center justify-center">
                            {src.thumbnail_url ? (
-                             <img src={src.thumbnail_url} alt="source" className="w-full h-full object-cover" />
+                             <img
+                               src={src.thumbnail_url}
+                               alt="source"
+                               className="w-full h-full object-cover"
+                               loading="lazy"
+                             />
                            ) : (
                              <ImageIcon size={16} className="text-slate-400" />
                            )}
@@ -740,6 +769,7 @@ export const ChatInterface: React.FC = () => {
                     src={selectedImagePreview}
                     alt="Selected"
                     className="w-14 h-14 object-cover cursor-zoom-in"
+                    loading="lazy"
                   />
                 </button>
                 <div className="text-xs text-slate-600">
@@ -777,6 +807,7 @@ export const ChatInterface: React.FC = () => {
             />
             <input
               type="text"
+              ref={inputRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               placeholder="Ask 'When was my trip to Kyoto?'..."
@@ -955,6 +986,7 @@ export const ChatInterface: React.FC = () => {
                 src={previewAttachment.url}
                 alt="Preview"
                 className="max-h-[70vh] w-auto rounded-xl border border-slate-200"
+                loading="lazy"
               />
             </div>
             <div className="flex items-center justify-between border-t border-slate-200 px-5 py-3">
@@ -978,6 +1010,6 @@ export const ChatInterface: React.FC = () => {
           </div>
         </div>
       )}
-    </div>
+    </PageMotion>
   );
 };

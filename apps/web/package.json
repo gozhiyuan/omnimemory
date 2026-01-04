@@ -10,6 +10,7 @@
     "test:e2e": "npx playwright test"
   },
   "dependencies": {
+    "framer-motion": "^11.0.0",
     "lucide-react": "^0.562.0",
     "@google/genai": "^1.34.0",
     "react-dom": "^19.2.3",

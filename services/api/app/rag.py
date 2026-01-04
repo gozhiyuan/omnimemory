@@ -284,10 +284,14 @@ async def retrieve_context_hits(
         settings=settings,
         tz_offset_minutes=tz_offset_minutes,
     )
+    start_time = parsed.date_range[0] if parsed.date_range else None
+    end_time = parsed.date_range[1] if parsed.date_range else None
     candidates = search_contexts(
         query,
         limit=max(top_k * 8, 40),
         user_id=str(user_id),
+        start_time=start_time,
+        end_time=end_time,
     )
 
     now = datetime.now(timezone.utc)

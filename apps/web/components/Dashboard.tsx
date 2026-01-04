@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts';
 import { HardDrive, Image as ImageIcon, Link as LinkIcon, Activity, Calendar, Mic, Play, Video, Cpu, DollarSign } from 'lucide-react';
 import { apiGet } from '../services/api';
+import { PageMotion } from './PageMotion';
 import { DashboardRecentItem, DashboardStatsResponse, TimelineFocus } from '../types';
 
 const StatCard = ({ title, value, icon, subtext }: { title: string, value: string | number, icon: React.ReactNode, subtext?: string }) => (
@@ -56,6 +57,7 @@ const RecentActivityItem: React.FC<{ item: DashboardRecentItem; onSelect?: (item
             alt={buildLabel(item)}
             className="w-12 h-12 rounded-lg object-cover shadow-sm group-hover:scale-105 transition-transform"
             onError={() => setImageFailed(true)}
+            loading="lazy"
           />
           {isVideo && (
             <span className="absolute inset-0 flex items-center justify-center text-white">
@@ -193,7 +195,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ onOpenTimeline }) => {
   const usageAllTime = stats?.usage_all_time;
 
   return (
-    <div className="h-full overflow-y-auto p-8 space-y-8 animate-fade-in">
+    <PageMotion className="h-full overflow-y-auto p-8 space-y-8">
       <div>
         <h1 className="text-2xl font-bold text-slate-900">Dashboard</h1>
         <p className="text-slate-500 mt-1">Overview of your digital life log.</p>
@@ -431,6 +433,6 @@ export const Dashboard: React.FC<DashboardProps> = ({ onOpenTimeline }) => {
           </p>
         </div>
       </div>
-    </div>
+    </PageMotion>
   );
 };

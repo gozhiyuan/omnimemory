@@ -23,6 +23,7 @@ from ..google_photos import (
     extract_picker_media_fields,
     fetch_picker_media_items,
     get_valid_access_token,
+    PickerPendingError,
     store_google_photos_tokens,
 )
 from ..tasks.google_photos import sync_google_photos_media
@@ -94,6 +95,8 @@ class PickerMediaItem(BaseModel):
 
 class PickerMediaResponse(BaseModel):
     items: list[PickerMediaItem]
+    status: str = "ready"
+    message: Optional[str] = None
 
 
 def _ensure_google_photos_config() -> None:
@@ -251,6 +254,12 @@ async def get_google_photos_picker_items(
         raise HTTPException(status_code=401, detail="Google Photos token missing or expired.")
     try:
         items = await fetch_picker_media_items(access_token, session_id)
+    except PickerPendingError:
+        return PickerMediaResponse(
+            items=[],
+            status="pending",
+            message="Waiting for Google Photos selection to complete.",
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=f"Failed to fetch picker items: {exc}") from exc
 

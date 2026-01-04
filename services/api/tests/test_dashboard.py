@@ -97,8 +97,16 @@ def test_dashboard_stats_returns_activity_and_recent_items(monkeypatch):
     async def override_get_session():
         yield fake_session
 
+    async def fake_cache_get(_key: str):
+        return None
+
+    async def fake_cache_set(_key: str, _payload, _ttl: int):
+        return None
+
     app.dependency_overrides[get_session] = override_get_session
     monkeypatch.setattr(dashboard_module, "get_storage_provider", lambda: FakeStorage())
+    monkeypatch.setattr(dashboard_module, "get_cache_json", fake_cache_get)
+    monkeypatch.setattr(dashboard_module, "set_cache_json", fake_cache_set)
 
     client = TestClient(app)
     response = client.get("/dashboard/stats")
@@ -151,11 +159,68 @@ def test_dashboard_handles_signing_failures(monkeypatch):
     async def override_get_session():
         yield fake_session
 
+    async def fake_cache_get(_key: str):
+        return None
+
+    async def fake_cache_set(_key: str, _payload, _ttl: int):
+        return None
+
     app.dependency_overrides[get_session] = override_get_session
     monkeypatch.setattr(dashboard_module, "get_storage_provider", lambda: FailingStorage())
+    monkeypatch.setattr(dashboard_module, "get_cache_json", fake_cache_get)
+    monkeypatch.setattr(dashboard_module, "set_cache_json", fake_cache_set)
 
     client = TestClient(app)
     response = client.get("/dashboard/stats")
     assert response.status_code == 200
     payload = response.json()
     assert payload["recent_items"][0]["download_url"] is None
+
+
+def test_dashboard_stats_uses_cache(monkeypatch):
+    cached_payload = {
+        "total_items": 8,
+        "processed_items": 8,
+        "failed_items": 0,
+        "active_connections": 1,
+        "uploads_last_7_days": 3,
+        "storage_used_bytes": 1024,
+        "recent_items": [],
+        "activity": [],
+        "usage_this_week": {
+            "prompt_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.0,
+        },
+        "usage_all_time": {
+            "prompt_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.0,
+        },
+        "usage_daily": [],
+    }
+
+    class FailingSession:
+        async def execute(self, _stmt):
+            raise AssertionError("DB queries should not run on cache hit.")
+
+    async def override_get_session():
+        yield FailingSession()
+
+    async def fake_cache_get(_key: str):
+        return cached_payload
+
+    async def fake_cache_set(_key: str, _payload, _ttl: int):
+        raise AssertionError("Cache write should not run on cache hit.")
+
+    app.dependency_overrides[get_session] = override_get_session
+    monkeypatch.setattr(dashboard_module, "get_cache_json", fake_cache_get)
+    monkeypatch.setattr(dashboard_module, "set_cache_json", fake_cache_set)
+
+    client = TestClient(app)
+    response = client.get("/dashboard/stats")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total_items"] == 8

@@ -1,3 +1,5 @@
+import { toast } from './toast';
+
 const API_BASE = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
 
 type ApiOptions = RequestInit & { json?: unknown };
@@ -27,9 +29,23 @@ export const apiRequest = async <T>(path: string, options: ApiOptions = {}): Pro
     body = JSON.stringify(json);
   }
 
-  const response = await fetch(buildUrl(path), { ...rest, headers: requestHeaders, body });
+  const notifyFailure = (message: string, status?: number) => {
+    const title = status ? `Request failed (${status})` : 'Request failed';
+    toast.error(title, message);
+  };
+
+  let response: Response;
+  try {
+    response = await fetch(buildUrl(path), { ...rest, headers: requestHeaders, body });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Network error';
+    notifyFailure(message);
+    throw err;
+  }
   if (!response.ok) {
-    throw new Error(await formatError(response));
+    const message = await formatError(response);
+    notifyFailure(message, response.status);
+    throw new Error(message);
   }
   if (response.status === 204) {
     return null as T;

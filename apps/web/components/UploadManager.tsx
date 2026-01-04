@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { UploadCloud, CheckCircle2, FileImage, X, AlertCircle, ChevronDown, FileText, Mic, Play, Video } from 'lucide-react';
 import { apiGet, apiPost } from '../services/api';
+import { PageMotion } from './PageMotion';
 import {
   GooglePhotosAuthUrlResponse,
   GooglePhotosPickerSessionResponse,
@@ -30,6 +31,9 @@ export const UploadManager: React.FC = () => {
   const [pickerLoading, setPickerLoading] = useState(false);
   const [pickerError, setPickerError] = useState<string | null>(null);
   const [pickerSessionId, setPickerSessionId] = useState<string | null>(null);
+  const [pickerUri, setPickerUri] = useState<string | null>(null);
+  const [pickerPollCycle, setPickerPollCycle] = useState(0);
+  const [pickerPollExhausted, setPickerPollExhausted] = useState(false);
   const [syncLoading, setSyncLoading] = useState(false);
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
   const [recentItems, setRecentItems] = useState<TimelineItem[]>([]);
@@ -40,6 +44,7 @@ export const UploadManager: React.FC = () => {
   const [selectedItems, setSelectedItems] = useState<GooglePhotosPickerItem[]>([]);
   const [selectedLoading, setSelectedLoading] = useState(false);
   const [selectedError, setSelectedError] = useState<string | null>(null);
+  const [selectedHint, setSelectedHint] = useState<string | null>(null);
   const [detailsOpen, setDetailsOpen] = useState(true);
 
   const inferItemType = (file: File) => {
@@ -71,6 +76,13 @@ export const UploadManager: React.FC = () => {
       };
       media.src = url;
     });
+  };
+
+  const formatLocalDate = (value: Date) => {
+    const year = value.getFullYear();
+    const month = String(value.getMonth() + 1).padStart(2, '0');
+    const day = String(value.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
   };
 
   const handleDrag = (e: React.DragEvent) => {
@@ -129,10 +141,12 @@ export const UploadManager: React.FC = () => {
     try {
       for (const file of files) {
         const contentType = file.type || 'application/octet-stream';
+        const uploadDate = file.lastModified ? new Date(file.lastModified) : new Date();
         const uploadMeta = await apiPost<UploadUrlResponse>('/storage/upload-url', {
           filename: file.name,
           content_type: contentType,
           prefix: 'uploads/ui',
+          path_date: formatLocalDate(uploadDate),
         });
         if (!uploadMeta.url) {
           throw new Error(`Upload URL missing for ${file.name}`);
@@ -231,10 +245,14 @@ export const UploadManager: React.FC = () => {
     setSyncMessage(null);
     setSelectedItems([]);
     setSelectedError(null);
+    setSelectedHint(null);
+    setPickerPollExhausted(false);
     try {
       const response = await apiPost<GooglePhotosPickerSessionResponse>('/integrations/google/photos/picker-session');
       setPickerSessionId(response.session_id);
+      setPickerUri(response.picker_uri);
       window.open(response.picker_uri, '_blank', 'noopener,noreferrer');
+      setPickerPollCycle((cycle) => cycle + 1);
     } catch (err) {
       setPickerError(err instanceof Error ? err.message : 'Failed to open Google Photos picker.');
     } finally {
@@ -245,19 +263,44 @@ export const UploadManager: React.FC = () => {
   const fetchPickerSelection = async () => {
     if (!pickerSessionId) {
       setSelectedError('Start a picker session before loading selections.');
-      return 0;
+      return { count: 0, pending: false };
     }
     setSelectedError(null);
+    setSelectedHint(null);
     try {
       const response = await apiGet<GooglePhotosPickerItemsResponse>(
         `/integrations/google/photos/picker-items?session_id=${encodeURIComponent(pickerSessionId)}`
       );
+      if (response.status === 'pending') {
+        setSelectedItems([]);
+        setSelectedHint(response.message || 'Waiting for Google Photos selection to complete.');
+        return { count: 0, pending: true };
+      }
+      setSelectedHint(null);
       setSelectedItems(response.items);
-      return response.items.length;
+      return { count: response.items.length, pending: false };
     } catch (err) {
       setSelectedError(err instanceof Error ? err.message : 'Failed to load picker selections.');
-      return 0;
+      return { count: 0, pending: false };
     }
+  };
+
+  const handlePickerCheckAgain = () => {
+    if (!pickerSessionId) {
+      setSelectedError('Start a picker session before loading selections.');
+      return;
+    }
+    setPickerPollExhausted(false);
+    setSelectedHint('Checking Google Photos selection...');
+    setPickerPollCycle((cycle) => cycle + 1);
+  };
+
+  const handlePickerReopen = () => {
+    if (!pickerUri) {
+      setPickerError('No picker session available. Start a new selection.');
+      return;
+    }
+    window.open(pickerUri, '_blank', 'noopener,noreferrer');
   };
 
   const handleGoogleSync = async () => {
@@ -288,31 +331,55 @@ export const UploadManager: React.FC = () => {
   useEffect(() => {
     if (!pickerSessionId) return;
 
+    const initialDelayMs = 2000;
+    const maxDelayMs = 15000;
+    const maxDurationMs = 90000;
+    const backoffFactor = 1.6;
+
     let cancelled = false;
-    let attempts = 0;
+    let timeoutId: number | undefined;
+    let delayMs = initialDelayMs;
+    const startedAt = Date.now();
+
     setSelectedItems([]);
     setSelectedLoading(true);
     setSelectedError(null);
+    setPickerPollExhausted(false);
 
     const pollSelection = async () => {
-      attempts += 1;
-      const count = await fetchPickerSelection();
+      const { count, pending } = await fetchPickerSelection();
       if (cancelled) return;
-      if (count > 0 || attempts >= 10) {
+      if (!pending) {
         setSelectedLoading(false);
-        window.clearInterval(intervalId);
+        setPickerPollExhausted(false);
+        if (count === 0) {
+          setSelectedHint('No items selected yet. Reopen the picker to choose photos.');
+        }
+        return;
       }
+
+      const elapsedMs = Date.now() - startedAt;
+      if (elapsedMs >= maxDurationMs) {
+        setSelectedLoading(false);
+        setPickerPollExhausted(true);
+        setSelectedHint('Still waiting on Google Photos. Check again or reopen the picker.');
+        return;
+      }
+
+      delayMs = Math.min(Math.floor(delayMs * backoffFactor), maxDelayMs);
+      timeoutId = window.setTimeout(pollSelection, delayMs);
     };
 
-    const intervalId = window.setInterval(pollSelection, 2000);
     void pollSelection();
 
     return () => {
       cancelled = true;
-      window.clearInterval(intervalId);
+      if (timeoutId) {
+        window.clearTimeout(timeoutId);
+      }
       setSelectedLoading(false);
     };
-  }, [pickerSessionId]);
+  }, [pickerSessionId, pickerPollCycle]);
 
   const formatGoogleStatus = () => {
     if (!googleStatus?.connected) {
@@ -326,7 +393,7 @@ export const UploadManager: React.FC = () => {
   };
 
   return (
-    <div className="p-8 max-w-4xl mx-auto">
+    <PageMotion className="p-8 max-w-4xl mx-auto">
        <div className="mb-8">
         <h1 className="text-2xl font-bold text-slate-900">Ingestion Pipeline</h1>
         <p className="text-slate-500 mt-1">Upload photos, videos, or connect external accounts.</p>
@@ -428,7 +495,12 @@ export const UploadManager: React.FC = () => {
             <div className="flex items-center justify-between">
               <div className="flex items-center space-x-3">
                 <div className="w-10 h-10 bg-blue-50 rounded-lg flex items-center justify-center">
-                   <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/c/c1/Google_%22G%22_logo.svg/768px-Google_%22G%22_logo.svg.png" className="w-5 h-5" alt="Google" />
+                   <img
+                     src="https://upload.wikimedia.org/wikipedia/commons/thumb/c/c1/Google_%22G%22_logo.svg/768px-Google_%22G%22_logo.svg.png"
+                     className="w-5 h-5"
+                     alt="Google"
+                     loading="lazy"
+                   />
                 </div>
                 <div>
                   <h3 className="text-sm font-medium text-slate-900">Google Photos</h3>
@@ -494,6 +566,28 @@ export const UploadManager: React.FC = () => {
                         {!pickerSessionId && <span className="text-slate-500">Open the picker to start a selection.</span>}
                       </div>
                       {selectedError && <p className="text-xs text-red-600">{selectedError}</p>}
+                      {selectedHint && !selectedError && (
+                        <p className="text-xs text-slate-500">{selectedHint}</p>
+                      )}
+                      {pickerPollExhausted && !selectedError && (
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button
+                            className="text-xs border border-slate-300 px-2.5 py-1 rounded-md hover:bg-white disabled:opacity-50"
+                            onClick={handlePickerCheckAgain}
+                            disabled={selectedLoading}
+                            type="button"
+                          >
+                            Check again
+                          </button>
+                          <button
+                            className="text-xs text-slate-600 hover:text-slate-800 underline underline-offset-2"
+                            onClick={handlePickerReopen}
+                            type="button"
+                          >
+                            Reopen picker
+                          </button>
+                        </div>
+                      )}
                       <button
                         className="text-xs bg-slate-900 text-white px-3 py-1.5 rounded-md hover:bg-slate-800 disabled:opacity-50"
                         onClick={handleGoogleSync}
@@ -531,6 +625,7 @@ export const UploadManager: React.FC = () => {
                                   src={item.download_url}
                                   alt={item.original_filename || 'Google Photos thumbnail'}
                                   className="w-10 h-10 rounded-md object-cover border border-slate-200"
+                                  loading="lazy"
                                 />
                               ) : item.item_type === 'video' && item.poster_url ? (
                                 <div className="relative">
@@ -538,6 +633,7 @@ export const UploadManager: React.FC = () => {
                                     src={item.poster_url}
                                     alt={item.original_filename || 'Video preview'}
                                     className="w-10 h-10 rounded-md object-cover border border-slate-200"
+                                    loading="lazy"
                                   />
                                   <span className="absolute inset-0 flex items-center justify-center text-white">
                                     <span className="flex items-center justify-center w-5 h-5 rounded-full bg-black/60">
@@ -595,6 +691,6 @@ export const UploadManager: React.FC = () => {
           </div>
         </div>
       </div>
-    </div>
+    </PageMotion>
   );
 };

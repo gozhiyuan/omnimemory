@@ -21,6 +21,25 @@ GOOGLE_PHOTOS_PICKER_MEDIA_ITEM_ENDPOINT = "https://photospicker.googleapis.com/
 GOOGLE_PHOTOS_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 
 
+class PickerPendingError(RuntimeError):
+    """Raised when the picker session is awaiting user selection."""
+
+
+def _is_pending_picker_error(payload: dict) -> bool:
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict):
+        return False
+    if error.get("status") != "FAILED_PRECONDITION":
+        return False
+    details = error.get("details")
+    if isinstance(details, list):
+        for detail in details:
+            if isinstance(detail, dict) and detail.get("reason") == "PENDING_USER_ACTION":
+                return True
+    message = error.get("message") or ""
+    return "not picked media items" in message.lower()
+
+
 def parse_google_timestamp(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
@@ -252,6 +271,13 @@ async def fetch_picker_media_items(access_token: str, session_id: str) -> list[d
                 params["pageToken"] = page_token
             response = await client.get(GOOGLE_PHOTOS_PICKER_MEDIA_ENDPOINT, headers=headers, params=params)
             if response.status_code >= 400:
+                if response.status_code == 400:
+                    try:
+                        payload = response.json()
+                    except Exception:
+                        payload = {}
+                    if _is_pending_picker_error(payload):
+                        raise PickerPendingError("picker selection pending")
                 if use_fields_mask and response.status_code == 400 and "fields" in response.text:
                     logger.warning("Picker media request failed with fields mask; retrying without fields: {}", response.text)
                     use_fields_mask = False

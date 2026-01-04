@@ -362,6 +362,7 @@ Reference: `docs/minecontext/lifelog_ingestion_rag_design.md`
 - [ ] Memory graph population + graph-based retrieval (tables exist).
 - [ ] Scheduled daily event clustering job.
 - [ ] mem0 integration (not used in current implementation).
+- [ ] Notion integration (deferred until post-MVP).
 
 ---
 
@@ -384,278 +385,53 @@ Reference: `docs/minecontext/lifelog_ingestion_rag_design.md`
 ## Week 9-10: Timeline, Dashboard & Polish
 
 ### Objectives
-- Build timeline visualization
-- Create dashboard with statistics
-- Add loading states and error handling
-- Implement Notion integration
-- Polish UI/UX
+- Stabilize and polish the implemented Timeline + Dashboard
+- Improve error handling, loading states, and UX resilience
+- Stand up local observability for Celery + API + Qdrant
+- Expand QA coverage for ingest -> retrieval -> chat
 
-### Tasks
+### Implemented (Current)
+- [x] Timeline API: `/timeline`, `/timeline/items`, `/timeline/items/{id}`, `/timeline/episodes/{id}`, `PATCH /timeline/episodes/{id}`, `DELETE /timeline/items/{id}`
+- [x] Timeline UI: day + all views, daily summary + episodes, item detail drawer, search, upload-for-date, manual "load more"
+- [x] Dashboard API: `/dashboard/stats` with activity, recent items, AI usage, storage totals
+- [x] Dashboard UI: stat cards, ingestion activity chart, AI usage chart, recent memories linking to timeline
+- [x] Basic tests: `services/api/tests/test_timeline.py`, `services/api/tests/test_dashboard.py`, `apps/web/tests/ingest-flow.spec.ts`
 
-**Timeline View**
-- [ ] Create timeline API endpoint:
-  ```python
-  @app.get("/timeline")
-  async def get_timeline(
-      start_date: date,
-      end_date: date,
-      user: User = Depends(get_current_user)
-  ):
-      # Get events in date range
-      events = db.query(events).filter(
-          user_id=user.id,
-          start_time >= start_date,
-          end_time <= end_date
-      ).all()
-      
-      # Get items per day
-      items_by_day = db.query(
-          func.date(source_items.captured_at).label('date'),
-          func.count(source_items.id).label('count')
-      ).filter(
-          user_id=user.id,
-          captured_at >= start_date,
-          captured_at <= end_date
-      ).group_by('date').all()
-      
-      return {
-          'events': [format_event(e) for e in events],
-          'activity': {day: count for day, count in items_by_day}
-      }
-  ```
-- [ ] Build timeline UI with calendar view:
-  ```typescript
-  const Timeline = () => {
-    const [selectedDate, setSelectedDate] = useState(new Date());
-    
-    const { data: timeline } = useQuery({
-      queryKey: ['timeline', selectedDate.getMonth(), selectedDate.getFullYear()],
-      queryFn: () => api.get('/timeline', {
-        params: {
-          start_date: startOfMonth(selectedDate),
-          end_date: endOfMonth(selectedDate)
-        }
-      })
-    });
-    
-    return (
-      <div>
-        <Calendar
-          value={selectedDate}
-          onChange={setSelectedDate}
-          tileContent={({ date }) => (
-            <ActivityDot count={timeline?.activity[date] || 0} />
-          )}
-        />
-        <EventList
-          events={timeline?.events.filter(e =>
-            isSameDay(e.start_time, selectedDate)
-          )}
-        />
-      </div>
-    );
-  };
-  ```
-- [ ] Add a day-details panel that combines the selected day's timeline events, thumbnails, embedded videos, and Gemini-generated text summaries (include links back to Google Photos originals when available)
-- [ ] Implement infinite scroll for timeline
+### Remaining (Week 9-10 Focus)
 
-**Dashboard**
-- [ ] Create dashboard stats endpoint:
-  ```python
-  @app.get("/dashboard/stats")
-  async def get_dashboard_stats(user: User = Depends(get_current_user)):
-      total_items = db.query(func.count(source_items.id)).filter(
-          user_id=user.id
-      ).scalar()
-      
-      total_storage = db.query(func.sum(source_items.size)).filter(
-          user_id=user.id
-      ).scalar() or 0
-      
-      # Items uploaded in last 7 days
-      recent_items = db.query(func.count(source_items.id)).filter(
-          user_id=user.id,
-          created_at >= datetime.now() - timedelta(days=7)
-      ).scalar()
-      
-      # Connected sources
-      connections = db.query(data_connections).filter(
-          user_id=user.id,
-          status='connected'
-      ).count()
-      
-      # Activity heatmap (last 30 days)
-      heatmap = db.query(
-          func.date(source_items.captured_at).label('date'),
-          func.count(source_items.id).label('count')
-      ).filter(
-          user_id=user.id,
-          captured_at >= datetime.now() - timedelta(days=30)
-      ).group_by('date').all()
-      
-      return {
-          'total_items': total_items,
-          'storage_used_gb': total_storage / (1024**3),
-          'recent_uploads': recent_items,
-          'connected_sources': connections,
-          'activity_heatmap': heatmap
-      }
-  ```
-- [ ] Build dashboard UI with stat cards:
-  ```typescript
-  const Dashboard = () => {
-    const { data: stats } = useQuery({
-      queryKey: ['dashboard-stats'],
-      queryFn: () => api.get('/dashboard/stats')
-    });
-    
-    return (
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-        <StatCard
-          title="Total Memories"
-          value={stats?.total_items.toLocaleString()}
-          icon={<PhotoIcon />}
-        />
-        <StatCard
-          title="Storage Used"
-          value={`${stats?.storage_used_gb.toFixed(2)} GB`}
-          icon={<DatabaseIcon />}
-        />
-        <StatCard
-          title="This Week"
-          value={stats?.recent_uploads}
-          icon={<CalendarIcon />}
-        />
-        <StatCard
-          title="Connected Sources"
-          value={stats?.connected_sources}
-          icon={<LinkIcon />}
-        />
-      </div>
-    );
-  };
-  ```
-- [ ] Add activity heatmap component
-- [ ] Show recent events and highlights
-
-**Notion Integration**
-- [ ] Set up Notion OAuth integration
-- [ ] Create Notion sync task:
-  ```python
-  @celery.task
-  def sync_notion(connection_id: str):
-      connection = db.get(data_connections, connection_id)
-      token = decrypt_token(connection.oauth_token_encrypted)
-      
-      notion = Client(auth=token)
-      
-      # Get all pages
-      results = notion.search(filter={"property": "object", "value": "page"})
-      
-      for page in results.get('results', []):
-          # Get page content
-          blocks = notion.blocks.children.list(page['id'])
-          
-          # Extract text content
-          text_content = extract_notion_text(blocks)
-          
-          # Create source_item
-          item_id = db.insert(source_items, {
-              'user_id': connection.user_id,
-              'connection_id': connection_id,
-              'provider': 'notion',
-              'external_id': page['id'],
-              'item_type': 'note',
-              'captured_at': page['created_time'],
-              'metadata': {
-                  'title': page['properties']['title']['title'][0]['text']['content'],
-                  'url': page['url']
-              },
-              'processing_status': 'pending'
-          })
-          
-          # Store content
-          db.insert(processed_content, {
-              'source_item_id': item_id,
-              'content_type': 'note',
-              'content_text': text_content
-          })
-          
-          # Queue for embedding
-          celery.send_task('generate_embedding', args=[item_id])
-  ```
+**Monitoring & Instrumentation**
+- [ ] Enable Prometheus stack in `orchestration/docker-compose.dev.yml` (celery-exporter, Prometheus, Grafana)
+- [ ] Update `orchestration/prometheus.yml` to scrape API `/metrics` (container or `host.docker.internal`)
+- [ ] Add Grafana datasource provisioning + starter dashboards (ingest throughput, task latency, chat latency, model spend)
+- [ ] Optional: run Flower for Celery task debugging
 
 **Error Handling & Loading States**
-- [ ] Add error boundaries in React:
-  ```typescript
-  class ErrorBoundary extends React.Component {
-    state = { hasError: false };
-    
-    static getDerivedStateFromError(error) {
-      return { hasError: true };
-    }
-    
-    render() {
-      if (this.state.hasError) {
-        return <ErrorFallback />;
-      }
-      return this.props.children;
-    }
-  }
-  ```
-- [ ] Add loading skeletons for all data fetching
-- [ ] Implement toast notifications for errors:
-  ```typescript
-  import { toast } from 'sonner';
-  
-  const handleError = (error) => {
-    toast.error(error.message || 'Something went wrong');
-  };
-  ```
-- [ ] Add retry logic for failed tasks:
-  ```python
-  @celery.task(bind=True, max_retries=3)
-  def process_item(self, item_id):
-      try:
-          # Processing logic
-          pass
-      except Exception as exc:
-          raise self.retry(exc=exc, countdown=60 * (2 ** self.request.retries))
-  ```
+- [ ] Add a global Error Boundary + fallback UI
+- [ ] Add toast notifications (e.g. Sonner) for API failures
+- [ ] Add consistent skeletons/spinners for Timeline/Dashboard/Chat fetches
 
-**UI Polish**
-- [ ] Add animations with Framer Motion
-- [ ] Implement dark mode toggle
-- [ ] Create empty states for all pages
-- [ ] Add keyboard shortcuts for chat (Cmd+K to focus)
-- [ ] Optimize image loading with lazy loading
-- [ ] Add tooltips and help text
+**UI/UX Polish**
+- [ ] Empty states + helper copy across tabs
+- [ ] Tooltips and small help affordances
+- [ ] Keyboard shortcuts for chat (Cmd+K focus, Cmd+Enter send)
+- [ ] Optional: subtle motion and dark mode toggle
 
-**Performance Optimization**
-- [ ] Implement pagination for timeline and item lists
-- [ ] Add database indexes:
-  ```sql
-  CREATE INDEX idx_source_items_user_captured ON source_items(user_id, captured_at DESC);
-  CREATE INDEX idx_events_user_date ON events(user_id, start_time DESC);
-  CREATE INDEX idx_memory_nodes_user_type ON memory_nodes(user_id, node_type);
-  ```
-- [ ] Enable caching for dashboard stats (Valkey/Redis)
-- [ ] Optimize Qdrant queries with filters
-- [ ] Add CDN for static assets
+**Performance**
+- [ ] Consider infinite scroll for timeline (replace manual "Load more")
+- [ ] Add caching for dashboard stats (Valkey)
+- [ ] Review indexes for timeline queries and add any missing ones
+- [ ] Verify Qdrant filters for timeline/search use
 
-**Instrumentation & QA**
-- [ ] Wire Prometheus/Grafana dashboards for ingestion throughput, processing SLA, chat latency, and model spend
-- [ ] Schedule nightly synthetic end-to-end test (seed user) covering upload → processing → retrieval → chat
-- [ ] Automate weekly metric export to Metabase for success metric review
-- [ ] Run load test (Locust/k6) to validate chat p95 < 3s at target concurrency
-- [ ] Validate security + privacy requirements (encryption, token rotation, data deletion) and document checklist
+**QA / Testing**
+- [ ] Expand Playwright flows (timeline detail, episode edits, item delete)
+- [ ] Add synthetic end-to-end job (upload -> processing -> retrieval -> chat)
+- [ ] Run load test (k6/Locust) for chat latency budgets
 
 ### Deliverables
-- ✅ Timeline view shows user's activity by day with high-performance pagination
-- ✅ Dashboard surfaces ingestion, storage, and activity metrics with caching
-- ✅ Notion integration syncs pages incrementally into memory system
-- ✅ Monitoring dashboards + synthetic tests cover ingest → chat pipeline
-- ✅ UI is polished, accessible, and resilient with loading/error states
+- [x] Timeline and Dashboard features shipped
+- [ ] Monitoring dashboards and synthetic tests cover ingest -> chat pipeline
+- [ ] UI is polished, accessible, and resilient with loading/error states
+- [ ] Performance and caching verified for timeline + dashboard
 
 ---
 

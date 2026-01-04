@@ -273,6 +273,8 @@ export interface GooglePhotosPickerItem {
 
 export interface GooglePhotosPickerItemsResponse {
   items: GooglePhotosPickerItem[];
+  status?: 'ready' | 'pending';
+  message?: string | null;
 }
 
 export interface GooglePhotosSyncRequest {

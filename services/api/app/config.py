@@ -66,6 +66,7 @@ class Settings(BaseSettings):
     bucket_thumbnails: str = "thumbnails"
 
     presigned_url_ttl_seconds: int = 15 * 60
+    dashboard_cache_ttl_seconds: int = Field(default=60, ge=0)
     cors_allow_origins: list[str] = Field(
         default_factory=lambda: ["http://localhost:3000", "http://127.0.0.1:3000"]
     )
@@ -154,6 +155,7 @@ class Settings(BaseSettings):
     video_preview_max_width: int = Field(default=640, ge=64)
     video_preview_fps: int = Field(default=12, ge=1)
     video_preview_bitrate_kbps: int = Field(default=600, ge=50)
+    ingest_batch_limit: int = Field(default=200, ge=1)
 
     # Episode merge + semantic merge settings
     semantic_merge_enabled: bool = True

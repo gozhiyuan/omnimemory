@@ -470,8 +470,25 @@ async def _get_or_create_session(
     return record
 
 
-async def _load_daily_summaries(session: AsyncSession, user_id: UUID, days: int = 7) -> list[DailySummary]:
-    since = date_today = datetime.now(timezone.utc).date()
+def _summary_display_date(
+    summary: DailySummary,
+    tz_offset_minutes: Optional[int],
+) -> date:
+    metadata = summary.summary_metadata or {}
+    if isinstance(metadata, dict) and metadata.get("tz_offset_minutes") is not None:
+        return summary.summary_date
+    offset_delta = timedelta(minutes=tz_offset_minutes or 0)
+    return (datetime.combine(summary.summary_date, time.min, tzinfo=timezone.utc) - offset_delta).date()
+
+
+async def _load_daily_summaries(
+    session: AsyncSession,
+    user_id: UUID,
+    days: int = 7,
+    tz_offset_minutes: Optional[int] = None,
+) -> list[DailySummary]:
+    offset_delta = timedelta(minutes=tz_offset_minutes or 0)
+    since = date_today = (datetime.now(timezone.utc) - offset_delta).date()
     start_date = date_today - timedelta(days=days - 1)
     stmt = (
         select(DailySummary)
@@ -817,11 +834,16 @@ async def _run_chat(
         if context:
             ordered_entries.append((context, hit))
 
-    daily_summaries = await _load_daily_summaries(session, user_id, days=7)
+    daily_summaries = await _load_daily_summaries(
+        session,
+        user_id,
+        days=7,
+        tz_offset_minutes=tz_offset_minutes,
+    )
     summary_block = ""
     if daily_summaries:
         summary_block = "\n".join(
-            f"{(datetime.combine(summary.summary_date, time.min, tzinfo=timezone.utc) - offset_delta).date().isoformat()}: {summary.summary}"
+            f"{_summary_display_date(summary, tz_offset_minutes).isoformat()}: {summary.summary}"
             for summary in daily_summaries
             if summary.summary
         )

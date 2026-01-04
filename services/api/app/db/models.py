@@ -208,6 +208,29 @@ class ProcessedContext(Base):
     )
 
 
+class TimelineDayHighlight(Base):
+    __tablename__ = "timeline_day_highlights"
+    __table_args__ = (
+        UniqueConstraint("user_id", "highlight_date", name="timeline_day_highlights_user_date_key"),
+        Index("timeline_day_highlights_user_date_idx", "user_id", "highlight_date"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"))
+    highlight_date: Mapped[date] = mapped_column(Date, nullable=False)
+    source_item_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("source_items.id", ondelete="CASCADE")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("NOW()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("NOW()"), nullable=False
+    )
+
+
 class MemoryNode(Base):
     __tablename__ = "memory_nodes"
     __table_args__ = (

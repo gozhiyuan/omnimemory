@@ -1,11 +1,12 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Calendar, ChevronLeft, ChevronRight, FileText, Image as ImageIcon, Mic, Play, Search, UploadCloud, Video, X } from 'lucide-react';
-import { apiDelete, apiGet, apiPatch, apiPost } from '../services/api';
+import { Calendar, ChevronLeft, ChevronRight, FileText, Image as ImageIcon, Mic, Play, Search, Star, UploadCloud, Video, X } from 'lucide-react';
+import { apiDelete, apiGet, apiPatch, apiPost, apiPostForm } from '../services/api';
 import {
   IngestResponse,
   SearchResponse,
   SearchResult,
   TimelineDay,
+  TimelineDailySummary,
   TimelineEpisode,
   TimelineEpisodeDetail,
   TimelineItem,
@@ -18,6 +19,10 @@ import {
 import { PageMotion } from './PageMotion';
 
 type ViewMode = TimelineViewMode;
+type EpisodeCard = TimelineEpisode & {
+  isSynthetic?: boolean;
+  syntheticItemId?: string;
+};
 
 const formatDate = (value?: string) => {
   if (!value) return 'Unknown date';
@@ -176,6 +181,15 @@ const getThumbnail = (item: TimelineItem) => {
   return null;
 };
 
+const getDayThumbnail = (day?: TimelineDay) => {
+  if (!day) return null;
+  if (day.highlight?.thumbnail_url) {
+    return day.highlight.thumbnail_url;
+  }
+  const previewItem = day.items.find((item) => getThumbnail(item));
+  return previewItem ? getThumbnail(previewItem) : null;
+};
+
 const VIEW_LABELS: Record<ViewMode, string> = {
   day: 'Day',
   week: 'Week',
@@ -232,6 +246,17 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [pendingSelection, setPendingSelection] = useState<{ itemId?: string; episodeContextId?: string } | null>(null);
+  const [highlightSavingId, setHighlightSavingId] = useState<string | null>(null);
+  const [highlightClearing, setHighlightClearing] = useState(false);
+  const [highlightError, setHighlightError] = useState<string | null>(null);
+  const [dailySummaryEditOpen, setDailySummaryEditOpen] = useState(false);
+  const [dailySummaryTitle, setDailySummaryTitle] = useState('');
+  const [dailySummaryText, setDailySummaryText] = useState('');
+  const [dailySummarySaving, setDailySummarySaving] = useState(false);
+  const [dailySummaryResetting, setDailySummaryResetting] = useState(false);
+  const [dailySummaryError, setDailySummaryError] = useState<string | null>(null);
+  const [dailySummaryVoiceLoading, setDailySummaryVoiceLoading] = useState(false);
+  const [dailySummaryVoiceError, setDailySummaryVoiceError] = useState<string | null>(null);
   const [dayItems, setDayItems] = useState<TimelineItem[]>([]);
   const [dayOffset, setDayOffset] = useState(0);
   const [dayTotal, setDayTotal] = useState(0);
@@ -346,6 +371,31 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     return dayLookup.get(dayKey)?.daily_summary ?? null;
   }, [dayLookup, dayKey, viewMode]);
 
+  const dayHighlight = useMemo(() => {
+    if (viewMode !== 'day') {
+      return null;
+    }
+    return dayLookup.get(dayKey)?.highlight ?? null;
+  }, [dayLookup, dayKey, viewMode]);
+
+  useEffect(() => {
+    if (!daySummary) {
+      setDailySummaryEditOpen(false);
+      setDailySummaryTitle('');
+      setDailySummaryText('');
+      setDailySummaryResetting(false);
+      setDailySummaryError(null);
+      setDailySummaryVoiceError(null);
+      return;
+    }
+    setDailySummaryEditOpen(false);
+    setDailySummaryTitle(daySummary.title || '');
+    setDailySummaryText(daySummary.summary || '');
+    setDailySummaryResetting(false);
+    setDailySummaryError(null);
+    setDailySummaryVoiceError(null);
+  }, [daySummary?.context_id]);
+
   const loadDayItems = async (reset = false) => {
     if (dayLoading && !reset) {
       return;
@@ -415,6 +465,12 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
   }, [viewMode, dayKey, reloadKey]);
 
   useEffect(() => {
+    setHighlightError(null);
+    setHighlightSavingId(null);
+    setHighlightClearing(false);
+  }, [dayKey, viewMode]);
+
+  useEffect(() => {
     setUploadOpen(false);
     setUploadFiles([]);
     setUploadError(null);
@@ -465,14 +521,39 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     return episodes;
   }, [dayEpisodes]);
 
+  const episodeCards = useMemo<EpisodeCard[]>(() => {
+    const base = sortedDayEpisodes.map((episode) => ({ ...episode, isSynthetic: false }));
+    const singles: EpisodeCard[] = sortedDayItems.map((item) => ({
+      episode_id: `single-${item.id}`,
+      title: buildLabel(item),
+      summary: item.caption || item.original_filename || 'Single memory',
+      context_type: 'single_memory',
+      start_time_utc: item.captured_at,
+      end_time_utc: item.captured_at,
+      item_count: 1,
+      source_item_ids: [item.id],
+      context_ids: [],
+      preview_url: getThumbnail(item) || undefined,
+      isSynthetic: true,
+      syntheticItemId: item.id,
+    }));
+    const combined = [...base, ...singles];
+    combined.sort((a, b) => {
+      const aTime = a.start_time_utc ? new Date(a.start_time_utc).getTime() : 0;
+      const bTime = b.start_time_utc ? new Date(b.start_time_utc).getTime() : 0;
+      return aTime - bTime;
+    });
+    return combined;
+  }, [sortedDayEpisodes, sortedDayItems]);
+
   const visibleDayEpisodes = useMemo(
-    () => sortedDayEpisodes.slice(0, episodeVisibleCount),
-    [sortedDayEpisodes, episodeVisibleCount]
+    () => episodeCards.slice(0, episodeVisibleCount),
+    [episodeCards, episodeVisibleCount]
   );
 
   const hasMoreEpisodes = useMemo(
-    () => sortedDayEpisodes.length > episodeVisibleCount,
-    [sortedDayEpisodes.length, episodeVisibleCount]
+    () => episodeCards.length > episodeVisibleCount,
+    [episodeCards.length, episodeVisibleCount]
   );
 
   const hasMoreAllItems = useMemo(
@@ -528,10 +609,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     return null;
   };
 
-  const memoryCount = useMemo(
-    () => sortedDayEpisodes.length + sortedDayItems.length,
-    [sortedDayEpisodes.length, sortedDayItems.length]
-  );
+  const memoryCount = useMemo(() => episodeCards.length, [episodeCards.length]);
 
   const hasItems = useMemo(() => days.some(day => day.items.length > 0), [days]);
   const rangeDates = useMemo(() => buildDateRange(range.start, range.end), [range]);
@@ -553,6 +631,33 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     return totals;
   }, [days]);
 
+  const monthPreviewMap = useMemo(() => {
+    const map = new Map<number, { thumbnail: string; dayKey: string; priority: number; count: number; timestamp: number }>();
+    days.forEach((day) => {
+      const parsed = new Date(`${day.date}T00:00:00`);
+      if (Number.isNaN(parsed.getTime())) {
+        return;
+      }
+      const thumbnail = getDayThumbnail(day);
+      if (!thumbnail) {
+        return;
+      }
+      const priority = day.highlight?.thumbnail_url ? 2 : 1;
+      const count = day.item_count;
+      const timestamp = parsed.getTime();
+      const existing = map.get(parsed.getMonth());
+      if (
+        !existing
+        || priority > existing.priority
+        || (priority === existing.priority && timestamp > existing.timestamp)
+        || (priority === existing.priority && timestamp === existing.timestamp && count > existing.count)
+      ) {
+        map.set(parsed.getMonth(), { thumbnail, dayKey: day.date, priority, count, timestamp });
+      }
+    });
+    return map;
+  }, [days]);
+
   const maxMonthTotal = useMemo(
     () => Math.max(1, ...monthTotals),
     [monthTotals]
@@ -572,7 +677,9 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
       prev
         .map((day) => {
           const remaining = day.items.filter((item) => item.id !== itemId);
-          return { ...day, items: remaining, item_count: remaining.length };
+          const nextHighlight =
+            day.highlight && day.highlight.item_id === itemId ? null : day.highlight ?? null;
+          return { ...day, items: remaining, item_count: remaining.length, highlight: nextHighlight };
         })
         .filter((day) => day.items.length > 0)
     );
@@ -583,6 +690,142 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     if (selectedItemId === itemId) {
       setSelectedItemId(null);
       setDetail(null);
+    }
+  };
+
+  const setDayHighlight = async (item: TimelineItem) => {
+    const thumbnail = getThumbnail(item);
+    if (!thumbnail) {
+      setHighlightError('This memory does not have a preview thumbnail yet.');
+      return;
+    }
+    setHighlightSavingId(item.id);
+    setHighlightError(null);
+    try {
+      await apiPost('/timeline/highlights', {
+        highlight_date: dayKey,
+        item_id: item.id,
+        tz_offset_minutes: anchorDate.getTimezoneOffset(),
+      });
+      setDays((prev) =>
+        prev.map((day) =>
+          day.date === dayKey
+            ? {
+                ...day,
+                highlight: {
+                  item_id: item.id,
+                  item_type: item.item_type,
+                  thumbnail_url: thumbnail,
+                },
+              }
+            : day
+        )
+      );
+    } catch (err) {
+      setHighlightError(err instanceof Error ? err.message : 'Failed to save highlight.');
+    } finally {
+      setHighlightSavingId(null);
+    }
+  };
+
+  const clearDayHighlight = async () => {
+    setHighlightClearing(true);
+    setHighlightError(null);
+    try {
+      await apiDelete(`/timeline/highlights/${dayKey}`);
+      setDays((prev) =>
+        prev.map((day) => (day.date === dayKey ? { ...day, highlight: null } : day))
+      );
+    } catch (err) {
+      setHighlightError(err instanceof Error ? err.message : 'Failed to clear highlight.');
+    } finally {
+      setHighlightClearing(false);
+    }
+  };
+
+  const applyDailySummary = (updated: TimelineDailySummary, previousDate?: string) => {
+    setDays((prev) =>
+      prev.map((day) => {
+        if (day.date === updated.summary_date) {
+          return { ...day, daily_summary: updated };
+        }
+        if (previousDate && day.date === previousDate) {
+          return { ...day, daily_summary: null };
+        }
+        return day;
+      })
+    );
+  };
+
+  const handleDailySummarySave = async () => {
+    if (!daySummary) {
+      return;
+    }
+    setDailySummarySaving(true);
+    setDailySummaryError(null);
+    try {
+      const payload = {
+        title: dailySummaryTitle,
+        summary: dailySummaryText,
+        tz_offset_minutes: anchorDate.getTimezoneOffset(),
+      };
+      const updated = await apiPatch<TimelineDailySummary>(
+        `/timeline/daily-summaries/${daySummary.context_id}`,
+        payload
+      );
+      applyDailySummary(updated, daySummary.summary_date);
+      setDailySummaryEditOpen(false);
+    } catch (err) {
+      setDailySummaryError(err instanceof Error ? err.message : 'Failed to update daily summary.');
+    } finally {
+      setDailySummarySaving(false);
+    }
+  };
+
+  const handleDailySummaryVoice = async (file: File) => {
+    if (!daySummary) {
+      return;
+    }
+    setDailySummaryVoiceLoading(true);
+    setDailySummaryVoiceError(null);
+    try {
+      const form = new FormData();
+      form.append('file', file);
+      form.append('tz_offset_minutes', anchorDate.getTimezoneOffset().toString());
+      const updated = await apiPostForm<TimelineDailySummary>(
+        `/timeline/daily-summaries/${daySummary.context_id}/voice`,
+        form
+      );
+      applyDailySummary(updated, daySummary.summary_date);
+      setDailySummaryTitle(updated.title || '');
+      setDailySummaryText(updated.summary || '');
+      setDailySummaryEditOpen(true);
+    } catch (err) {
+      setDailySummaryVoiceError(err instanceof Error ? err.message : 'Voice update failed.');
+    } finally {
+      setDailySummaryVoiceLoading(false);
+    }
+  };
+
+  const handleDailySummaryReset = async () => {
+    if (!daySummary) {
+      return;
+    }
+    setDailySummaryResetting(true);
+    setDailySummaryError(null);
+    try {
+      const updated = await apiPost<TimelineDailySummary>(
+        `/timeline/daily-summaries/${daySummary.context_id}/reset`,
+        { tz_offset_minutes: anchorDate.getTimezoneOffset() }
+      );
+      applyDailySummary(updated, daySummary.summary_date);
+      setDailySummaryTitle(updated.title || '');
+      setDailySummaryText(updated.summary || '');
+      setDailySummaryEditOpen(false);
+    } catch (err) {
+      setDailySummaryError(err instanceof Error ? err.message : 'Failed to reset daily summary.');
+    } finally {
+      setDailySummaryResetting(false);
     }
   };
 
@@ -916,7 +1159,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
       setEpisodeDetail(null);
       return;
     }
-    if (!sortedDayItems.length && !sortedDayEpisodes.length) {
+    if (!episodeCards.length) {
       setSelectedItemId(null);
       setDetail(null);
       setSelectedEpisodeId(null);
@@ -929,16 +1172,17 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     if (selectedItemId && dayItems.some((item) => item.id === selectedItemId)) {
       return;
     }
-    if (sortedDayEpisodes.length > 0) {
-      setSelectedEpisodeId(sortedDayEpisodes[0].episode_id);
-      setSelectedItemId(null);
+    const nextCard = episodeCards[0];
+    if (nextCard?.isSynthetic && nextCard.syntheticItemId) {
+      setSelectedItemId(nextCard.syntheticItemId);
+      setSelectedEpisodeId(null);
       return;
     }
-    if (sortedDayItems.length > 0) {
-      setSelectedItemId(sortedDayItems[0].id);
-      setSelectedEpisodeId(null);
+    if (nextCard) {
+      setSelectedEpisodeId(nextCard.episode_id);
+      setSelectedItemId(null);
     }
-  }, [sortedDayItems, sortedDayEpisodes, viewMode, selectedItemId, selectedEpisodeId]);
+  }, [episodeCards, sortedDayEpisodes, dayItems, viewMode, selectedItemId, selectedEpisodeId]);
 
   useEffect(() => {
     if (!selectedItemId) {
@@ -1205,8 +1449,9 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                     const key = toDateKey(date);
                     const day = dayLookup.get(key);
                     const count = day?.item_count ?? 0;
-                    const preview = day?.items?.[0];
-                    const thumbnail = preview ? getThumbnail(preview) : null;
+                    const thumbnail = getDayThumbnail(day);
+                    const previewType = day?.highlight?.item_type || day?.items?.[0]?.item_type;
+                    const hasHighlight = Boolean(day?.highlight);
                     return (
                       <button
                         key={key}
@@ -1215,42 +1460,48 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                           setAnchorDate(date);
                           setViewMode('day');
                         }}
-                        className={`rounded-2xl border p-4 text-left transition-all ${
+                        className={`group relative w-full overflow-hidden rounded-2xl border text-left transition-all ${
                           count > 0
                             ? 'border-slate-200 bg-white hover:border-slate-300 hover:shadow-md'
                             : 'border-white/60 bg-slate-50/70 text-slate-400'
                         }`}
                       >
-                        <div className="flex items-center justify-between">
-                          <span className="text-xs font-semibold uppercase tracking-wide">
-                            {formatDayLabel(date)}
-                          </span>
-                          <span className="text-xs font-semibold text-slate-500">
-                            {date.getDate()}
-                          </span>
-                        </div>
-                        <div className="mt-4 flex items-center justify-between">
-                          <span className="text-sm font-semibold">
-                            {count > 0 ? `${count} memories` : 'No memories'}
-                          </span>
+                        <div className="relative aspect-[4/3] w-full">
                           {thumbnail ? (
-                            <img
-                              src={thumbnail}
-                              alt="Preview"
-                              className="h-8 w-8 rounded-full object-cover"
-                              loading="lazy"
-                            />
+                            <>
+                              <img
+                                src={thumbnail}
+                                alt="Preview"
+                                className="absolute inset-0 h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+                                loading="lazy"
+                              />
+                              <div className="absolute inset-0 bg-gradient-to-t from-slate-900/70 via-slate-900/20 to-transparent" />
+                            </>
                           ) : (
-                            <div className="flex h-8 w-8 items-center justify-center rounded-full bg-slate-100 text-slate-400">
-                              {preview?.item_type === 'video' ? (
-                                <Video className="h-4 w-4" />
-                              ) : preview?.item_type === 'audio' ? (
-                                <Mic className="h-4 w-4" />
+                            <div className="absolute inset-0 flex items-center justify-center bg-slate-100 text-slate-400">
+                              {previewType === 'video' ? (
+                                <Video className="h-5 w-5" />
+                              ) : previewType === 'audio' ? (
+                                <Mic className="h-5 w-5" />
                               ) : (
-                                <ImageIcon className="h-4 w-4" />
+                                <ImageIcon className="h-5 w-5" />
                               )}
                             </div>
                           )}
+                          <div className={`relative z-10 flex h-full flex-col justify-between p-3 ${thumbnail ? 'text-white' : 'text-slate-500'}`}>
+                            <div className="flex items-center justify-between text-xs font-semibold uppercase tracking-wide">
+                              <span>{formatDayLabel(date)}</span>
+                              <span>{date.getDate()}</span>
+                            </div>
+                            <div className="flex items-center justify-between text-sm font-semibold">
+                              <span>{count > 0 ? `${count} memories` : 'No memories'}</span>
+                              {hasHighlight && (
+                                <span className="flex h-6 w-6 items-center justify-center rounded-full bg-white/80 text-amber-500">
+                                  <Star className="h-3 w-3 fill-amber-400" />
+                                </span>
+                              )}
+                            </div>
+                          </div>
                         </div>
                       </button>
                     );
@@ -1267,35 +1518,70 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                       </span>
                     ))}
                   </div>
-                  <div className="mt-2 grid grid-cols-7 gap-2">
-                    {monthGrid.map((date) => {
-                      const key = toDateKey(date);
-                      const day = dayLookup.get(key);
-                      const count = day?.item_count ?? 0;
-                      const isCurrent = isSameMonth(date, anchorDate);
-                      return (
-                        <button
-                          key={key}
-                          type="button"
-                          onClick={() => {
-                            setAnchorDate(date);
-                            setViewMode('day');
-                          }}
-                          className={`flex aspect-square flex-col items-center justify-center rounded-2xl border text-xs font-semibold transition-all ${
-                            isCurrent
-                              ? 'border-slate-200 bg-white hover:border-slate-300 hover:shadow-md'
-                              : 'border-white/60 bg-slate-50/70 text-slate-400'
-                          }`}
-                        >
+                <div className="mt-2 grid grid-cols-7 gap-2">
+                  {monthGrid.map((date) => {
+                    const key = toDateKey(date);
+                    const day = dayLookup.get(key);
+                    const count = day?.item_count ?? 0;
+                    const isCurrent = isSameMonth(date, anchorDate);
+                    const thumbnail = getDayThumbnail(day);
+                    const previewType = day?.highlight?.item_type || day?.items?.[0]?.item_type;
+                    const hasHighlight = Boolean(day?.highlight);
+                    return (
+                      <button
+                        key={key}
+                        type="button"
+                        onClick={() => {
+                          setAnchorDate(date);
+                          setViewMode('day');
+                        }}
+                        className={`group relative w-full aspect-square overflow-hidden rounded-2xl border text-xs font-semibold transition-all ${
+                          isCurrent
+                            ? 'border-slate-200 bg-white hover:border-slate-300 hover:shadow-md'
+                            : 'border-white/60 bg-slate-50/70 text-slate-400'
+                        }`}
+                      >
+                        {thumbnail ? (
+                          <>
+                            <img
+                              src={thumbnail}
+                              alt="Preview"
+                              className={`absolute inset-0 h-full w-full object-cover transition-transform duration-300 group-hover:scale-105 ${
+                                isCurrent ? '' : 'opacity-60'
+                              }`}
+                              loading="lazy"
+                            />
+                            <div className="absolute inset-0 bg-gradient-to-t from-slate-900/60 via-slate-900/10 to-transparent" />
+                          </>
+                        ) : (
+                          <div className="absolute inset-0 flex items-center justify-center bg-slate-100 text-slate-400">
+                            {previewType === 'video' ? (
+                              <Video className="h-4 w-4" />
+                            ) : previewType === 'audio' ? (
+                              <Mic className="h-4 w-4" />
+                            ) : (
+                              <ImageIcon className="h-4 w-4" />
+                            )}
+                          </div>
+                        )}
+                        <div className={`relative z-10 flex h-full flex-col items-center justify-between p-2 ${thumbnail ? 'text-white' : 'text-slate-500'}`}>
                           <span className="text-sm">{date.getDate()}</span>
                           {count > 0 && (
-                            <span className="text-[10px] text-slate-500">{count}</span>
+                            <span className={`text-[10px] ${thumbnail ? 'text-white/80' : 'text-slate-500'}`}>
+                              {count}
+                            </span>
                           )}
-                        </button>
-                      );
-                    })}
-                  </div>
+                        </div>
+                        {hasHighlight && (
+                          <span className="absolute top-1.5 right-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-white/80 text-amber-500">
+                            <Star className="h-3 w-3 fill-amber-400" />
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
                 </div>
+              </div>
               )}
 
               {viewMode === 'year' && (
@@ -1303,6 +1589,8 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                   {Array.from({ length: 12 }, (_, index) => {
                     const total = monthTotals[index];
                     const percent = Math.round((total / maxMonthTotal) * 100);
+                    const preview = monthPreviewMap.get(index);
+                    const monthLabel = formatMonthLabel(new Date(anchorDate.getFullYear(), index, 1));
                     return (
                       <button
                         key={index}
@@ -1311,26 +1599,46 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                           setAnchorDate(new Date(anchorDate.getFullYear(), index, 1));
                           setViewMode('month');
                         }}
-                        className={`rounded-2xl border p-4 text-left transition-all ${
+                        className={`group relative w-full min-h-[140px] overflow-hidden rounded-3xl border p-4 text-left transition-all ${
                           total > 0
                             ? 'border-slate-200 bg-white hover:border-slate-300 hover:shadow-md'
                             : 'border-white/60 bg-slate-50/70 text-slate-400'
                         }`}
                       >
-                        <div className="flex items-center justify-between">
-                          <span className="text-sm font-semibold text-slate-900">
-                            {formatMonthLabel(new Date(anchorDate.getFullYear(), index, 1))}
-                          </span>
-                          <span className="text-xs font-semibold text-slate-500">
-                            {total}
-                          </span>
+                        {preview?.thumbnail && (
+                          <>
+                            <img
+                              src={preview.thumbnail}
+                              alt={`${monthLabel} preview`}
+                              className="absolute inset-0 h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+                              loading="lazy"
+                            />
+                            <div className="absolute inset-0 bg-gradient-to-t from-slate-900/75 via-slate-900/25 to-transparent" />
+                          </>
+                        )}
+                        <div className={`relative z-10 flex h-full flex-col justify-between ${preview?.thumbnail ? 'text-white' : 'text-slate-700'}`}>
+                          <div className="flex items-center justify-between">
+                            <span className="text-sm font-semibold">
+                              {monthLabel}
+                            </span>
+                            <span className={`text-xs font-semibold ${preview?.thumbnail ? 'text-white/80' : 'text-slate-500'}`}>
+                              {total} memories
+                            </span>
+                          </div>
+                          <div className="mt-6">
+                            <div className={`h-2 w-full rounded-full ${preview?.thumbnail ? 'bg-white/20' : 'bg-slate-100'}`}>
+                              <div
+                                className={`h-full rounded-full ${preview?.thumbnail ? 'bg-white' : 'bg-slate-900'}`}
+                                style={{ width: `${percent}%` }}
+                              />
+                            </div>
+                          </div>
                         </div>
-                        <div className="mt-4 h-2 w-full rounded-full bg-slate-100">
-                          <div
-                            className="h-full rounded-full bg-slate-900"
-                            style={{ width: `${percent}%` }}
-                          />
-                        </div>
+                        {preview?.priority === 2 && (
+                          <span className="absolute top-3 right-3 flex h-6 w-6 items-center justify-center rounded-full bg-white/80 text-amber-500">
+                            <Star className="h-3.5 w-3.5 fill-amber-400" />
+                          </span>
+                        )}
                       </button>
                     );
                   })}
@@ -1609,20 +1917,75 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                   </div>
                 )}
 
-                {sortedDayEpisodes.length > 0 && (
+                <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-sm font-semibold text-slate-900">Day highlight</p>
+                      <p className="text-xs text-slate-500">
+                        Pick one memory to represent this day in week/month/year views.
+                      </p>
+                    </div>
+                    {dayHighlight && (
+                      <button
+                        type="button"
+                        onClick={clearDayHighlight}
+                        disabled={highlightClearing}
+                        className="text-[11px] font-semibold text-slate-500 hover:text-slate-700 disabled:opacity-60"
+                      >
+                        {highlightClearing ? 'Clearing...' : 'Clear'}
+                      </button>
+                    )}
+                  </div>
+                  <div className="mt-3 flex items-center gap-3 rounded-xl border border-dashed border-slate-200 bg-slate-50 px-3 py-2">
+                    <div className="relative h-12 w-12 overflow-hidden rounded-lg bg-white">
+                      {dayHighlight?.thumbnail_url ? (
+                        <img
+                          src={dayHighlight.thumbnail_url}
+                          alt="Day highlight"
+                          className="h-full w-full object-cover"
+                          loading="lazy"
+                        />
+                      ) : (
+                        <div className="flex h-full w-full items-center justify-center text-slate-400">
+                          <ImageIcon className="h-4 w-4" />
+                        </div>
+                      )}
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <p className="text-xs font-semibold text-slate-700">
+                        {dayHighlight ? 'Highlighted memory selected' : 'No highlight selected'}
+                      </p>
+                      <p className="text-[11px] text-slate-500">
+                        {dayHighlight ? 'Use the star next to a memory to switch.' : 'Use the star next to a memory to set one.'}
+                      </p>
+                    </div>
+                  </div>
+                  {highlightError && <div className="mt-2 text-xs text-red-600">{highlightError}</div>}
+                </div>
+
+                {episodeCards.length > 0 && (
                   <div className="mt-4 space-y-3">
                     <div className="flex items-center justify-between text-xs text-slate-500">
-                      <span className="font-semibold text-slate-700">Merged episodes</span>
-                      <span>{sortedDayEpisodes.length}</span>
+                      <span className="font-semibold text-slate-700">Episodes</span>
+                      <span>{episodeCards.length}</span>
                     </div>
                     {visibleDayEpisodes.map((episode) => {
-                      const isActive = episode.episode_id === selectedEpisodeId;
+                      const isSynthetic = Boolean(episode.isSynthetic);
+                      const isActive = isSynthetic
+                        ? selectedItemId === episode.syntheticItemId
+                        : episode.episode_id === selectedEpisodeId;
                       const preview = getEpisodePreview(episode);
+                      const label = isSynthetic ? 'Memory' : 'Episode';
                       return (
                         <button
                           key={episode.episode_id}
                           type="button"
                           onClick={() => {
+                            if (isSynthetic && episode.syntheticItemId) {
+                              setSelectedEpisodeId(null);
+                              setSelectedItemId(episode.syntheticItemId);
+                              return;
+                            }
                             setSelectedEpisodeId(episode.episode_id);
                             setSelectedItemId(null);
                           }}
@@ -1650,7 +2013,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                             <div className="min-w-0 flex-1">
                               <div className="flex items-center justify-between text-[10px] uppercase tracking-wide">
                                 <span className={isActive ? 'text-white/70' : 'text-slate-400'}>
-                                  Episode
+                                  {label}
                                 </span>
                                 <span className={isActive ? 'text-white/70' : 'text-slate-400'}>
                                   {episode.item_count} items
@@ -1662,9 +2025,11 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                               <p className={`mt-1 text-xs ${isActive ? 'text-white/70' : 'text-slate-500'}`}>
                                 {formatTimeRange(episode.start_time_utc, episode.end_time_utc)}
                               </p>
-                              <p className={`mt-1 line-clamp-2 text-xs ${isActive ? 'text-white/70' : 'text-slate-500'}`}>
-                                {episode.summary}
-                              </p>
+                              {episode.summary && (
+                                <p className={`mt-1 line-clamp-2 text-xs ${isActive ? 'text-white/70' : 'text-slate-500'}`}>
+                                  {episode.summary}
+                                </p>
+                              )}
                             </div>
                           </div>
                         </button>
@@ -1686,98 +2051,15 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                   <div className="mt-3 text-xs text-red-600">{dayError}</div>
                 )}
 
-                {dayLoading && dayItems.length === 0 && sortedDayEpisodes.length === 0 ? (
+                {dayLoading && dayItems.length === 0 && episodeCards.length === 0 ? (
                   <div className="py-8 text-center text-sm text-slate-500">
                     Loading memories...
                   </div>
-                ) : sortedDayItems.length === 0 && sortedDayEpisodes.length === 0 ? (
+                ) : episodeCards.length === 0 ? (
                   <div className="py-8 text-center text-sm text-slate-500">
                     No memories for this day.
                   </div>
-                ) : sortedDayItems.length === 0 ? (
-                  <div className="py-4 text-center text-xs text-slate-500">
-                    No individual memories yet.
-                  </div>
-                ) : (
-                  <div className="mt-4 space-y-4">
-                    {sortedDayItems.map((item, index) => {
-                      const isActive = item.id === selectedItemId;
-                      const thumbnail = getThumbnail(item);
-                      const showConnector = index < sortedDayItems.length - 1;
-                      return (
-                        <button
-                          key={item.id}
-                          type="button"
-                          onClick={() => {
-                            setSelectedItemId(item.id);
-                            setSelectedEpisodeId(null);
-                          }}
-                          className="w-full text-left"
-                        >
-                          <div className="flex gap-3">
-                            <div className="flex flex-col items-center pt-1">
-                              <span className={`text-[10px] font-semibold ${isActive ? 'text-slate-900' : 'text-slate-400'}`}>
-                                {formatTime(item.captured_at)}
-                              </span>
-                              <span className={`mt-1 h-2.5 w-2.5 rounded-full ${isActive ? 'bg-slate-900' : 'bg-slate-300'}`} />
-                              {showConnector && <span className="mt-1 h-10 w-px bg-slate-200" />}
-                            </div>
-                            <div
-                              className={`flex flex-1 items-center gap-3 rounded-2xl border p-3 transition-all ${
-                                isActive
-                                  ? 'border-slate-900 bg-slate-900 text-white shadow-lg'
-                                  : 'border-white/60 bg-white/90 hover:border-slate-200 hover:shadow'
-                              }`}
-                            >
-                              <div className="relative h-14 w-14 flex-shrink-0 overflow-hidden rounded-xl bg-slate-100">
-                                {thumbnail ? (
-                                  <img
-                                    src={thumbnail}
-                                    alt={buildLabel(item)}
-                                    className="h-full w-full object-cover"
-                                    loading="lazy"
-                                  />
-                                ) : item.item_type === 'video' ? (
-                                  <div className="flex h-full w-full items-center justify-center text-slate-400">
-                                    <Video className="h-5 w-5" />
-                                  </div>
-                                ) : item.item_type === 'audio' ? (
-                                  <div className="flex h-full w-full items-center justify-center text-slate-400">
-                                    <Mic className="h-5 w-5" />
-                                  </div>
-                                ) : (
-                                  <div className="flex h-full w-full items-center justify-center text-slate-400">
-                                    <ImageIcon className="h-5 w-5" />
-                                  </div>
-                                )}
-                                {item.item_type === 'video' && (
-                                  <span className="absolute inset-0 flex items-center justify-center">
-                                    <span className="flex h-6 w-6 items-center justify-center rounded-full bg-black/60 text-white">
-                                      <Play className="h-3 w-3" />
-                                    </span>
-                                  </span>
-                                )}
-                              </div>
-                              <div className="min-w-0 flex-1">
-                                <div className="flex items-center justify-between text-[10px] uppercase tracking-wide">
-                                  <span className={`${isActive ? 'text-white/80' : 'text-slate-400'}`}>
-                                    {item.item_type}
-                                  </span>
-                                  <span className={`${isActive ? 'text-white/70' : 'text-slate-400'}`}>
-                                    {item.processed ? 'Processed' : 'Processing'}
-                                  </span>
-                                </div>
-                                <p className={`mt-1 line-clamp-2 text-sm font-semibold ${isActive ? 'text-white' : 'text-slate-900'}`}>
-                                  {buildLabel(item)}
-                                </p>
-                              </div>
-                            </div>
-                          </div>
-                        </button>
-                      );
-                    })}
-                  </div>
-                )}
+                ) : null}
                 {hasMoreDayItems && (
                   <button
                     type="button"
@@ -1793,23 +2075,110 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
               <div className="rounded-2xl border border-white/70 bg-white/80 p-6 shadow-sm backdrop-blur">
                 {viewMode === 'day' && daySummary && (
                   <div className="mb-6 rounded-2xl border border-slate-100 bg-white p-4">
-                    <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
-                      <FileText className="h-3 w-3" />
-                      Daily summary
-                    </div>
-                    <p className="mt-2 text-sm font-semibold text-slate-900">{daySummary.title}</p>
-                    <p className="mt-2 text-sm text-slate-600">{daySummary.summary}</p>
-                    {daySummary.keywords.length > 0 && (
-                      <div className="mt-3 flex flex-wrap gap-1">
-                        {daySummary.keywords.map((keyword) => (
-                          <span
-                            key={keyword}
-                            className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] text-slate-500"
-                          >
-                            {keyword}
-                          </span>
-                        ))}
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                        <FileText className="h-3 w-3" />
+                        Daily summary
                       </div>
+                      <button
+                        type="button"
+                        onClick={() => setDailySummaryEditOpen((open) => !open)}
+                        className="text-[11px] font-semibold text-slate-500 hover:text-slate-700"
+                      >
+                        {dailySummaryEditOpen ? 'Close editor' : 'Edit summary'}
+                      </button>
+                    </div>
+
+                    {dailySummaryEditOpen ? (
+                      <div className="mt-3 space-y-3">
+                        <label className="text-xs text-slate-500">
+                          Title
+                          <input
+                            value={dailySummaryTitle}
+                            onChange={(event) => setDailySummaryTitle(event.target.value)}
+                            className="mt-1 h-10 w-full rounded-lg border border-slate-200 px-3 text-sm text-slate-700"
+                          />
+                        </label>
+                        <label className="text-xs text-slate-500">
+                          Summary
+                          <textarea
+                            value={dailySummaryText}
+                            onChange={(event) => setDailySummaryText(event.target.value)}
+                            rows={4}
+                            className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700"
+                          />
+                        </label>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={handleDailySummarySave}
+                            disabled={dailySummarySaving || dailySummaryResetting}
+                            className="rounded-full bg-slate-900 px-4 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-60"
+                          >
+                            {dailySummarySaving ? 'Saving...' : 'Save summary'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setDailySummaryEditOpen(false);
+                              setDailySummaryTitle(daySummary.title || '');
+                              setDailySummaryText(daySummary.summary || '');
+                            }}
+                            className="rounded-full border border-slate-200 px-4 py-1.5 text-xs text-slate-600 hover:bg-slate-50"
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            type="button"
+                            onClick={handleDailySummaryReset}
+                            disabled={dailySummaryResetting || dailySummarySaving}
+                            className="rounded-full border border-slate-200 px-4 py-1.5 text-xs text-slate-600 hover:bg-slate-50 disabled:opacity-60"
+                          >
+                            {dailySummaryResetting ? 'Resetting...' : 'Reset to auto summary'}
+                          </button>
+                          <label className="ml-auto inline-flex cursor-pointer items-center gap-2 rounded-full border border-slate-200 px-3 py-1.5 text-[11px] text-slate-600 hover:bg-slate-50">
+                            <input
+                              type="file"
+                              accept="audio/*"
+                              className="hidden"
+                              onChange={(event) => {
+                                const file = event.target.files?.[0];
+                                if (file) {
+                                  void handleDailySummaryVoice(file);
+                                }
+                                event.currentTarget.value = '';
+                              }}
+                            />
+                            {dailySummaryVoiceLoading ? 'Transcribing...' : 'Upload voice note'}
+                          </label>
+                        </div>
+                        <p className="text-[11px] text-slate-400">
+                          Voice updates replace the summary with a transcript.
+                        </p>
+                        {dailySummaryError && (
+                          <div className="text-xs text-red-600">{dailySummaryError}</div>
+                        )}
+                        {dailySummaryVoiceError && (
+                          <div className="text-xs text-red-600">{dailySummaryVoiceError}</div>
+                        )}
+                      </div>
+                    ) : (
+                      <>
+                        <p className="mt-2 text-sm font-semibold text-slate-900">{daySummary.title}</p>
+                        <p className="mt-2 text-sm text-slate-600">{daySummary.summary}</p>
+                        {daySummary.keywords.length > 0 && (
+                          <div className="mt-3 flex flex-wrap gap-1">
+                            {daySummary.keywords.map((keyword) => (
+                              <span
+                                key={keyword}
+                                className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] text-slate-500"
+                              >
+                                {keyword}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </>
                     )}
                   </div>
                 )}
@@ -1928,12 +2297,20 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                           <h4 className="text-sm font-semibold text-slate-900">Episode items</h4>
                           <div className="mt-3 grid gap-3 sm:grid-cols-2">
                             {episodeDetail.items.map((item) => (
-                              <button
+                              <div
                                 key={item.id}
-                                type="button"
+                                role="button"
+                                tabIndex={0}
                                 onClick={() => {
                                   setSelectedEpisodeId(null);
                                   setSelectedItemId(item.id);
+                                }}
+                                onKeyDown={(event) => {
+                                  if (event.key === 'Enter' || event.key === ' ') {
+                                    event.preventDefault();
+                                    setSelectedEpisodeId(null);
+                                    setSelectedItemId(item.id);
+                                  }
                                 }}
                                 className="flex items-center gap-3 rounded-2xl border border-slate-100 bg-white p-3 text-left hover:shadow"
                               >
@@ -1972,7 +2349,38 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                                     {buildLabel(item)}
                                   </p>
                                 </div>
-                              </button>
+                                {(() => {
+                                  const thumbnail = getThumbnail(item);
+                                  const canHighlight = Boolean(thumbnail);
+                                  const isHighlighted = dayHighlight?.item_id === item.id;
+                                  const isHighlighting = highlightSavingId === item.id;
+                                  return (
+                                    <button
+                                      type="button"
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        if (!canHighlight || isHighlighting) {
+                                          return;
+                                        }
+                                        void setDayHighlight(item);
+                                      }}
+                                      disabled={!canHighlight || isHighlighting}
+                                      className={`ml-auto flex h-8 w-8 items-center justify-center rounded-full border transition ${
+                                        isHighlighted
+                                          ? 'border-amber-400 bg-amber-400 text-white'
+                                          : 'border-slate-200 text-slate-500 hover:border-slate-300'
+                                      } ${!canHighlight ? 'opacity-40' : ''}`}
+                                      title={canHighlight ? (isHighlighted ? 'Highlighted' : 'Set highlight') : 'No thumbnail available'}
+                                    >
+                                      {isHighlighting ? (
+                                        <span className="text-[10px] font-semibold">...</span>
+                                      ) : (
+                                        <Star className={`h-4 w-4 ${isHighlighted ? 'fill-white' : ''}`} />
+                                      )}
+                                    </button>
+                                  );
+                                })()}
+                              </div>
                             ))}
                           </div>
                         </div>
@@ -2005,14 +2413,47 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                               </span>
                             </div>
                           </div>
-                          <button
-                            type="button"
-                            onClick={() => handleDelete(detail.id)}
-                            className="rounded-full border border-slate-200 px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-50"
-                            disabled={deletingId === detail.id}
-                          >
-                            {deletingId === detail.id ? 'Deleting...' : 'Delete'}
-                          </button>
+                          <div className="flex items-center gap-2">
+                            {(() => {
+                              const thumbnail = getThumbnail(detail);
+                              const canHighlight = Boolean(thumbnail);
+                              const isHighlighted = dayHighlight?.item_id === detail.id;
+                              const isHighlighting = highlightSavingId === detail.id;
+                              return (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    if (!canHighlight || isHighlighting) {
+                                      return;
+                                    }
+                                    void setDayHighlight(detail);
+                                  }}
+                                  disabled={!canHighlight || isHighlighting}
+                                  className={`flex items-center gap-1 rounded-full border px-3 py-1.5 text-xs font-semibold transition ${
+                                    isHighlighted
+                                      ? 'border-amber-400 bg-amber-400 text-white'
+                                      : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                                  } ${!canHighlight ? 'opacity-40' : ''}`}
+                                  title={canHighlight ? (isHighlighted ? 'Highlighted' : 'Set highlight') : 'No thumbnail available'}
+                                >
+                                  {isHighlighting ? 'Saving...' : (
+                                    <>
+                                      <Star className={`h-3.5 w-3.5 ${isHighlighted ? 'fill-white' : ''}`} />
+                                      {isHighlighted ? 'Highlighted' : 'Set highlight'}
+                                    </>
+                                  )}
+                                </button>
+                              );
+                            })()}
+                            <button
+                              type="button"
+                              onClick={() => handleDelete(detail.id)}
+                              className="rounded-full border border-slate-200 px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-50"
+                              disabled={deletingId === detail.id}
+                            >
+                              {deletingId === detail.id ? 'Deleting...' : 'Delete'}
+                            </button>
+                          </div>
                         </div>
 
                         <div className="overflow-hidden rounded-2xl border border-slate-200 bg-slate-50">

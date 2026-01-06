@@ -33,6 +33,12 @@ class FakeSession:
     async def execute(self, _stmt):
         return FakeResult(self._existing_users)
 
+    async def get(self, _model, user_id):
+        for user in self._existing_users:
+            if getattr(user, "id", None) == user_id:
+                return user
+        return None
+
     def add(self, obj):
         self.added.append(obj)
 

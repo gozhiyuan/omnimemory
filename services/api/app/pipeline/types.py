@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, Optional, Protocol, Tuple
 
@@ -21,6 +21,7 @@ class PipelineConfig:
     settings: Settings
     payload: Dict[str, Any]
     now: datetime
+    user_settings: Dict[str, Any] = field(default_factory=dict)
 
 
 class ArtifactStore:

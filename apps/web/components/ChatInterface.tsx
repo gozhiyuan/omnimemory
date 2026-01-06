@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Send,
   Bot,
@@ -12,6 +12,9 @@ import {
 } from 'lucide-react';
 import { apiGet, apiPost, apiPostForm } from '../services/api';
 import { PageMotion } from './PageMotion';
+import { useSettings } from '../contexts/SettingsContext';
+import { useI18n } from '../i18n/useI18n';
+import { formatDateKey, getTimeZoneOffsetMinutes } from '../utils/time';
 import {
   ChatMessage,
   ChatResponse,
@@ -36,13 +39,7 @@ type AgentSpec = {
   disabledLabel?: string;
 };
 
-const buildLocalDate = () => {
-  const now = new Date();
-  const offset = now.getTimezoneOffset();
-  return new Date(now.getTime() - offset * 60 * 1000).toISOString().slice(0, 10);
-};
-
-const AGENTS: AgentSpec[] = [
+const AGENT_DEFINITIONS: AgentSpec[] = [
   {
     id: 'daily_cartoon',
     name: 'Cartoon Day Summary',
@@ -94,14 +91,35 @@ const dedupeSources = (sources: ChatSource[]) => {
 };
 
 export const ChatInterface: React.FC = () => {
-  const buildWelcomeMessage = (): ChatMessage => ({
-    id: 'welcome',
-    role: 'assistant',
-    content: "Hi there! I'm OmniMemory. I've analyzed your photos and logs. Ask me anything about your memories!",
-    timestamp: new Date(),
-  });
+  const { settings } = useSettings();
+  const { t, locale } = useI18n();
+  const timeZone = settings.preferences.timezone;
+  const buildWelcomeMessage = useCallback(
+    (): ChatMessage => ({
+      id: 'welcome',
+      role: 'assistant',
+      content: t(
+        "Hi there! I'm OmniMemory. I've analyzed your photos and logs. Ask me anything about your memories!"
+      ),
+      timestamp: new Date(),
+    }),
+    [t]
+  );
 
-  const [messages, setMessages] = useState<ChatMessage[]>([buildWelcomeMessage()]);
+  const agents = useMemo(
+    () =>
+      AGENT_DEFINITIONS.map((agent) => ({
+        ...agent,
+        name: t(agent.name),
+        description: t(agent.description),
+        defaultPrompt: t(agent.defaultPrompt),
+        outputLabel: t(agent.outputLabel),
+        disabledLabel: agent.disabledLabel ? t(agent.disabledLabel) : undefined,
+      })),
+    [t]
+  );
+
+  const [messages, setMessages] = useState<ChatMessage[]>(() => [buildWelcomeMessage()]);
   const [sessions, setSessions] = useState<ChatSessionSummary[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [input, setInput] = useState('');
@@ -112,7 +130,7 @@ export const ChatInterface: React.FC = () => {
   });
   const [selectedImage, setSelectedImage] = useState<File | null>(null);
   const [selectedImagePreview, setSelectedImagePreview] = useState<string | null>(null);
-  const [agentDate, setAgentDate] = useState(buildLocalDate);
+  const [agentDate, setAgentDate] = useState(() => formatDateKey(new Date(), timeZone));
   const [agentPromptOverrides, setAgentPromptOverrides] = useState<Record<string, string>>(() => {
     if (typeof window === 'undefined') return {};
     try {
@@ -135,6 +153,43 @@ export const ChatInterface: React.FC = () => {
   const objectUrlsRef = useRef<string[]>([]);
 
   const activeSession = sessions.find((session) => session.session_id === sessionId) || null;
+
+  const formatDateLabel = (value: string | Date | null | undefined) => {
+    if (!value) return t('Unknown date');
+    const parsed = typeof value === 'string' ? new Date(value) : value;
+    if (Number.isNaN(parsed.getTime())) {
+      return t('Unknown date');
+    }
+    return new Intl.DateTimeFormat(locale, {
+      timeZone,
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+    }).format(parsed);
+  };
+
+  const formatDateTimeLabel = (value: string | Date | null | undefined) => {
+    if (!value) return t('Unknown time');
+    const parsed = typeof value === 'string' ? new Date(value) : value;
+    if (Number.isNaN(parsed.getTime())) {
+      return t('Unknown time');
+    }
+    return new Intl.DateTimeFormat(locale, {
+      timeZone,
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    }).format(parsed);
+  };
+
+  const formatTimeLabel = (value: Date) =>
+    new Intl.DateTimeFormat(locale, {
+      timeZone,
+      hour: '2-digit',
+      minute: '2-digit',
+    }).format(value);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -286,7 +341,7 @@ export const ChatInterface: React.FC = () => {
   };
 
   const resolveAgentPrompt = (agentId: string) => {
-    const agent = AGENTS.find((item) => item.id === agentId);
+    const agent = agents.find((item) => item.id === agentId);
     if (!agent) {
       return '';
     }
@@ -324,7 +379,7 @@ export const ChatInterface: React.FC = () => {
     if (!editingAgentId) {
       return;
     }
-    const agent = AGENTS.find((item) => item.id === editingAgentId);
+    const agent = agents.find((item) => item.id === editingAgentId);
     setAgentPromptDraft(agent?.defaultPrompt || '');
   };
 
@@ -342,7 +397,7 @@ export const ChatInterface: React.FC = () => {
     const userMsg: ChatMessage = {
       id: Date.now().toString(),
       role: 'user',
-      content: messageText || (imageFile ? 'Shared a photo.' : ''),
+      content: messageText || (imageFile ? t('Shared a photo.') : ''),
       timestamp: new Date(),
       attachments: imagePreview
         ? [
@@ -367,14 +422,14 @@ export const ChatInterface: React.FC = () => {
         if (sessionId) {
           form.append('session_id', sessionId);
         }
-        form.append('tz_offset_minutes', new Date().getTimezoneOffset().toString());
+        form.append('tz_offset_minutes', getTimeZoneOffsetMinutes(new Date(), timeZone).toString());
         form.append('image', imageFile);
         response = await apiPostForm<ChatResponse>('/chat/image', form);
       } else {
         response = await apiPost<ChatResponse>('/chat', {
           message: messageText,
           session_id: sessionId || undefined,
-          tz_offset_minutes: new Date().getTimezoneOffset(),
+          tz_offset_minutes: getTimeZoneOffsetMinutes(new Date(), timeZone),
         });
       }
 
@@ -398,7 +453,7 @@ export const ChatInterface: React.FC = () => {
       const errorMsg: ChatMessage = {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
-        content: "I'm having trouble connecting right now. Please try again.",
+        content: t("I'm having trouble connecting right now. Please try again."),
         timestamp: new Date(),
       };
       setMessages((prev) => [...prev, errorMsg]);
@@ -444,7 +499,7 @@ export const ChatInterface: React.FC = () => {
   }, [handleSend]);
 
   const handleAgentRun = async (agentId: string) => {
-    const agent = AGENTS.find((item) => item.id === agentId);
+    const agent = agents.find((item) => item.id === agentId);
     if (!agent || agent.disabled || loading) {
       return;
     }
@@ -458,7 +513,7 @@ export const ChatInterface: React.FC = () => {
       const userMsg: ChatMessage = {
         id: Date.now().toString(),
         role: 'user',
-        content: `Run agent: ${agent.name} (${agentDate})`,
+        content: t('Run agent: {name} ({date})', { name: agent.name, date: agentDate }),
         timestamp: new Date(),
       };
       setMessages((prev) => [...prev, userMsg]);
@@ -468,7 +523,7 @@ export const ChatInterface: React.FC = () => {
           prompt: finalPrompt,
           date: agentDate,
           session_id: sessionId || undefined,
-          tz_offset_minutes: new Date().getTimezoneOffset(),
+          tz_offset_minutes: getTimeZoneOffsetMinutes(new Date(), timeZone),
         });
         if (!sessionId || sessionId !== response.session_id) {
           setSessionId(response.session_id);
@@ -488,7 +543,7 @@ export const ChatInterface: React.FC = () => {
         const errorMsg: ChatMessage = {
           id: (Date.now() + 1).toString(),
           role: 'assistant',
-          content: "I'm having trouble generating that image right now.",
+          content: t("I'm having trouble generating that image right now."),
           timestamp: new Date(),
         };
         setMessages((prev) => [...prev, errorMsg]);
@@ -502,7 +557,7 @@ export const ChatInterface: React.FC = () => {
       const userMsg: ChatMessage = {
         id: Date.now().toString(),
         role: 'user',
-        content: `Run agent: ${agent.name} (${agentDate})`,
+        content: t('Run agent: {name} ({date})', { name: agent.name, date: agentDate }),
         timestamp: new Date(),
       };
       setMessages((prev) => [...prev, userMsg]);
@@ -512,7 +567,7 @@ export const ChatInterface: React.FC = () => {
           prompt: finalPrompt,
           date: agentDate,
           session_id: sessionId || undefined,
-          tz_offset_minutes: new Date().getTimezoneOffset(),
+          tz_offset_minutes: getTimeZoneOffsetMinutes(new Date(), timeZone),
           include_image: true,
         });
         if (!sessionId || sessionId !== response.session_id) {
@@ -533,7 +588,7 @@ export const ChatInterface: React.FC = () => {
         const errorMsg: ChatMessage = {
           id: (Date.now() + 1).toString(),
           role: 'assistant',
-          content: "I'm having trouble generating that insight right now.",
+          content: t("I'm having trouble generating that insight right now."),
           timestamp: new Date(),
         };
         setMessages((prev) => [...prev, errorMsg]);
@@ -543,12 +598,12 @@ export const ChatInterface: React.FC = () => {
       return;
     }
 
-    const messageText = `[Agent: ${agent.name}]\n${finalPrompt}`;
+    const messageText = `${t('[Agent: {name}]', { name: agent.name })}\n${finalPrompt}`;
     await sendMessage({ messageText });
   };
 
   const editingAgent = editingAgentId
-    ? AGENTS.find((item) => item.id === editingAgentId) || null
+    ? agents.find((item) => item.id === editingAgentId) || null
     : null;
 
   const buildAttachmentName = (url: string, fallback: string) => {
@@ -569,8 +624,8 @@ export const ChatInterface: React.FC = () => {
       <aside className="w-72 bg-white border-r border-slate-200 flex flex-col">
         <div className="px-4 py-4 border-b border-slate-200 flex items-center justify-between">
           <div>
-            <p className="text-xs uppercase tracking-wider text-slate-400">Chat History</p>
-            <p className="text-sm font-semibold text-slate-800">Sessions</p>
+            <p className="text-xs uppercase tracking-wider text-slate-400">{t('Chat History')}</p>
+            <p className="text-sm font-semibold text-slate-800">{t('Sessions')}</p>
           </div>
           <button
             type="button"
@@ -578,12 +633,12 @@ export const ChatInterface: React.FC = () => {
             className="inline-flex items-center gap-1 text-xs text-primary-600 hover:text-primary-700"
           >
             <Plus size={14} />
-            New chat
+            {t('New chat')}
           </button>
         </div>
         <div className="flex-1 overflow-y-auto p-3 space-y-2">
           {sessions.length === 0 && (
-            <p className="text-xs text-slate-400">No chats yet.</p>
+            <p className="text-xs text-slate-400">{t('No chats yet.')}</p>
           )}
           {sessions.map((session) => {
             const isActive = session.session_id === sessionId;
@@ -599,10 +654,12 @@ export const ChatInterface: React.FC = () => {
                 }`}
               >
                 <p className="text-sm font-medium truncate">
-                  {session.title || 'Untitled chat'}
+                  {session.title || t('Untitled chat')}
                 </p>
                 <p className="text-[11px] text-slate-400 truncate">
-                  {new Date(session.last_message_at).toLocaleDateString()} · {session.message_count} messages
+                  {formatDateLabel(session.last_message_at)} · {t('{count} messages', {
+                    count: session.message_count,
+                  })}
                 </p>
               </button>
             );
@@ -616,19 +673,19 @@ export const ChatInterface: React.FC = () => {
           <div>
             <h2 className="text-lg font-bold text-slate-800 flex items-center">
               <Sparkles className="w-5 h-5 text-primary-500 mr-2" />
-              {activeSession?.title || 'Memory Assistant'}
+              {activeSession?.title || t('Memory Assistant')}
             </h2>
-            <p className="text-xs text-slate-500">Powered by Gemini 2.5</p>
+            <p className="text-xs text-slate-500">{t('Powered by Gemini 2.5')}</p>
           </div>
           <div className="text-xs text-slate-400">
-            Session ID: {sessionId ? sessionId.slice(0, 8) : 'new'}
+            {t('Session ID: {id}', { id: sessionId ? sessionId.slice(0, 8) : t('new') })}
           </div>
         </div>
 
         {/* Messages */}
         <div className="flex-1 overflow-y-auto p-4 space-y-6">
           {loadingHistory && (
-            <p className="text-center text-xs text-slate-400">Loading chat history...</p>
+            <p className="text-center text-xs text-slate-400">{t('Loading chat history...')}</p>
           )}
           {messages.map((msg) => {
             const uniqueSources = msg.sources ? dedupeSources(msg.sources) : [];
@@ -667,11 +724,11 @@ export const ChatInterface: React.FC = () => {
                         })
                       }
                       className="rounded-xl border border-slate-200 overflow-hidden"
-                      title="View image"
+                      title={t('View image')}
                     >
                       <img
                         src={attachment.url}
-                        alt="Uploaded"
+                        alt={t('Uploaded')}
                         className="w-48 h-32 object-cover cursor-zoom-in"
                         loading="lazy"
                       />
@@ -692,7 +749,9 @@ export const ChatInterface: React.FC = () => {
               {/* Sources (assistant only) */}
               {msg.role === 'assistant' && uniqueSources.length > 0 && (
                 <div className="mt-3 ml-1">
-                   <p className="text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">Relevant Memories</p>
+                   <p className="text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">
+                     {t('Relevant Memories')}
+                   </p>
                    <div className="flex space-x-3 overflow-x-auto pb-2 no-scrollbar max-w-full">
                      {uniqueSources.map((src) => (
                        <div
@@ -706,7 +765,7 @@ export const ChatInterface: React.FC = () => {
                            {src.thumbnail_url ? (
                              <img
                                src={src.thumbnail_url}
-                               alt="source"
+                               alt={t('Source')}
                                className="w-full h-full object-cover"
                                loading="lazy"
                              />
@@ -716,10 +775,10 @@ export const ChatInterface: React.FC = () => {
                          </div>
                          <div className="p-2 bg-slate-50">
                             <p className="text-[10px] text-slate-500 font-medium truncate">
-                              {src.timestamp ? new Date(src.timestamp).toLocaleString() : 'Unknown time'}
+                              {formatDateTimeLabel(src.timestamp)}
                             </p>
                             <p className="text-[10px] text-slate-800 truncate">
-                              {src.title || src.snippet || 'Memory'}
+                              {src.title || src.snippet || t('Memory')}
                             </p>
                          </div>
                        </div>
@@ -729,7 +788,7 @@ export const ChatInterface: React.FC = () => {
               )}
               
               <span className="text-[10px] text-slate-400 mt-1 mx-1">
-                {msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                {formatTimeLabel(msg.timestamp)}
               </span>
             </div>
           </div>
@@ -742,7 +801,7 @@ export const ChatInterface: React.FC = () => {
              </div>
              <div className="px-5 py-4 bg-white rounded-2xl rounded-tl-none shadow-sm border border-slate-100 flex items-center space-x-2">
                 <Loader2 className="w-4 h-4 text-primary-500 animate-spin" />
-                <span className="text-xs text-slate-500">Thinking...</span>
+                <span className="text-xs text-slate-500">{t('Thinking...')}</span>
              </div>
           </div>
         )}
@@ -763,18 +822,18 @@ export const ChatInterface: React.FC = () => {
                     })
                   }
                   className="rounded-md border border-slate-200 overflow-hidden"
-                  title="View image"
+                  title={t('View image')}
                 >
                   <img
                     src={selectedImagePreview}
-                    alt="Selected"
+                    alt={t('Selected')}
                     className="w-14 h-14 object-cover cursor-zoom-in"
                     loading="lazy"
                   />
                 </button>
                 <div className="text-xs text-slate-600">
-                  <p className="font-medium">Image attached</p>
-                  <p className="text-slate-400">Ask a question to find related memories.</p>
+                  <p className="font-medium">{t('Image attached')}</p>
+                  <p className="text-slate-400">{t('Ask a question to find related memories.')}</p>
                 </div>
               </div>
               <button
@@ -782,7 +841,7 @@ export const ChatInterface: React.FC = () => {
                 onClick={handleRemoveImage}
                 className="text-xs text-slate-500 hover:text-slate-700"
               >
-                Remove
+                {t('Remove')}
               </button>
             </div>
           )}
@@ -793,7 +852,7 @@ export const ChatInterface: React.FC = () => {
             <button
               type="button"
               className="p-3 text-slate-400 hover:text-primary-600 transition-colors"
-              title="Upload image for analysis"
+              title={t('Upload image for analysis')}
               onClick={() => fileInputRef.current?.click()}
             >
               <ImageIcon size={20} />
@@ -810,7 +869,7 @@ export const ChatInterface: React.FC = () => {
               ref={inputRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder="Ask 'When was my trip to Kyoto?'..."
+              placeholder={t("Ask 'When was my trip to Kyoto?'...")}
               className="flex-1 bg-transparent border-none focus:ring-0 text-slate-800 placeholder-slate-400 text-sm py-3.5"
               disabled={loading}
             />
@@ -827,18 +886,18 @@ export const ChatInterface: React.FC = () => {
             </button>
           </form>
           <p className="text-center text-[10px] text-slate-400 mt-2">
-            OmniMemory may display inaccurate info. Verify important details.
+            {t('OmniMemory may display inaccurate info. Verify important details.')}
           </p>
         </div>
       </div>
 
       <aside className="hidden xl:flex w-80 bg-white border-l border-slate-200 flex-col">
         <div className="px-4 py-4 border-b border-slate-200">
-          <p className="text-xs uppercase tracking-wider text-slate-400">Studio</p>
-          <p className="text-sm font-semibold text-slate-800">Downstream agents</p>
+          <p className="text-xs uppercase tracking-wider text-slate-400">{t('Studio')}</p>
+          <p className="text-sm font-semibold text-slate-800">{t('Downstream agents')}</p>
           <div className="mt-3">
             <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-              Target day
+              {t('Target day')}
             </label>
             <input
               type="date"
@@ -846,11 +905,11 @@ export const ChatInterface: React.FC = () => {
               onChange={(event) => setAgentDate(event.target.value)}
               className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700 focus:border-primary-400 focus:outline-none focus:ring-2 focus:ring-primary-100"
             />
-            <p className="mt-1 text-[10px] text-slate-400">Prompts support {`{date}`}.</p>
+            <p className="mt-1 text-[10px] text-slate-400">{t('Prompts support {date}.')}</p>
           </div>
         </div>
         <div className="flex-1 overflow-y-auto p-4 space-y-3">
-          {AGENTS.map((agent) => {
+          {agents.map((agent) => {
             const AgentIcon = agent.icon;
             const isCustomized = Boolean(agentPromptOverrides[agent.id]);
             return (
@@ -873,7 +932,7 @@ export const ChatInterface: React.FC = () => {
                       </span>
                       {isCustomized && (
                         <span className="rounded-full bg-primary-50 px-2 py-0.5 text-primary-600">
-                          Custom
+                          {t('Custom')}
                         </span>
                       )}
                       {agent.disabled && agent.disabledLabel && (
@@ -891,7 +950,7 @@ export const ChatInterface: React.FC = () => {
                     disabled={loading || agent.disabled}
                     className="flex-1 rounded-lg bg-primary-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-primary-700 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400"
                   >
-                    {agent.disabled ? 'Disabled' : 'Run'}
+                    {agent.disabled ? t('Disabled') : t('Run')}
                   </button>
                   <button
                     type="button"
@@ -899,7 +958,7 @@ export const ChatInterface: React.FC = () => {
                     className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 hover:border-slate-300 hover:text-slate-800"
                     disabled={agent.disabled}
                   >
-                    Edit prompt
+                    {t('Edit prompt')}
                   </button>
                 </div>
               </div>
@@ -907,8 +966,9 @@ export const ChatInterface: React.FC = () => {
           })}
         </div>
         <div className="px-4 py-3 border-t border-slate-200 text-[11px] text-slate-400">
-          Agents run through the same memory context as chat. Wire in image/video APIs to
-          generate media outputs.
+          {t(
+            'Agents run through the same memory context as chat. Wire in image/video APIs to generate media outputs.'
+          )}
         </div>
       </aside>
 
@@ -917,7 +977,9 @@ export const ChatInterface: React.FC = () => {
           <div className="w-full max-w-xl rounded-2xl border border-slate-200 bg-white shadow-xl">
             <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
               <div>
-                <p className="text-xs uppercase tracking-wider text-slate-400">Edit agent prompt</p>
+                <p className="text-xs uppercase tracking-wider text-slate-400">
+                  {t('Edit agent prompt')}
+                </p>
                 <p className="text-sm font-semibold text-slate-800">{editingAgent.name}</p>
               </div>
               <button
@@ -936,7 +998,7 @@ export const ChatInterface: React.FC = () => {
                 className="w-full rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700 focus:border-primary-400 focus:outline-none focus:ring-2 focus:ring-primary-100"
               />
               <p className="text-[11px] text-slate-400">
-                Use {`{date}`} to inject the target day. Prompts are saved per browser.
+                {t('Use {date} to inject the target day. Prompts are saved per browser.')}
               </p>
             </div>
             <div className="flex items-center justify-between border-t border-slate-200 px-5 py-4">
@@ -945,7 +1007,7 @@ export const ChatInterface: React.FC = () => {
                 onClick={resetAgentPrompt}
                 className="text-xs font-semibold text-slate-500 hover:text-slate-700"
               >
-                Reset to default
+                {t('Reset to default')}
               </button>
               <div className="flex items-center gap-2">
                 <button
@@ -953,14 +1015,14 @@ export const ChatInterface: React.FC = () => {
                   onClick={closeAgentPromptEditor}
                   className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 hover:border-slate-300 hover:text-slate-800"
                 >
-                  Cancel
+                  {t('Cancel')}
                 </button>
                 <button
                   type="button"
                   onClick={saveAgentPrompt}
                   className="rounded-lg bg-primary-600 px-3 py-2 text-xs font-semibold text-white hover:bg-primary-700"
                 >
-                  Save prompt
+                  {t('Save prompt')}
                 </button>
               </div>
             </div>
@@ -972,7 +1034,7 @@ export const ChatInterface: React.FC = () => {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 p-4">
           <div className="w-full max-w-4xl rounded-2xl border border-slate-200 bg-white shadow-xl overflow-hidden">
             <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
-              <p className="text-sm font-semibold text-slate-800">Image preview</p>
+              <p className="text-sm font-semibold text-slate-800">{t('Image preview')}</p>
               <button
                 type="button"
                 onClick={() => setPreviewAttachment(null)}
@@ -984,7 +1046,7 @@ export const ChatInterface: React.FC = () => {
             <div className="bg-slate-50 px-5 py-4 flex items-center justify-center">
               <img
                 src={previewAttachment.url}
-                alt="Preview"
+                alt={t('Preview')}
                 className="max-h-[70vh] w-auto rounded-xl border border-slate-200"
                 loading="lazy"
               />
@@ -997,14 +1059,14 @@ export const ChatInterface: React.FC = () => {
                 rel="noreferrer"
                 className="rounded-lg bg-primary-600 px-3 py-2 text-xs font-semibold text-white hover:bg-primary-700"
               >
-                Download
+                {t('Download')}
               </a>
               <button
                 type="button"
                 onClick={() => setPreviewAttachment(null)}
                 className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 hover:border-slate-300 hover:text-slate-800"
               >
-                Close
+                {t('Close')}
               </button>
             </div>
           </div>

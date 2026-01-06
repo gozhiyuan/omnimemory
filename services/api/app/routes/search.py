@@ -10,7 +10,8 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..db.models import DEFAULT_TEST_USER_ID, ProcessedContext, SourceItem
+from ..auth import get_current_user_id
+from ..db.models import ProcessedContext, SourceItem
 from ..db.session import get_session
 from ..vectorstore import search_contexts
 
@@ -25,7 +26,7 @@ async def search_items(
     start_date: Optional[date] = Query(default=None, description="Filter start date (YYYY-MM-DD)"),
     end_date: Optional[date] = Query(default=None, description="Filter end date (YYYY-MM-DD)"),
     provider: Optional[str] = Query(default=None, description="Filter by source provider"),
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     filter_start: Optional[datetime] = None

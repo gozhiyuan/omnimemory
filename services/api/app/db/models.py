@@ -47,6 +47,25 @@ class User(Base):
     items: Mapped[list["SourceItem"]] = relationship(back_populates="user")
 
 
+class UserSettings(Base):
+    __tablename__ = "user_settings"
+    __table_args__ = (UniqueConstraint("user_id", name="user_settings_user_id_idx"),)
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"))
+    settings: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("NOW()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("NOW()"), nullable=False
+    )
+
+    user: Mapped[User] = relationship()
+
+
 class DataConnection(Base):
     __tablename__ = "data_connections"
 
@@ -447,6 +466,7 @@ __all__ = [
     "DerivedArtifact",
     "ProcessedContext",
     "DailySummary",
+    "UserSettings",
     "AiUsageEvent",
     "DEFAULT_TEST_USER_ID",
 ]

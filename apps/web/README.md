@@ -22,6 +22,25 @@ compat with `STORAGE_PROVIDER=s3` + `S3_*` settings, or Supabase with `STORAGE_P
    GEMINI_API_KEY=your-key-here
    ```
 
+   To enable Authentik OIDC, add the SPA client settings (matching the API `AUTH_ENABLED=true`
+   config):
+
+   ```
+   VITE_OIDC_ISSUER_URL=https://authentik.example.com/application/o/omnimemory/
+   VITE_OIDC_CLIENT_ID=your-client-id
+   VITE_OIDC_REDIRECT_URI=http://localhost:5173
+   VITE_OIDC_SCOPES=openid profile email offline_access
+   ```
+
+   If your Authentik deployment uses non-standard endpoints, you can also set:
+
+   ```
+   VITE_OIDC_AUTH_URL=...
+   VITE_OIDC_TOKEN_URL=...
+   VITE_OIDC_LOGOUT_URL=...
+   VITE_OIDC_POST_LOGOUT_REDIRECT_URI=http://localhost:5173
+   ```
+
 3. Start the Vite dev server:
 
    ```bash

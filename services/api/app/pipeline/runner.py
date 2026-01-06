@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import get_settings
 from ..db.models import SourceItem
 from ..storage import get_storage_provider
+from ..user_settings import fetch_user_settings
 from .steps import get_pipeline_steps
 from .types import ArtifactStore, PipelineArtifacts, PipelineConfig
 
@@ -149,12 +150,14 @@ async def run_pipeline(
 ) -> PipelineArtifacts:
     settings = get_settings()
     storage = get_storage_provider()
+    user_settings = await fetch_user_settings(session, item.user_id)
     config = PipelineConfig(
         session=session,
         storage=storage,
         settings=settings,
         payload=payload,
         now=datetime.now(timezone.utc),
+        user_settings=user_settings,
     )
     artifacts = PipelineArtifacts(ArtifactStore(session, item))
     steps = get_pipeline_steps(item.item_type)

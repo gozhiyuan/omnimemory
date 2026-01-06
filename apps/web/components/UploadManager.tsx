@@ -2,6 +2,9 @@ import React, { useEffect, useState } from 'react';
 import { UploadCloud, CheckCircle2, FileImage, X, AlertCircle, ChevronDown, FileText, Mic, Play, Video } from 'lucide-react';
 import { apiGet, apiPost } from '../services/api';
 import { PageMotion } from './PageMotion';
+import { useSettings } from '../contexts/SettingsContext';
+import { useI18n } from '../i18n/useI18n';
+import { formatDateKey, getTimeZoneOffsetMinutes } from '../utils/time';
 import {
   GooglePhotosAuthUrlResponse,
   GooglePhotosPickerSessionResponse,
@@ -18,6 +21,9 @@ import {
 
 export const UploadManager: React.FC = () => {
   const RECENT_PAGE_SIZE = 6;
+  const { settings } = useSettings();
+  const { t, locale } = useI18n();
+  const timeZone = settings.preferences.timezone;
 
   const [dragActive, setDragActive] = useState(false);
   const [files, setFiles] = useState<File[]>([]);
@@ -78,11 +84,22 @@ export const UploadManager: React.FC = () => {
     });
   };
 
-  const formatLocalDate = (value: Date) => {
-    const year = value.getFullYear();
-    const month = String(value.getMonth() + 1).padStart(2, '0');
-    const day = String(value.getDate()).padStart(2, '0');
-    return `${year}-${month}-${day}`;
+  const formatDateTime = (value?: string | Date | null) => {
+    if (!value) {
+      return t('Unknown date');
+    }
+    const parsed = typeof value === 'string' ? new Date(value) : value;
+    if (Number.isNaN(parsed.getTime())) {
+      return t('Unknown date');
+    }
+    return new Intl.DateTimeFormat(locale, {
+      timeZone,
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    }).format(parsed);
   };
 
   const handleDrag = (e: React.DragEvent) => {
@@ -146,10 +163,10 @@ export const UploadManager: React.FC = () => {
           filename: file.name,
           content_type: contentType,
           prefix: 'uploads/ui',
-          path_date: formatLocalDate(uploadDate),
+          path_date: formatDateKey(uploadDate, timeZone),
         });
         if (!uploadMeta.url) {
-          throw new Error(`Upload URL missing for ${file.name}`);
+          throw new Error(t('Upload URL missing for {name}', { name: file.name }));
         }
 
         const headers = { ...(uploadMeta.headers || {}), 'Content-Type': contentType };
@@ -160,8 +177,13 @@ export const UploadManager: React.FC = () => {
         });
         if (!uploadResponse.ok) {
           const responseText = await uploadResponse.text();
+          const details = responseText || '';
           throw new Error(
-            `Upload failed for ${file.name}: ${uploadResponse.status} ${responseText || ''}`.trim()
+            t('Upload failed for {name}: {status} {details}', {
+              name: file.name,
+              status: uploadResponse.status,
+              details,
+            }).trim()
           );
         }
 
@@ -173,7 +195,7 @@ export const UploadManager: React.FC = () => {
           original_filename: file.name,
           size_bytes: file.size,
           duration_sec: durationSec,
-          client_tz_offset_minutes: new Date().getTimezoneOffset(),
+          client_tz_offset_minutes: getTimeZoneOffsetMinutes(new Date(), timeZone),
         });
 
         setUploadedCount((count) => count + 1);
@@ -182,7 +204,7 @@ export const UploadManager: React.FC = () => {
       setSuccess(true);
       setFiles([]);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Upload failed.');
+      setError(err instanceof Error ? err.message : t('Upload failed.'));
     } finally {
       setUploading(false);
     }
@@ -195,7 +217,9 @@ export const UploadManager: React.FC = () => {
       const status = await apiGet<GooglePhotosStatus>('/integrations/google/photos/status');
       setGoogleStatus(status);
     } catch (err) {
-      setGoogleError(err instanceof Error ? err.message : 'Failed to load Google Photos status.');
+      setGoogleError(
+        err instanceof Error ? err.message : t('Failed to load Google Photos status.')
+      );
     } finally {
       setGoogleLoading(false);
     }
@@ -219,7 +243,7 @@ export const UploadManager: React.FC = () => {
       setRecentTotal(data.total);
       setRecentOffset(nextOffset + data.items.length);
     } catch (err) {
-      setRecentError(err instanceof Error ? err.message : 'Failed to load recent items.');
+      setRecentError(err instanceof Error ? err.message : t('Failed to load recent items.'));
     } finally {
       setRecentLoading(false);
     }
@@ -232,7 +256,9 @@ export const UploadManager: React.FC = () => {
       const response = await apiGet<GooglePhotosAuthUrlResponse>('/integrations/google/photos/auth-url');
       window.location.href = response.auth_url;
     } catch (err) {
-      setGoogleError(err instanceof Error ? err.message : 'Failed to start Google Photos connection.');
+      setGoogleError(
+        err instanceof Error ? err.message : t('Failed to start Google Photos connection.')
+      );
       setGoogleLoading(false);
     }
   };
@@ -254,7 +280,7 @@ export const UploadManager: React.FC = () => {
       window.open(response.picker_uri, '_blank', 'noopener,noreferrer');
       setPickerPollCycle((cycle) => cycle + 1);
     } catch (err) {
-      setPickerError(err instanceof Error ? err.message : 'Failed to open Google Photos picker.');
+      setPickerError(err instanceof Error ? err.message : t('Failed to open Google Photos picker.'));
     } finally {
       setPickerLoading(false);
     }
@@ -262,7 +288,7 @@ export const UploadManager: React.FC = () => {
 
   const fetchPickerSelection = async () => {
     if (!pickerSessionId) {
-      setSelectedError('Start a picker session before loading selections.');
+      setSelectedError(t('Start a picker session before loading selections.'));
       return { count: 0, pending: false };
     }
     setSelectedError(null);
@@ -273,31 +299,33 @@ export const UploadManager: React.FC = () => {
       );
       if (response.status === 'pending') {
         setSelectedItems([]);
-        setSelectedHint(response.message || 'Waiting for Google Photos selection to complete.');
+        setSelectedHint(
+          response.message || t('Waiting for Google Photos selection to complete.')
+        );
         return { count: 0, pending: true };
       }
       setSelectedHint(null);
       setSelectedItems(response.items);
       return { count: response.items.length, pending: false };
     } catch (err) {
-      setSelectedError(err instanceof Error ? err.message : 'Failed to load picker selections.');
+      setSelectedError(err instanceof Error ? err.message : t('Failed to load picker selections.'));
       return { count: 0, pending: false };
     }
   };
 
   const handlePickerCheckAgain = () => {
     if (!pickerSessionId) {
-      setSelectedError('Start a picker session before loading selections.');
+      setSelectedError(t('Start a picker session before loading selections.'));
       return;
     }
     setPickerPollExhausted(false);
-    setSelectedHint('Checking Google Photos selection...');
+    setSelectedHint(t('Checking Google Photos selection...'));
     setPickerPollCycle((cycle) => cycle + 1);
   };
 
   const handlePickerReopen = () => {
     if (!pickerUri) {
-      setPickerError('No picker session available. Start a new selection.');
+      setPickerError(t('No picker session available. Start a new selection.'));
       return;
     }
     window.open(pickerUri, '_blank', 'noopener,noreferrer');
@@ -305,7 +333,7 @@ export const UploadManager: React.FC = () => {
 
   const handleGoogleSync = async () => {
     if (!pickerSessionId) {
-      setPickerError('Start a picker session before syncing.');
+      setPickerError(t('Start a picker session before syncing.'));
       return;
     }
     setSyncLoading(true);
@@ -314,10 +342,10 @@ export const UploadManager: React.FC = () => {
     try {
       const payload: GooglePhotosSyncRequest = { session_id: pickerSessionId };
       const response = await apiPost<GooglePhotosSyncResponse>('/integrations/google/photos/sync', payload);
-      setSyncMessage(`Sync queued (task ${response.task_id}).`);
+      setSyncMessage(t('Sync queued (task {task_id}).', { task_id: response.task_id }));
       void loadRecentItems(true);
     } catch (err) {
-      setPickerError(err instanceof Error ? err.message : 'Failed to queue Google Photos sync.');
+      setPickerError(err instanceof Error ? err.message : t('Failed to queue Google Photos sync.'));
     } finally {
       setSyncLoading(false);
     }
@@ -353,7 +381,7 @@ export const UploadManager: React.FC = () => {
         setSelectedLoading(false);
         setPickerPollExhausted(false);
         if (count === 0) {
-          setSelectedHint('No items selected yet. Reopen the picker to choose photos.');
+          setSelectedHint(t('No items selected yet. Reopen the picker to choose photos.'));
         }
         return;
       }
@@ -362,7 +390,7 @@ export const UploadManager: React.FC = () => {
       if (elapsedMs >= maxDurationMs) {
         setSelectedLoading(false);
         setPickerPollExhausted(true);
-        setSelectedHint('Still waiting on Google Photos. Check again or reopen the picker.');
+        setSelectedHint(t('Still waiting on Google Photos. Check again or reopen the picker.'));
         return;
       }
 
@@ -383,26 +411,28 @@ export const UploadManager: React.FC = () => {
 
   const formatGoogleStatus = () => {
     if (!googleStatus?.connected) {
-      return 'Not connected';
+      return t('Not connected');
     }
     if (googleStatus.connected_at) {
       const connectedAt = new Date(googleStatus.connected_at);
-      return `Connected ${connectedAt.toLocaleString()}`;
+      return t('Connected {time}', { time: formatDateTime(connectedAt) });
     }
-    return 'Connected';
+    return t('Connected');
   };
 
   return (
     <PageMotion className="p-8 max-w-4xl mx-auto">
        <div className="mb-8">
-        <h1 className="text-2xl font-bold text-slate-900">Ingestion Pipeline</h1>
-        <p className="text-slate-500 mt-1">Upload photos, videos, or connect external accounts.</p>
+        <h1 className="text-2xl font-bold text-slate-900">{t('Ingestion Pipeline')}</h1>
+        <p className="text-slate-500 mt-1">
+          {t('Upload photos, videos, or connect external accounts.')}
+        </p>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
         {/* Manual Upload Area */}
         <div className="space-y-4">
-          <h2 className="text-lg font-semibold text-slate-800">Manual Upload</h2>
+          <h2 className="text-lg font-semibold text-slate-800">{t('Manual Upload')}</h2>
           <div 
             className={`relative border-2 border-dashed rounded-xl p-8 flex flex-col items-center justify-center text-center transition-colors min-h-[300px] ${
               dragActive ? 'border-primary-500 bg-primary-50' : 'border-slate-300 bg-slate-50'
@@ -423,22 +453,24 @@ export const UploadManager: React.FC = () => {
               <UploadCloud className={`w-8 h-8 ${dragActive ? 'text-primary-600' : 'text-slate-400'}`} />
             </div>
             <p className="text-sm font-medium text-slate-900 pointer-events-none">
-              Click to upload or drag and drop
+              {t('Click to upload or drag and drop')}
             </p>
             <p className="text-xs text-slate-500 mt-2 max-w-xs pointer-events-none">
-              Supported: JPG, PNG, MP4, MOV, MP3, WAV (Max 5GB per batch)
+              {t('Supported: JPG, PNG, MP4, MOV, MP3, WAV (Max 5GB per batch)')}
             </p>
           </div>
 
           {files.length > 0 && (
             <div className="bg-white rounded-lg border border-slate-200 p-4 shadow-sm animate-fade-in">
               <div className="flex justify-between items-center mb-3">
-                <span className="text-sm font-medium text-slate-700">{files.length} files selected</span>
+                <span className="text-sm font-medium text-slate-700">
+                  {t('{count} files selected', { count: files.length })}
+                </span>
                 <button 
                   onClick={clearFiles}
                   className="text-xs text-red-500 hover:text-red-600"
                 >
-                  Clear all
+                  {t('Clear all')}
                 </button>
               </div>
               <div className="max-h-40 overflow-y-auto space-y-2 pr-1 custom-scrollbar">
@@ -465,9 +497,12 @@ export const UploadManager: React.FC = () => {
                       <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
                       <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                     </svg>
-                    Uploading {uploadedCount}/{files.length}
+                    {t('Uploading {current}/{total}', {
+                      current: uploadedCount,
+                      total: files.length,
+                    })}
                   </>
-                ) : 'Start Processing'}
+                ) : t('Start Processing')}
               </button>
             </div>
           )}
@@ -482,14 +517,14 @@ export const UploadManager: React.FC = () => {
           {success && (
              <div className="bg-green-50 border border-green-200 text-green-700 px-4 py-3 rounded-lg flex items-center">
                <CheckCircle2 className="w-5 h-5 mr-2" />
-               <span className="text-sm">Batch uploaded & queued for processing!</span>
+               <span className="text-sm">{t('Batch uploaded & queued for processing!')}</span>
              </div>
           )}
         </div>
 
         {/* Integration Cards */}
         <div className="space-y-4">
-          <h2 className="text-lg font-semibold text-slate-800">Connected Sources</h2>
+          <h2 className="text-lg font-semibold text-slate-800">{t('Connected Sources')}</h2>
           
           <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
             <div className="flex items-center justify-between">
@@ -503,14 +538,14 @@ export const UploadManager: React.FC = () => {
                    />
                 </div>
                 <div>
-                  <h3 className="text-sm font-medium text-slate-900">Google Photos</h3>
+                  <h3 className="text-sm font-medium text-slate-900">{t('Google Photos')}</h3>
                   <p className={`text-xs flex items-center ${googleStatus?.connected ? 'text-green-600' : 'text-slate-500'}`}>
                     {googleStatus?.connected ? (
                       <CheckCircle2 size={12} className="mr-1" />
                     ) : (
                       <AlertCircle size={12} className="mr-1" />
                     )}
-                    {googleLoading ? 'Checking status...' : formatGoogleStatus()}
+                    {googleLoading ? t('Checking status...') : formatGoogleStatus()}
                   </p>
                 </div>
               </div>
@@ -521,7 +556,7 @@ export const UploadManager: React.FC = () => {
                   disabled={googleLoading}
                   type="button"
                 >
-                  {googleStatus?.connected ? 'Reconnect' : 'Connect'}
+                  {googleStatus?.connected ? t('Reconnect') : t('Connect')}
                 </button>
                 <button
                   className="text-xs bg-primary-600 text-white px-3 py-1.5 rounded-md hover:bg-primary-700 disabled:opacity-50"
@@ -529,7 +564,7 @@ export const UploadManager: React.FC = () => {
                   disabled={!googleStatus?.connected || pickerLoading}
                   type="button"
                 >
-                  {pickerLoading ? 'Opening...' : 'Select photos'}
+                  {pickerLoading ? t('Opening...') : t('Select photos')}
                 </button>
               </div>
             </div>
@@ -549,7 +584,7 @@ export const UploadManager: React.FC = () => {
                   className="w-full flex items-center justify-between px-3 py-2 text-sm font-medium text-slate-800"
                   aria-expanded={detailsOpen}
                 >
-                  <span>Google Photos ingestion details</span>
+                  <span>{t('Google Photos ingestion details')}</span>
                   <ChevronDown
                     className={`w-4 h-4 transition-transform ${detailsOpen ? 'rotate-180' : ''}`}
                   />
@@ -557,13 +592,23 @@ export const UploadManager: React.FC = () => {
                 {detailsOpen && (
                   <div className="border-t border-slate-200 bg-slate-50 rounded-b-lg p-3 text-xs text-slate-600 space-y-3">
                     <div className="space-y-1">
-                      <p className="text-sm text-slate-800 font-medium">Select photos in Google Picker</p>
-                      <p>Selections refresh automatically after you finish picking. Already ingested items are skipped during sync.</p>
+                      <p className="text-sm text-slate-800 font-medium">
+                        {t('Select photos in Google Picker')}
+                      </p>
+                      <p>
+                        {t(
+                          'Selections refresh automatically after you finish picking. Already ingested items are skipped during sync.'
+                        )}
+                      </p>
                       <div className="flex items-center gap-3">
                         <span className="text-slate-700 font-medium">
-                          {selectedLoading ? 'Loading selection...' : `Selected ${selectedItems.length} photos`}
+                          {selectedLoading
+                            ? t('Loading selection...')
+                            : t('Selected {count} photos', { count: selectedItems.length })}
                         </span>
-                        {!pickerSessionId && <span className="text-slate-500">Open the picker to start a selection.</span>}
+                        {!pickerSessionId && (
+                          <span className="text-slate-500">{t('Open the picker to start a selection.')}</span>
+                        )}
                       </div>
                       {selectedError && <p className="text-xs text-red-600">{selectedError}</p>}
                       {selectedHint && !selectedError && (
@@ -577,14 +622,14 @@ export const UploadManager: React.FC = () => {
                             disabled={selectedLoading}
                             type="button"
                           >
-                            Check again
+                            {t('Check again')}
                           </button>
                           <button
                             className="text-xs text-slate-600 hover:text-slate-800 underline underline-offset-2"
                             onClick={handlePickerReopen}
                             type="button"
                           >
-                            Reopen picker
+                            {t('Reopen picker')}
                           </button>
                         </div>
                       )}
@@ -594,27 +639,31 @@ export const UploadManager: React.FC = () => {
                         disabled={syncLoading || !pickerSessionId}
                         type="button"
                       >
-                        {syncLoading ? 'Queueing sync...' : 'Ingest selected photos'}
+                        {syncLoading ? t('Queueing sync...') : t('Ingest selected photos')}
                       </button>
                       {syncMessage && <p className="text-green-600">{syncMessage}</p>}
-                      {!pickerSessionId && <p className="text-slate-500">Waiting for picker selection.</p>}
+                      {!pickerSessionId && (
+                        <p className="text-slate-500">{t('Waiting for picker selection.')}</p>
+                      )}
                     </div>
 
                     <div className="border-t border-slate-200 pt-3">
                       <div className="flex items-center justify-between">
-                        <p className="text-sm text-slate-800 font-medium">Recently ingested from Google Photos</p>
+                        <p className="text-sm text-slate-800 font-medium">
+                          {t('Recently ingested from Google Photos')}
+                        </p>
                         <button
                           className="text-xs text-slate-500 hover:text-slate-700 disabled:opacity-50"
                           onClick={() => loadRecentItems(true)}
                           disabled={recentLoading}
                           type="button"
                         >
-                          {recentLoading ? 'Refreshing...' : 'Refresh'}
+                          {recentLoading ? t('Refreshing...') : t('Refresh')}
                         </button>
                       </div>
                       {recentError && <p className="text-xs text-red-600">{recentError}</p>}
                       {recentItems.length === 0 && !recentError ? (
-                        <p className="text-xs text-slate-500">No recent items yet.</p>
+                        <p className="text-xs text-slate-500">{t('No recent items yet.')}</p>
                       ) : (
                         <ul className="space-y-2 text-xs text-slate-600 mt-2">
                           {recentItems.map((item) => (
@@ -623,7 +672,7 @@ export const UploadManager: React.FC = () => {
                               {item.item_type === 'photo' && item.download_url ? (
                                 <img
                                   src={item.download_url}
-                                  alt={item.original_filename || 'Google Photos thumbnail'}
+                                  alt={item.original_filename || t('Google Photos thumbnail')}
                                   className="w-10 h-10 rounded-md object-cover border border-slate-200"
                                   loading="lazy"
                                 />
@@ -631,7 +680,7 @@ export const UploadManager: React.FC = () => {
                                 <div className="relative">
                                   <img
                                     src={item.poster_url}
-                                    alt={item.original_filename || 'Video preview'}
+                                    alt={item.original_filename || t('Video preview')}
                                     className="w-10 h-10 rounded-md object-cover border border-slate-200"
                                     loading="lazy"
                                   />
@@ -659,7 +708,7 @@ export const UploadManager: React.FC = () => {
                                   {item.original_filename || item.storage_key}
                                 </p>
                                 <p className="text-slate-500">
-                                  {item.captured_at ? new Date(item.captured_at).toLocaleString() : 'Unknown date'}
+                                  {formatDateTime(item.captured_at)}
                                 </p>
                               </div>
                             </li>
@@ -669,7 +718,10 @@ export const UploadManager: React.FC = () => {
                       {recentItems.length > 0 && (
                         <div className="mt-2 flex items-center justify-between text-[11px] text-slate-500">
                           <span>
-                            Showing {recentItems.length} of {Math.max(recentTotal, recentItems.length)}
+                            {t('Showing {count} of {total}', {
+                              count: recentItems.length,
+                              total: Math.max(recentTotal, recentItems.length),
+                            })}
                           </span>
                           {hasMoreRecent && (
                             <button
@@ -678,7 +730,7 @@ export const UploadManager: React.FC = () => {
                               className="text-xs text-slate-500 hover:text-slate-700 disabled:opacity-60"
                               disabled={recentLoading}
                             >
-                              {recentLoading ? 'Loading...' : 'Load more'}
+                              {recentLoading ? t('Loading...') : t('Load more')}
                             </button>
                           )}
                         </div>

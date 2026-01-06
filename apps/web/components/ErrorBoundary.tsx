@@ -1,4 +1,5 @@
 import React from 'react';
+import { translateFromStorage } from '../i18n/core';
 
 type ErrorBoundaryState = {
   hasError: boolean;
@@ -31,16 +32,20 @@ export class ErrorBoundary extends React.Component<React.PropsWithChildren, Erro
           <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-rose-50 text-rose-600">
             <span className="text-2xl font-semibold">!</span>
           </div>
-          <h1 className="text-lg font-semibold text-slate-900">Something went wrong</h1>
+          <h1 className="text-lg font-semibold text-slate-900">
+            {translateFromStorage('Something went wrong')}
+          </h1>
           <p className="mt-2 text-sm text-slate-500">
-            The app hit an unexpected error. Reload the page to try again.
+            {translateFromStorage(
+              'The app hit an unexpected error. Reload the page to try again.'
+            )}
           </p>
           <button
             type="button"
             onClick={this.handleReload}
             className="mt-5 inline-flex items-center justify-center rounded-lg bg-primary-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-primary-700"
           >
-            Reload
+            {translateFromStorage('Reload')}
           </button>
         </div>
       </div>

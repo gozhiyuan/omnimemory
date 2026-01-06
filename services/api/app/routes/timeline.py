@@ -15,11 +15,11 @@ from sqlalchemy import delete, func, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
+from ..auth import get_current_user_id
 from ..celery_app import celery_app
 from ..ai import transcribe_media
 from ..config import get_settings
 from ..db.models import (
-    DEFAULT_TEST_USER_ID,
     DataConnection,
     DailySummary,
     DerivedArtifact,
@@ -32,6 +32,7 @@ from ..db.session import get_session
 from ..google_photos import get_valid_access_token
 from ..storage import get_storage_provider
 from ..tasks.episodes import _update_daily_summary as refresh_daily_summary
+from ..user_settings import fetch_user_settings, resolve_language_label, resolve_language_code
 from ..vectorstore import delete_context_embeddings, upsert_context_embeddings
 from ..pipeline.utils import build_vector_text, ensure_tz_aware, extract_keywords
 
@@ -355,7 +356,7 @@ WEB_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 
 @router.get("/", response_model=list[TimelineDay])
 async def get_timeline(
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
     limit: int = 200,
     provider: Optional[str] = None,
@@ -784,7 +785,7 @@ async def get_timeline(
 async def update_daily_summary(
     context_id: str,
     payload: DailySummaryUpdateRequest,
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> TimelineDailySummary:
     context = await _load_daily_summary_context(context_id, user_id, session)
@@ -821,7 +822,7 @@ async def update_daily_summary_from_voice(
     context_id: str,
     file: UploadFile = File(...),
     tz_offset_minutes: Optional[int] = Form(None),
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> TimelineDailySummary:
     context = await _load_daily_summary_context(context_id, user_id, session)
@@ -830,6 +831,8 @@ async def update_daily_summary_from_voice(
         raise HTTPException(status_code=400, detail="Empty audio payload")
 
     settings = get_settings()
+    user_settings = await fetch_user_settings(session, user_id)
+    language = resolve_language_label(resolve_language_code(user_settings))
     transcript = await transcribe_media(
         blob,
         settings,
@@ -838,6 +841,7 @@ async def update_daily_summary_from_voice(
         user_id=user_id,
         item_id=context.id,
         step_name="daily_summary_voice",
+        language=language,
     )
     if transcript.get("status") != "ok":
         reason = transcript.get("reason") or transcript.get("error") or "transcription_failed"
@@ -859,7 +863,7 @@ async def update_daily_summary_from_voice(
 async def reset_daily_summary(
     context_id: str,
     payload: DailySummaryResetRequest,
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> TimelineDailySummary:
     context = await _load_daily_summary_context(context_id, user_id, session)
@@ -889,7 +893,7 @@ async def reset_daily_summary(
 @router.post("/highlights", response_model=TimelineHighlightResponse)
 async def set_timeline_highlight(
     request: TimelineHighlightRequest,
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> TimelineHighlightResponse:
     item = await session.get(SourceItem, request.item_id)
@@ -934,7 +938,7 @@ async def set_timeline_highlight(
 @router.delete("/highlights/{highlight_date}", response_model=TimelineHighlightDeleteResponse)
 async def clear_timeline_highlight(
     highlight_date: date,
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> TimelineHighlightDeleteResponse:
     stmt = select(TimelineDayHighlight).where(
@@ -958,7 +962,7 @@ async def clear_timeline_highlight(
 
 @router.get("/items", response_model=TimelineItemsPage)
 async def get_timeline_items(
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
     limit: int = 50,
     offset: int = 0,
@@ -1178,7 +1182,7 @@ async def get_timeline_items(
 @router.get("/items/{item_id}", response_model=TimelineItemDetail)
 async def get_timeline_item_detail(
     item_id: UUID,
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> TimelineItemDetail:
     item = await session.get(SourceItem, item_id)
@@ -1359,7 +1363,7 @@ async def get_timeline_item_detail(
 @router.get("/episodes/{episode_id}", response_model=TimelineEpisodeDetail)
 async def get_timeline_episode_detail(
     episode_id: str,
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> TimelineEpisodeDetail:
     episode_stmt = select(ProcessedContext).where(
@@ -1555,7 +1559,7 @@ async def get_timeline_episode_detail(
 async def update_episode_detail(
     episode_id: str,
     payload: EpisodeUpdateRequest,
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> TimelineEpisodeDetail:
     context_stmt = select(ProcessedContext).where(
@@ -1601,7 +1605,7 @@ async def update_episode_detail(
 @router.delete("/items/{item_id}", response_model=DeleteResponse)
 async def delete_timeline_item(
     item_id: UUID,
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> DeleteResponse:
     item = await session.get(SourceItem, item_id)

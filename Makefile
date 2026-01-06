@@ -1,32 +1,36 @@
 COMPOSE := orchestration/docker-compose.dev.yml
+ENV_FILE := $(if $(wildcard .env),--env-file .env,)
 NODE_PREFIX := $(shell brew --prefix node@20 2>/dev/null || brew --prefix node 2>/dev/null || true)
 NODE_BIN := $(if $(NODE_PREFIX),$(NODE_PREFIX)/bin,)
 NODE_PATH := $(if $(NODE_BIN),$(NODE_BIN):,)
 
-.PHONY: dev-up dev-down dev-restart dev-logs dev-ps dev-pull dev-clean observability observability-check observability-down verify
+.PHONY: dev-up dev-down dev-restart dev-logs dev-ps dev-pull dev-clean authentik-up observability observability-check observability-down verify
 
 dev-up:
-	docker compose -f $(COMPOSE) up -d --remove-orphans
+	docker compose $(ENV_FILE) -f $(COMPOSE) up -d --remove-orphans
 
 dev-down:
-	docker compose -f $(COMPOSE) down
+	docker compose $(ENV_FILE) -f $(COMPOSE) down
 
 dev-restart: dev-down dev-up
 
 dev-logs:
-	docker compose -f $(COMPOSE) logs -f --tail=200
+	docker compose $(ENV_FILE) -f $(COMPOSE) logs -f --tail=200
 
 dev-ps:
-	docker compose -f $(COMPOSE) ps
+	docker compose $(ENV_FILE) -f $(COMPOSE) ps
 
 dev-pull:
-	docker compose -f $(COMPOSE) pull
+	docker compose $(ENV_FILE) -f $(COMPOSE) pull
 
 dev-clean:
-	docker compose -f $(COMPOSE) down -v
+	docker compose $(ENV_FILE) -f $(COMPOSE) down -v
+
+authentik-up:
+	docker compose $(ENV_FILE) -f $(COMPOSE) up -d --remove-orphans authentik-server authentik-worker
 
 observability:
-	docker compose -f $(COMPOSE) up -d --remove-orphans celery-exporter prometheus grafana
+	docker compose $(ENV_FILE) -f $(COMPOSE) up -d --remove-orphans celery-exporter prometheus grafana
 	@$(MAKE) observability-check
 
 observability-check:
@@ -51,7 +55,7 @@ observability-check:
 	@echo "Observability stack is up (Prometheus, Grafana, Celery exporter)."
 
 observability-down:
-	docker compose -f $(COMPOSE) stop celery-exporter prometheus grafana
+	docker compose $(ENV_FILE) -f $(COMPOSE) stop celery-exporter prometheus grafana
 
 verify:
 	cd services/api && (UV_CACHE_DIR=.uv-cache uv run --extra dev pytest || .venv/bin/python -m pytest)

@@ -199,11 +199,17 @@ async def _ingest_media_item(
     return source_item.id
 
 
-async def _sync_google_photos(session_id: Optional[str]) -> dict[str, Any]:
+async def _sync_google_photos(session_id: Optional[str], user_id: Optional[str]) -> dict[str, Any]:
+    resolved_user_id = DEFAULT_TEST_USER_ID
+    if user_id:
+        try:
+            resolved_user_id = UUID(user_id)
+        except (TypeError, ValueError):
+            resolved_user_id = DEFAULT_TEST_USER_ID
     async with isolated_session() as session:
         result = await session.execute(
             select(DataConnection).where(
-                DataConnection.user_id == DEFAULT_TEST_USER_ID,
+                DataConnection.user_id == resolved_user_id,
                 DataConnection.provider == "google_photos",
             )
         )
@@ -244,11 +250,11 @@ async def _sync_google_photos(session_id: Optional[str]) -> dict[str, Any]:
 
 
 @celery_app.task(name="integrations.google_photos.sync", bind=True)
-def sync_google_photos_media(self, session_id: Optional[str] = None) -> dict[str, Any]:
+def sync_google_photos_media(self, session_id: Optional[str] = None, user_id: Optional[str] = None) -> dict[str, Any]:
     """Fetch Google Photos media items and enqueue ingestion."""
 
     try:
-        return asyncio.run(_sync_google_photos(session_id))
+        return asyncio.run(_sync_google_photos(session_id, user_id))
     except Exception as exc:  # pragma: no cover - task boundary
         logger.exception("Google Photos sync failed: {}", exc)
         raise

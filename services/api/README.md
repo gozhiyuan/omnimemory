@@ -1,6 +1,6 @@
 # Backend API (FastAPI)
 
-This service handles synchronous requests (uploads, storage signing, timeline/dashboard summaries, search) and enqueues Celery tasks to process items. Authentication is not wired yet; endpoints default to the test user ID unless you provide one explicitly.
+This service handles synchronous requests (uploads, storage signing, timeline/dashboard summaries, search) and enqueues Celery tasks to process items. Authentication is optional: when `AUTH_ENABLED=false`, endpoints fall back to the test user ID; when enabled, requests must include a Bearer token from your OIDC provider.
 
 ## Prerequisites
 
@@ -69,6 +69,23 @@ This service handles synchronous requests (uploads, storage signing, timeline/da
      `SUPABASE_SERVICE_ROLE_KEY`.
    - If you do not configure a provider that supports presigned URLs, you can still call
      `/upload/ingest` directly (no presigned uploads), but the UI upload flow will fail with a 501.
+
+5. (Optional) Enable OIDC authentication (Authentik):
+   - Set `AUTH_ENABLED=true` and point the API at your issuer/JWKS endpoints, for example:
+
+     ```bash
+     AUTH_ENABLED=true
+     OIDC_ISSUER_URL=https://authentik.example.com/application/o/omnimemory/
+     OIDC_JWKS_URL=https://authentik.example.com/application/o/omnimemory/jwks/
+     OIDC_AUDIENCE=omnimemory
+     OIDC_USER_ID_CLAIM=sub
+     OIDC_EMAIL_CLAIM=email
+     OIDC_NAME_CLAIM=name
+     ```
+
+   - When enabled, all API endpoints (except `/health` and `/metrics`) require an `Authorization: Bearer <token>` header.
+   - User IDs are derived from the token `sub` claim if it is a UUID; otherwise the API will fall back to the email claim.
+   - Make sure your Authentik application is configured for a public client + PKCE if the web app is a SPA.
 
 Subsequent commands can be executed through `uv run <command>` which automatically reuses the virtual
 environment.

@@ -4,6 +4,49 @@ from __future__ import annotations
 
 
 OCR_TEXT_PLACEHOLDER = "<<OCR_TEXT>>"
+DEFAULT_LANGUAGE = "English"
+
+
+def _resolve_language_label(language: str | None) -> str:
+    if language and language.strip():
+        return language.strip()
+    return DEFAULT_LANGUAGE
+
+
+def _image_language_guidance(language: str | None) -> str:
+    label = _resolve_language_label(language)
+    return (
+        "\n\nLanguage guidance:\n"
+        f"- Use {label} for all title/summary/keywords fields.\n"
+        "- Keep JSON keys and enum values in English.\n"
+    )
+
+
+def _media_chunk_language_guidance(language: str | None) -> str:
+    label = _resolve_language_label(language)
+    return (
+        "\n\nLanguage guidance:\n"
+        f"- Transcript stays in the original spoken language; do not translate.\n"
+        f"- Use {label} for titles/summaries/keywords in contexts.\n"
+        "- Keep JSON keys and enum values in English.\n"
+    )
+
+
+def _transcription_language_guidance(language: str | None) -> str:
+    label = _resolve_language_label(language)
+    return (
+        "\nLanguage guidance:\n"
+        f"- User language: {label}.\n"
+        "- Transcribe verbatim in the original spoken language; do not translate.\n"
+    )
+
+
+def _summary_language_guidance(language: str | None) -> str:
+    label = _resolve_language_label(language)
+    return (
+        "\n\nLanguage guidance:\n"
+        f"- Use {label} for title/summary/keywords.\n"
+    )
 
 LIFELOG_IMAGE_ANALYSIS_V2_PROMPT = """\
 You are analyzing a personal lifelog photo captured by the user (the camera-holder).
@@ -58,11 +101,12 @@ Return JSON ONLY:
 """
 
 
-def build_lifelog_image_prompt(ocr_text: str | None) -> str:
+def build_lifelog_image_prompt(ocr_text: str | None, language: str | None = None) -> str:
     cleaned = (ocr_text or "").strip()
     if len(cleaned) > 2000:
         cleaned = cleaned[:2000] + "..."
-    return LIFELOG_IMAGE_ANALYSIS_V2_PROMPT.replace(OCR_TEXT_PLACEHOLDER, cleaned or "None")
+    base = LIFELOG_IMAGE_ANALYSIS_V2_PROMPT.replace(OCR_TEXT_PLACEHOLDER, cleaned or "None")
+    return base + _image_language_guidance(language)
 
 
 LIFELOG_TRANSCRIPTION_PROMPT = """\
@@ -72,11 +116,11 @@ Return the verbatim transcript as plain text. Do not add commentary, speaker lab
 """
 
 
-def build_lifelog_transcription_prompt(media_kind: str) -> str:
+def build_lifelog_transcription_prompt(media_kind: str, language: str | None = None) -> str:
     kind = (media_kind or "audio").strip().lower()
     if kind not in {"audio", "video"}:
         kind = "audio"
-    return f"{LIFELOG_TRANSCRIPTION_PROMPT}\nMedia type: {kind}."
+    return f"{LIFELOG_TRANSCRIPTION_PROMPT}\nMedia type: {kind}.{_transcription_language_guidance(language)}"
 
 
 LIFELOG_VIDEO_CHUNK_PROMPT = """\
@@ -150,8 +194,8 @@ Context rules:
 """
 
 
-def build_lifelog_video_chunk_prompt() -> str:
-    return LIFELOG_VIDEO_CHUNK_PROMPT
+def build_lifelog_video_chunk_prompt(language: str | None = None) -> str:
+    return LIFELOG_VIDEO_CHUNK_PROMPT + _media_chunk_language_guidance(language)
 
 
 LIFELOG_AUDIO_CHUNK_PROMPT = """\
@@ -225,8 +269,8 @@ Context rules:
 """
 
 
-def build_lifelog_audio_chunk_prompt() -> str:
-    return LIFELOG_AUDIO_CHUNK_PROMPT
+def build_lifelog_audio_chunk_prompt(language: str | None = None) -> str:
+    return LIFELOG_AUDIO_CHUNK_PROMPT + _media_chunk_language_guidance(language)
 
 
 LIFELOG_EPISODE_SUMMARY_PROMPT = """\
@@ -263,13 +307,15 @@ def build_lifelog_episode_summary_prompt(
     item_count: int,
     time_range: str,
     omitted_count: int = 0,
+    language: str | None = None,
 ) -> str:
-    return LIFELOG_EPISODE_SUMMARY_PROMPT.format(
+    base = LIFELOG_EPISODE_SUMMARY_PROMPT.format(
         ITEM_COUNT=item_count,
         TIME_RANGE=time_range,
         OMITTED_COUNT=omitted_count,
         EPISODE_ITEMS=items_json.strip() or "[]",
     )
+    return base + _summary_language_guidance(language)
 
 
 LIFELOG_CHAT_SYSTEM_PROMPT = """\

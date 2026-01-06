@@ -13,9 +13,11 @@ Implemented:
 - Chat image upload (VLM description) + chat attachments.
 - Downstream agents: Cartoon Day Summary and Day Insights Infographic.
 - Dashboard aggregates + usage metrics.
+- Authentik-backed OIDC authentication (bearer token validation + AuthGate).
+- Settings API + Settings UI (profile, language, timezone, timeline defaults, weekly recap toggle).
 
 Deferred or not implemented yet:
-- Authentication (provider TBD / JWT) and multi-user support.
+- Advanced auth (RBAC, social logins, account management).
 - Memory graph population and graph-based retrieval.
 - Scheduled lifecycle retention jobs.
 - Notion integration and other connectors.
@@ -28,7 +30,7 @@ Deferred or not implemented yet:
 ### Objectives
 - Set up development environment
 - Establish core infrastructure
-- Implement authentication
+- Implement OIDC authentication
 - Create basic database schema
 
 ### Tasks
@@ -95,7 +97,7 @@ Deferred or not implemented yet:
 - [ ] Implement health check endpoint (`/health`) — done
 - [ ] Add CORS middleware for frontend — done
 - [ ] Set up S3-compatible storage integration (RustFS/MinIO/AWS) for presigned uploads — done
-- [ ] Defer JWT authentication middleware until auth is wired
+- [x] OIDC bearer auth middleware (JWKS validation via Authentik) — done
 - [ ] Defer structlog + OpenTelemetry tracing until observability setup
 - [ ] Defer token encryption helper (AES-256-GCM with key rotation schedule) until OAuth tokens are stored
 - [ ] Implement core HTTP endpoints — done:
@@ -106,6 +108,11 @@ Deferred or not implemented yet:
   - `GET /timeline` (timeline feed)
   - `GET /dashboard/stats` (dashboard aggregates)
   - `GET /search` (Qdrant-backed search)
+
+**Authentication (OIDC)**
+- [x] Authentik local stack in `orchestration/docker-compose.dev.yml` with `make authentik-up`
+- [x] API env config: `AUTH_ENABLED=true`, `OIDC_ISSUER_URL`, `OIDC_JWKS_URL`, `OIDC_AUDIENCE`
+- [x] Web env config: `VITE_OIDC_ISSUER_URL`, `VITE_OIDC_CLIENT_ID`, `VITE_OIDC_AUTH_URL`, `VITE_OIDC_TOKEN_URL`
 
 **Storage Abstraction & Presigned URLs**
 - [ ] Implement storage provider interface (memory + S3/RustFS, optional Supabase) — done
@@ -132,7 +139,7 @@ Deferred or not implemented yet:
 - [ ] Flesh out the Ingest tab so manual uploads use `POST /storage/upload-url` + `PUT <signed url>` + `POST /upload/ingest`, and the Google Photos connector UI triggers OAuth, shows sync status, and surfaces retry/manage actions
 - [ ] Build chat + ingestion workflows against the Gemini API via `@google/genai` services, reusing hooks/utilities under `apps/web/services`
 - [ ] Drive the Timeline view from the `/timeline` API (daily activity heatmap + detail drawer per day showing photos, videos, summaries) and hydrate the Dashboard components with stats returned by `/dashboard/stats`
-- [ ] Add lightweight routing or state persistence as needed (URL params or Zustand) instead of server-side routing, and gate authenticated data fetches through the future auth layer once backend endpoints exist
+- [ ] Add lightweight routing or state persistence as needed (URL params or Zustand) instead of server-side routing; auth gating now handled via AuthGate + bearer tokens
 
 **Docker Compose for Local Development**
 - [ ] Create `docker-compose.yml`:
@@ -396,18 +403,22 @@ Reference: `docs/minecontext/lifelog_ingestion_rag_design.md`
 - [x] Dashboard API: `/dashboard/stats` with activity, recent items, AI usage, storage totals
 - [x] Dashboard UI: stat cards, ingestion activity chart, AI usage chart, recent memories linking to timeline
 - [x] Basic tests: `services/api/tests/test_timeline.py`, `services/api/tests/test_dashboard.py`, `apps/web/tests/ingest-flow.spec.ts`
+- [x] Authentik OIDC auth (API JWKS validation + web AuthGate)
+- [x] Global Error Boundary + event-driven toast notifications for API failures
+- [x] Settings API + Settings UI (profile, language, timezone, timeline defaults, weekly recap toggle)
+- [x] Weekly recap task + Celery beat schedule + manual trigger endpoint (`POST /settings/weekly-recap`)
 
 ### Remaining (Week 9-10 Focus)
 
 **Monitoring & Instrumentation**
-- [ ] Enable Prometheus stack in `orchestration/docker-compose.dev.yml` (celery-exporter, Prometheus, Grafana)
+- [x] Enable Prometheus stack in `orchestration/docker-compose.dev.yml` (celery-exporter, Prometheus, Grafana) and `make observability`
 - [ ] Update `orchestration/prometheus.yml` to scrape API `/metrics` (container or `host.docker.internal`)
 - [ ] Add Grafana datasource provisioning + starter dashboards (ingest throughput, task latency, chat latency, model spend)
 - [ ] Optional: run Flower for Celery task debugging
 
 **Error Handling & Loading States**
-- [ ] Add a global Error Boundary + fallback UI
-- [ ] Add toast notifications (e.g. Sonner) for API failures
+- [x] Add a global Error Boundary + fallback UI
+- [x] Add toast notifications for API failures
 - [ ] Add consistent skeletons/spinners for Timeline/Dashboard/Chat fetches
 
 **UI/UX Polish**

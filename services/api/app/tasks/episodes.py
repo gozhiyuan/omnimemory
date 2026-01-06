@@ -27,6 +27,7 @@ from ..db.models import (
 )
 from ..db.session import isolated_session
 from ..pipeline.utils import build_vector_text, ensure_tz_aware, extract_keywords, parse_iso_datetime
+from ..user_settings import fetch_user_settings, resolve_language_code, resolve_language_label
 from ..vectorstore import delete_context_embeddings, search_contexts, upsert_context_embeddings
 
 
@@ -163,6 +164,7 @@ async def _generate_episode_summary(
     start_time: datetime,
     end_time: datetime,
     user_id: UUID,
+    language: str | None = None,
 ) -> Optional[dict[str, Any]]:
     if settings.video_understanding_provider != "gemini":
         return None
@@ -175,6 +177,7 @@ async def _generate_episode_summary(
         item_count=item_count,
         time_range=time_range,
         omitted_count=omitted_count,
+        language=language,
     )
     response = await summarize_text_with_gemini(
         prompt=prompt,
@@ -374,24 +377,54 @@ def _build_daily_summary(episodes: list[ProcessedContext], summary_date: date) -
     return _daily_summary_title(summary_date), summary, keywords
 
 
-def _summary_window(summary_date: date) -> tuple[datetime, datetime]:
-    start = datetime.combine(summary_date, datetime.min.time(), tzinfo=timezone.utc)
+def _summary_window(summary_date: date, tz_offset_minutes: Optional[int] = None) -> tuple[datetime, datetime]:
+    offset = timedelta(minutes=tz_offset_minutes or 0)
+    start = datetime.combine(summary_date, datetime.min.time(), tzinfo=timezone.utc) + offset
     end = start + timedelta(days=1)
     return start, end
 
 
-async def _update_daily_summary(session, user_id: UUID, summary_date: date) -> None:
-    start, end = _summary_window(summary_date)
-    summary_context_stmt = (
-        select(ProcessedContext)
-        .where(
-            ProcessedContext.user_id == user_id,
-            ProcessedContext.is_episode.is_(True),
-            ProcessedContext.context_type == "daily_summary",
-            ProcessedContext.processor_versions["daily_summary_date"].astext == summary_date.isoformat(),
+async def _update_daily_summary(
+    session,
+    user_id: UUID,
+    summary_date: date,
+    tz_offset_minutes: Optional[int] = None,
+    context_id: Optional[UUID] = None,
+    force_regen: bool = False,
+) -> None:
+    start, end = _summary_window(summary_date, tz_offset_minutes=tz_offset_minutes)
+    summary_contexts: list[ProcessedContext] = []
+    summary_context: Optional[ProcessedContext] = None
+    existing_summary_date: Optional[date] = None
+
+    if context_id:
+        context = await session.get(ProcessedContext, context_id)
+        if (
+            context
+            and context.user_id == user_id
+            and context.context_type == "daily_summary"
+            and context.is_episode
+        ):
+            summary_contexts = [context]
+            summary_context = context
+    if summary_context is None:
+        date_keys = {summary_date.isoformat()}
+        if tz_offset_minutes is not None:
+            utc_key = start.date().isoformat()
+            date_keys.add(utc_key)
+        summary_context_stmt = (
+            select(ProcessedContext)
+            .where(
+                ProcessedContext.user_id == user_id,
+                ProcessedContext.is_episode.is_(True),
+                ProcessedContext.context_type == "daily_summary",
+                ProcessedContext.processor_versions["daily_summary_date"].astext.in_(list(date_keys)),
+            )
+            .order_by(ProcessedContext.created_at.desc())
         )
-        .order_by(ProcessedContext.created_at.desc())
-    )
+        summary_context_rows = await session.execute(summary_context_stmt)
+        summary_contexts = list(summary_context_rows.scalars().all())
+        summary_context = summary_contexts[0] if summary_contexts else None
     episode_stmt = select(ProcessedContext).where(
         ProcessedContext.user_id == user_id,
         ProcessedContext.is_episode.is_(True),
@@ -402,9 +435,15 @@ async def _update_daily_summary(session, user_id: UUID, summary_date: date) -> N
     )
     episode_rows = await session.execute(episode_stmt)
     episodes = list(episode_rows.scalars().all())
-    summary_context_rows = await session.execute(summary_context_stmt)
-    summary_contexts = list(summary_context_rows.scalars().all())
-    summary_context = summary_contexts[0] if summary_contexts else None
+    if summary_context:
+        processor_versions = summary_context.processor_versions or {}
+        if isinstance(processor_versions, dict):
+            date_value = processor_versions.get("daily_summary_date")
+            if date_value:
+                try:
+                    existing_summary_date = date.fromisoformat(date_value)
+                except ValueError:
+                    existing_summary_date = None
     if not episodes:
         if summary_contexts:
             for context in summary_contexts:
@@ -414,19 +453,77 @@ async def _update_daily_summary(session, user_id: UUID, summary_date: date) -> N
                 delete_context_embeddings([str(context.id) for context in summary_contexts])
             except Exception as exc:  # pragma: no cover - external service dependency
                 logger.warning("Daily summary embedding delete failed: {}", exc)
-        await session.execute(
-            delete(DailySummary).where(
-                DailySummary.user_id == user_id,
-                DailySummary.summary_date == summary_date,
+        delete_dates = {summary_date}
+        if existing_summary_date:
+            delete_dates.add(existing_summary_date)
+        for target_date in delete_dates:
+            await session.execute(
+                delete(DailySummary).where(
+                    DailySummary.user_id == user_id,
+                    DailySummary.summary_date == target_date,
+                )
             )
-        )
         return
+    summary_source_items: list[UUID] = []
+    for episode in episodes:
+        summary_source_items.extend(episode.source_item_ids or [])
+    summary_source_items = list(dict.fromkeys(summary_source_items))[:200]
+    if summary_context:
+        processor_versions = summary_context.processor_versions or {}
+        if isinstance(processor_versions, dict) and force_regen:
+            processor_versions.pop("edited_by_user", None)
+        if isinstance(processor_versions, dict) and processor_versions.get("edited_by_user"):
+            summary_context.source_item_ids = summary_source_items
+            summary_context.event_time_utc = start
+            summary_context.start_time_utc = start
+            summary_context.end_time_utc = end
+            processor_versions["daily_summary_date"] = summary_date.isoformat()
+            if tz_offset_minutes is not None:
+                processor_versions["tz_offset_minutes"] = tz_offset_minutes
+            summary_context.processor_versions = processor_versions
+            await session.flush()
+
+            summary_metadata = {
+                "episode_count": len(episodes),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "edited_by_user": True,
+            }
+            if tz_offset_minutes is not None:
+                summary_metadata["tz_offset_minutes"] = tz_offset_minutes
+            daily_table = DailySummary.__table__
+            daily_upsert = insert(daily_table).values(
+                {
+                    daily_table.c.user_id: user_id,
+                    daily_table.c.summary_date: summary_date,
+                    daily_table.c.summary: summary_context.summary,
+                    daily_table.c.metadata: summary_metadata,
+                }
+            )
+            daily_upsert = daily_upsert.on_conflict_do_update(
+                index_elements=[daily_table.c.user_id, daily_table.c.summary_date],
+                set_={
+                    daily_table.c.summary: summary_context.summary,
+                    daily_table.c.metadata: summary_metadata,
+                },
+            )
+            await session.execute(daily_upsert)
+            if existing_summary_date and existing_summary_date != summary_date:
+                await session.execute(
+                    delete(DailySummary).where(
+                        DailySummary.user_id == user_id,
+                        DailySummary.summary_date == existing_summary_date,
+                    )
+                )
+            return
+
     title, summary, keywords = _build_daily_summary(episodes, summary_date)
 
     summary_metadata = {
         "episode_count": len(episodes),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+    if tz_offset_minutes is not None:
+        summary_metadata["tz_offset_minutes"] = tz_offset_minutes
     daily_table = DailySummary.__table__
     daily_upsert = insert(daily_table).values(
         {
@@ -444,15 +541,19 @@ async def _update_daily_summary(session, user_id: UUID, summary_date: date) -> N
         },
     )
     await session.execute(daily_upsert)
-
-    summary_source_items: list[UUID] = []
-    for episode in episodes:
-        summary_source_items.extend(episode.source_item_ids or [])
-    summary_source_items = list(dict.fromkeys(summary_source_items))[:200]
+    if existing_summary_date and existing_summary_date != summary_date:
+        await session.execute(
+            delete(DailySummary).where(
+                DailySummary.user_id == user_id,
+                DailySummary.summary_date == existing_summary_date,
+            )
+        )
     processor_versions = {
         "daily_summary": "v1",
         "daily_summary_date": summary_date.isoformat(),
     }
+    if tz_offset_minutes is not None:
+        processor_versions["tz_offset_minutes"] = tz_offset_minutes
     if summary_context is None:
         summary_context = ProcessedContext(
             user_id=user_id,
@@ -494,6 +595,9 @@ async def _update_episode_for_item(item_id: str) -> dict[str, Any]:
             return {"status": "missing_item"}
         if item.processing_status != "completed":
             return {"status": "not_ready"}
+
+        user_settings = await fetch_user_settings(session, item.user_id)
+        language = resolve_language_label(resolve_language_code(user_settings))
 
         context_stmt = select(ProcessedContext).where(
             ProcessedContext.user_id == item.user_id,
@@ -663,6 +767,7 @@ async def _update_episode_for_item(item_id: str) -> dict[str, Any]:
                     start_time=start_time,
                     end_time=end_time,
                     user_id=item.user_id,
+                    language=language,
                 )
 
         episode_records = _build_episode_context_records(
@@ -680,8 +785,43 @@ async def _update_episode_for_item(item_id: str) -> dict[str, Any]:
             session.add(record)
         await session.flush()
         upsert_context_embeddings(episode_records)
+        summary_date = start_time.date()
+        summary_context: Optional[ProcessedContext] = None
+        summary_tz_offset: Optional[int] = None
+        summary_context_stmt = select(ProcessedContext).where(
+            ProcessedContext.user_id == item.user_id,
+            ProcessedContext.is_episode.is_(True),
+            ProcessedContext.context_type == "daily_summary",
+            ProcessedContext.start_time_utc.is_not(None),
+            ProcessedContext.end_time_utc.is_not(None),
+            ProcessedContext.start_time_utc <= start_time,
+            ProcessedContext.end_time_utc > start_time,
+        ).order_by(ProcessedContext.created_at.desc())
+        summary_rows = await session.execute(summary_context_stmt)
+        summary_context = summary_rows.scalars().first()
+        if summary_context:
+            versions = summary_context.processor_versions or {}
+            if isinstance(versions, dict):
+                date_value = versions.get("daily_summary_date")
+                if date_value:
+                    try:
+                        summary_date = date.fromisoformat(date_value)
+                    except ValueError:
+                        summary_date = start_time.date()
+                offset_value = versions.get("tz_offset_minutes")
+                if offset_value is not None:
+                    try:
+                        summary_tz_offset = int(offset_value)
+                    except (TypeError, ValueError):
+                        summary_tz_offset = None
 
-        await _update_daily_summary(session, item.user_id, start_time.date())
+        await _update_daily_summary(
+            session,
+            item.user_id,
+            summary_date,
+            tz_offset_minutes=summary_tz_offset,
+            context_id=summary_context.id if summary_context else None,
+        )
         await session.commit()
 
     return {
@@ -702,7 +842,11 @@ def update_episode_for_item(item_id: str) -> dict[str, Any]:
 
 
 @celery_app.task(name="episodes.update_daily_summary")
-def update_daily_summary(user_id: str | None, summary_date: str) -> dict[str, Any]:
+def update_daily_summary(
+    user_id: str | None,
+    summary_date: str,
+    tz_offset_minutes: int | None = None,
+) -> dict[str, Any]:
     try:
         summary_day = date.fromisoformat(summary_date)
     except ValueError:
@@ -712,7 +856,12 @@ def update_daily_summary(user_id: str | None, summary_date: str) -> dict[str, An
 
     async def _run() -> None:
         async with isolated_session() as session:
-            await _update_daily_summary(session, resolved_user, summary_day)
+            await _update_daily_summary(
+                session,
+                resolved_user,
+                summary_day,
+                tz_offset_minutes=tz_offset_minutes,
+            )
             await session.commit()
 
     try:

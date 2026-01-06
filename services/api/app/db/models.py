@@ -47,6 +47,25 @@ class User(Base):
     items: Mapped[list["SourceItem"]] = relationship(back_populates="user")
 
 
+class UserSettings(Base):
+    __tablename__ = "user_settings"
+    __table_args__ = (UniqueConstraint("user_id", name="user_settings_user_id_idx"),)
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"))
+    settings: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("NOW()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("NOW()"), nullable=False
+    )
+
+    user: Mapped[User] = relationship()
+
+
 class DataConnection(Base):
     __tablename__ = "data_connections"
 
@@ -204,6 +223,29 @@ class ProcessedContext(Base):
     vector_text: Mapped[str] = mapped_column(Text, nullable=False)
     processor_versions: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("NOW()"), nullable=False
+    )
+
+
+class TimelineDayHighlight(Base):
+    __tablename__ = "timeline_day_highlights"
+    __table_args__ = (
+        UniqueConstraint("user_id", "highlight_date", name="timeline_day_highlights_user_date_key"),
+        Index("timeline_day_highlights_user_date_idx", "user_id", "highlight_date"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"))
+    highlight_date: Mapped[date] = mapped_column(Date, nullable=False)
+    source_item_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("source_items.id", ondelete="CASCADE")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("NOW()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("NOW()"), nullable=False
     )
 
@@ -424,6 +466,7 @@ __all__ = [
     "DerivedArtifact",
     "ProcessedContext",
     "DailySummary",
+    "UserSettings",
     "AiUsageEvent",
     "DEFAULT_TEST_USER_ID",
 ]

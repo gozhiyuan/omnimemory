@@ -106,10 +106,15 @@ async def _ingest_media_item(
             session_id,
         )
         return None
-    download_url = _build_download_url(base_url, mime_type)
-    storage_key = f"google_photos/{connection.user_id}/{media_id}/{_infer_filename(media_id, filename, mime_type)}"
     mime_type = mime_type or "application/octet-stream"
     captured_at = parse_google_timestamp(creation_time)
+    key_date = (captured_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    inferred_name = _infer_filename(media_id, filename, mime_type)
+    desired_storage_key = (
+        f"google_photos/{connection.user_id}/{key_date:%Y/%m/%d}/{media_id}-{inferred_name}"
+    )
+    download_url = _build_download_url(base_url, mime_type)
+    storage_key = desired_storage_key
 
     storage = get_storage_provider()
 
@@ -125,7 +130,11 @@ async def _ingest_media_item(
         )
         existing = result.scalar_one_or_none()
         if existing:
-            existing.storage_key = storage_key
+            if existing.storage_key and not existing.storage_key.startswith(("http://", "https://")):
+                storage_key = existing.storage_key
+            else:
+                existing.storage_key = desired_storage_key
+                storage_key = desired_storage_key
             existing.content_type = existing.content_type or mime_type
             existing.original_filename = existing.original_filename or filename
             existing.provider = existing.provider or "google_photos"
@@ -190,11 +199,17 @@ async def _ingest_media_item(
     return source_item.id
 
 
-async def _sync_google_photos(session_id: Optional[str]) -> dict[str, Any]:
+async def _sync_google_photos(session_id: Optional[str], user_id: Optional[str]) -> dict[str, Any]:
+    resolved_user_id = DEFAULT_TEST_USER_ID
+    if user_id:
+        try:
+            resolved_user_id = UUID(user_id)
+        except (TypeError, ValueError):
+            resolved_user_id = DEFAULT_TEST_USER_ID
     async with isolated_session() as session:
         result = await session.execute(
             select(DataConnection).where(
-                DataConnection.user_id == DEFAULT_TEST_USER_ID,
+                DataConnection.user_id == resolved_user_id,
                 DataConnection.provider == "google_photos",
             )
         )
@@ -235,11 +250,11 @@ async def _sync_google_photos(session_id: Optional[str]) -> dict[str, Any]:
 
 
 @celery_app.task(name="integrations.google_photos.sync", bind=True)
-def sync_google_photos_media(self, session_id: Optional[str] = None) -> dict[str, Any]:
+def sync_google_photos_media(self, session_id: Optional[str] = None, user_id: Optional[str] = None) -> dict[str, Any]:
     """Fetch Google Photos media items and enqueue ingestion."""
 
     try:
-        return asyncio.run(_sync_google_photos(session_id))
+        return asyncio.run(_sync_google_photos(session_id, user_id))
     except Exception as exc:  # pragma: no cover - task boundary
         logger.exception("Google Photos sync failed: {}", exc)
         raise

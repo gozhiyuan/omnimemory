@@ -1,11 +1,12 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import { Calendar, ChevronLeft, ChevronRight, FileText, Image as ImageIcon, Mic, Play, Search, UploadCloud, Video, X } from 'lucide-react';
-import { apiDelete, apiGet, apiPatch, apiPost } from '../services/api';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Calendar, ChevronLeft, ChevronRight, FileText, Image as ImageIcon, Mic, Play, Search, Star, UploadCloud, Video, X } from 'lucide-react';
+import { apiDelete, apiGet, apiPatch, apiPost, apiPostForm } from '../services/api';
 import {
   IngestResponse,
   SearchResponse,
   SearchResult,
   TimelineDay,
+  TimelineDailySummary,
   TimelineEpisode,
   TimelineEpisodeDetail,
   TimelineItem,
@@ -15,38 +16,73 @@ import {
   TimelineViewMode,
   UploadUrlResponse,
 } from '../types';
+import { PageMotion } from './PageMotion';
+import { useSettings } from '../contexts/SettingsContext';
+import { translateFromStorage } from '../i18n/core';
+import { useI18n } from '../i18n/useI18n';
+import {
+  addDaysZoned,
+  buildZonedDate,
+  dateKeyToDate,
+  formatDateKey,
+  getDateParts,
+  getTimeZoneOffsetMinutes,
+  parseDateKey,
+  toZonedDate,
+} from '../utils/time';
 
 type ViewMode = TimelineViewMode;
+type EpisodeCard = TimelineEpisode & {
+  isSynthetic?: boolean;
+  syntheticItemId?: string;
+};
 
-const formatDate = (value?: string) => {
-  if (!value) return 'Unknown date';
-  return new Date(value).toLocaleDateString(undefined, {
+const formatDate = (value: string | Date | undefined, locale: string, timeZone: string) => {
+  if (!value) return translateFromStorage('Unknown date');
+  const parsed = typeof value === 'string' ? new Date(value) : value;
+  if (Number.isNaN(parsed.getTime())) {
+    return translateFromStorage('Unknown date');
+  }
+  return new Intl.DateTimeFormat(locale, {
+    timeZone,
     year: 'numeric',
     month: 'short',
     day: 'numeric',
-  });
+  }).format(parsed);
 };
 
-const formatMonthLabel = (value: Date) =>
-  value.toLocaleDateString(undefined, { month: 'long' });
+const formatMonthLabel = (value: Date, locale: string, timeZone: string) =>
+  new Intl.DateTimeFormat(locale, { timeZone, month: 'long' }).format(value);
 
-const formatDayLabel = (value: Date) =>
-  value.toLocaleDateString(undefined, { weekday: 'short' });
+const formatDayLabel = (value: Date, locale: string, timeZone: string) =>
+  new Intl.DateTimeFormat(locale, { timeZone, weekday: 'short' }).format(value);
 
 const buildLabel = (item: TimelineItem) =>
-  item.caption || item.original_filename || `${item.item_type} upload`;
+  item.caption ||
+  item.original_filename ||
+  translateFromStorage('{type} upload', { type: translateFromStorage(item.item_type) });
 
-const formatTime = (value?: string) => {
-  if (!value) return 'Unknown time';
-  return new Date(value).toLocaleTimeString(undefined, {
+const formatTime = (value: string | Date | undefined, locale: string, timeZone: string) => {
+  if (!value) return translateFromStorage('Unknown time');
+  const parsed = typeof value === 'string' ? new Date(value) : value;
+  if (Number.isNaN(parsed.getTime())) {
+    return translateFromStorage('Unknown time');
+  }
+  return new Intl.DateTimeFormat(locale, {
+    timeZone,
     hour: 'numeric',
     minute: '2-digit',
-  });
+  }).format(parsed);
 };
 
-const formatTimeRange = (start?: string | null, end?: string | null) => {
-  if (!start || !end) return 'Time window unknown';
-  return `${formatTime(start)} - ${formatTime(end)}`;
+const formatTimeRange = (
+  start: string | null | undefined,
+  end: string | null | undefined,
+  locale: string,
+  timeZone: string
+) => {
+  if (!start || !end) return translateFromStorage('Time window unknown');
+  return `${formatTime(start, locale, timeZone)} - ${formatTime(end, locale, timeZone)}`;
 };
 
 const formatDuration = (ms: number) => {
@@ -56,14 +92,19 @@ const formatDuration = (ms: number) => {
   return `${minutes}:${seconds.toString().padStart(2, '0')}`;
 };
 
-const formatClockTime = (value: Date) =>
-  value.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+const formatClockTime = (value: Date, locale: string, timeZone: string) =>
+  new Intl.DateTimeFormat(locale, {
+    timeZone,
+    hour: 'numeric',
+    minute: '2-digit',
+  }).format(value);
 
-const buildDateWithTime = (value: Date, timeValue: string) => {
+const buildDateWithTime = (value: Date, timeValue: string, timeZone: string) => {
   const [hours, minutes] = timeValue.split(':').map((part) => Number(part));
-  const next = new Date(value);
-  next.setHours(Number.isFinite(hours) ? hours : 0, Number.isFinite(minutes) ? minutes : 0, 0, 0);
-  return next;
+  const safeHours = Number.isFinite(hours) ? hours : 0;
+  const safeMinutes = Number.isFinite(minutes) ? minutes : 0;
+  const { year, month, day } = getDateParts(value, timeZone);
+  return buildZonedDate(year, month, day, timeZone, safeHours, safeMinutes);
 };
 
 const inferItemType = (file: File) => {
@@ -97,70 +138,91 @@ const getMediaDuration = (file: File): Promise<number | null> => {
   });
 };
 
-const toDateKey = (value: Date) => {
-  const year = value.getFullYear();
-  const month = `${value.getMonth() + 1}`.padStart(2, '0');
-  const day = `${value.getDate()}`.padStart(2, '0');
-  return `${year}-${month}-${day}`;
+const addMonthsZoned = (value: Date, months: number, timeZone: string) => {
+  const { year, month, day } = getDateParts(value, timeZone);
+  return buildZonedDate(year, month + months, day, timeZone);
 };
 
-const startOfWeek = (value: Date) => {
-  const date = new Date(value);
-  const day = (date.getDay() + 6) % 7;
-  date.setDate(date.getDate() - day);
-  return date;
+const addYearsZoned = (value: Date, years: number, timeZone: string) => {
+  const { year, month, day } = getDateParts(value, timeZone);
+  return buildZonedDate(year + years, month, day, timeZone);
 };
 
-const endOfWeek = (value: Date) => {
-  const start = startOfWeek(value);
-  const end = new Date(start);
-  end.setDate(end.getDate() + 6);
-  return end;
+const startOfWeek = (value: Date, timeZone: string) => {
+  const { year, month, day } = getDateParts(value, timeZone);
+  const weekday = new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+  const offset = (weekday + 6) % 7;
+  return addDaysZoned(value, -offset, timeZone);
 };
 
-const startOfMonth = (value: Date) => new Date(value.getFullYear(), value.getMonth(), 1);
-const endOfMonth = (value: Date) => new Date(value.getFullYear(), value.getMonth() + 1, 0);
+const endOfWeek = (value: Date, timeZone: string) =>
+  addDaysZoned(startOfWeek(value, timeZone), 6, timeZone);
 
-const startOfYear = (value: Date) => new Date(value.getFullYear(), 0, 1);
-const endOfYear = (value: Date) => new Date(value.getFullYear(), 11, 31);
+const startOfMonth = (value: Date, timeZone: string) => {
+  const { year, month } = getDateParts(value, timeZone);
+  return buildZonedDate(year, month, 1, timeZone);
+};
 
-const formatRangeLabel = (view: ViewMode, anchor: Date) => {
+const endOfMonth = (value: Date, timeZone: string) => {
+  const { year, month } = getDateParts(value, timeZone);
+  return buildZonedDate(year, month + 1, 0, timeZone);
+};
+
+const startOfYear = (value: Date, timeZone: string) => {
+  const { year } = getDateParts(value, timeZone);
+  return buildZonedDate(year, 1, 1, timeZone);
+};
+
+const endOfYear = (value: Date, timeZone: string) => {
+  const { year } = getDateParts(value, timeZone);
+  return buildZonedDate(year, 12, 31, timeZone);
+};
+
+const formatRangeLabel = (view: ViewMode, anchor: Date, locale: string, timeZone: string) => {
   if (view === 'day') {
-    return anchor.toLocaleDateString(undefined, {
+    return new Intl.DateTimeFormat(locale, {
+      timeZone,
       weekday: 'long',
       month: 'short',
       day: 'numeric',
-    });
+    }).format(anchor);
   }
   if (view === 'week') {
-    const start = startOfWeek(anchor);
-    const end = endOfWeek(anchor);
-    return `${start.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} - ${end.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`;
+    const start = startOfWeek(anchor, timeZone);
+    const end = endOfWeek(anchor, timeZone);
+    const formatter = new Intl.DateTimeFormat(locale, { timeZone, month: 'short', day: 'numeric' });
+    return `${formatter.format(start)} - ${formatter.format(end)}`;
   }
   if (view === 'month') {
-    return anchor.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+    return new Intl.DateTimeFormat(locale, { timeZone, month: 'long', year: 'numeric' }).format(anchor);
   }
   if (view === 'all') {
-    return 'All time';
+    return translateFromStorage('All time');
   }
-  return anchor.getFullYear().toString();
+  return getDateParts(anchor, timeZone).year.toString();
 };
 
-const buildDateRange = (start: Date, end: Date) => {
+const buildDateRange = (start: Date, end: Date, timeZone: string) => {
   const dates: Date[] = [];
-  const cursor = new Date(start);
+  let cursor = start;
   while (cursor <= end) {
-    dates.push(new Date(cursor));
-    cursor.setDate(cursor.getDate() + 1);
+    dates.push(cursor);
+    cursor = addDaysZoned(cursor, 1, timeZone);
   }
   return dates;
 };
 
-const buildMonthGrid = (anchor: Date) =>
-  buildDateRange(startOfWeek(startOfMonth(anchor)), endOfWeek(endOfMonth(anchor)));
+const buildMonthGrid = (anchor: Date, timeZone: string) => {
+  const gridStart = startOfWeek(startOfMonth(anchor, timeZone), timeZone);
+  const gridEnd = endOfWeek(endOfMonth(anchor, timeZone), timeZone);
+  return buildDateRange(gridStart, gridEnd, timeZone);
+};
 
-const isSameMonth = (value: Date, anchor: Date) =>
-  value.getFullYear() === anchor.getFullYear() && value.getMonth() === anchor.getMonth();
+const isSameMonth = (value: Date, anchor: Date, timeZone: string) => {
+  const left = getDateParts(value, timeZone);
+  const right = getDateParts(anchor, timeZone);
+  return left.year === right.year && left.month === right.month;
+};
 
 const getThumbnail = (item: TimelineItem) => {
   if (item.item_type === 'video') return item.poster_url || null;
@@ -168,12 +230,13 @@ const getThumbnail = (item: TimelineItem) => {
   return null;
 };
 
-const VIEW_LABELS: Record<ViewMode, string> = {
-  day: 'Day',
-  week: 'Week',
-  month: 'Month',
-  year: 'Year',
-  all: 'All',
+const getDayThumbnail = (day?: TimelineDay, preferHighlight = true) => {
+  if (!day) return null;
+  if (preferHighlight && day.highlight?.thumbnail_url) {
+    return day.highlight.thumbnail_url;
+  }
+  const previewItem = day.items.find((item) => getThumbnail(item));
+  return previewItem ? getThumbnail(previewItem) : null;
 };
 
 const VIEW_MODES: ViewMode[] = ['day', 'week', 'month', 'year', 'all'];
@@ -188,12 +251,18 @@ interface TimelineProps {
 }
 
 export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => {
+  const { settings } = useSettings();
+  const { t, locale } = useI18n();
+  const timelinePrefs = settings.timeline;
+  const timeZone = settings.preferences.timezone;
   const [days, setDays] = useState<TimelineDay[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>('day');
-  const [anchorDate, setAnchorDate] = useState<Date>(() => new Date());
+  const [viewInitialized, setViewInitialized] = useState(false);
+  const [anchorDate, setAnchorDate] = useState<Date>(() => toZonedDate(new Date(), timeZone));
+  const previousTimeZone = useRef(timeZone);
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
   const [selectedEpisodeId, setSelectedEpisodeId] = useState<string | null>(null);
   const [detail, setDetail] = useState<TimelineItemDetail | null>(null);
@@ -224,6 +293,21 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [pendingSelection, setPendingSelection] = useState<{ itemId?: string; episodeContextId?: string } | null>(null);
+
+  const showHighlights = timelinePrefs.showHighlights;
+  const showEpisodes = timelinePrefs.showEpisodes;
+  const showCaptions = timelinePrefs.showCaptions;
+  const [highlightSavingId, setHighlightSavingId] = useState<string | null>(null);
+  const [highlightClearing, setHighlightClearing] = useState(false);
+  const [highlightError, setHighlightError] = useState<string | null>(null);
+  const [dailySummaryEditOpen, setDailySummaryEditOpen] = useState(false);
+  const [dailySummaryTitle, setDailySummaryTitle] = useState('');
+  const [dailySummaryText, setDailySummaryText] = useState('');
+  const [dailySummarySaving, setDailySummarySaving] = useState(false);
+  const [dailySummaryResetting, setDailySummaryResetting] = useState(false);
+  const [dailySummaryError, setDailySummaryError] = useState<string | null>(null);
+  const [dailySummaryVoiceLoading, setDailySummaryVoiceLoading] = useState(false);
+  const [dailySummaryVoiceError, setDailySummaryVoiceError] = useState<string | null>(null);
   const [dayItems, setDayItems] = useState<TimelineItem[]>([]);
   const [dayOffset, setDayOffset] = useState(0);
   const [dayTotal, setDayTotal] = useState(0);
@@ -234,6 +318,29 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
   const [allTotal, setAllTotal] = useState(0);
   const [allLoading, setAllLoading] = useState(false);
   const [allError, setAllError] = useState<string | null>(null);
+  const viewLabels = useMemo(
+    () => ({
+      day: t('Day'),
+      week: t('Week'),
+      month: t('Month'),
+      year: t('Year'),
+      all: t('All'),
+    }),
+    [t]
+  );
+  const itemTypeLabels = useMemo(
+    () => ({
+      photo: t('Photo'),
+      video: t('Video'),
+      audio: t('Audio'),
+      document: t('Document'),
+    }),
+    [t]
+  );
+  const formatContextType = (value?: string | null) => {
+    if (!value) return '';
+    return t(value.replace(/_/g, ' '));
+  };
 
   const range = useMemo(() => {
     if (viewMode === 'day') {
@@ -243,13 +350,26 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
       return { start: anchorDate, end: anchorDate };
     }
     if (viewMode === 'week') {
-      return { start: startOfWeek(anchorDate), end: endOfWeek(anchorDate) };
+      return { start: startOfWeek(anchorDate, timeZone), end: endOfWeek(anchorDate, timeZone) };
     }
     if (viewMode === 'month') {
-      return { start: startOfMonth(anchorDate), end: endOfMonth(anchorDate) };
+      return { start: startOfMonth(anchorDate, timeZone), end: endOfMonth(anchorDate, timeZone) };
     }
-    return { start: startOfYear(anchorDate), end: endOfYear(anchorDate) };
-  }, [viewMode, anchorDate]);
+    return { start: startOfYear(anchorDate, timeZone), end: endOfYear(anchorDate, timeZone) };
+  }, [viewMode, anchorDate, timeZone]);
+
+  useEffect(() => {
+    if (previousTimeZone.current === timeZone) {
+      return;
+    }
+    setAnchorDate((prev) => {
+      const previousZone = previousTimeZone.current;
+      const dateKey = formatDateKey(prev, previousZone);
+      const rebased = dateKeyToDate(dateKey, timeZone);
+      return rebased ?? toZonedDate(new Date(), timeZone);
+    });
+    previousTimeZone.current = timeZone;
+  }, [timeZone]);
 
   useEffect(() => {
     if (viewMode === 'all') {
@@ -261,11 +381,11 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
       setLoading(true);
       setError(null);
       try {
-        const tzOffsetMinutes = range.start.getTimezoneOffset();
+        const tzOffsetMinutes = getTimeZoneOffsetMinutes(range.start, timeZone);
         const limit = viewMode === 'day' ? '1' : '600';
         const query = new URLSearchParams({
-          start_date: toDateKey(range.start),
-          end_date: toDateKey(range.end),
+          start_date: formatDateKey(range.start, timeZone),
+          end_date: formatDateKey(range.end, timeZone),
           limit,
           tz_offset_minutes: tzOffsetMinutes.toString(),
         });
@@ -275,7 +395,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
         }
       } catch (err) {
         if (mounted) {
-          setError(err instanceof Error ? err.message : 'Failed to load timeline.');
+          setError(err instanceof Error ? err.message : t('Failed to load timeline.'));
         }
       } finally {
         if (mounted) {
@@ -287,7 +407,22 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     return () => {
       mounted = false;
     };
-  }, [range, reloadKey, viewMode]);
+  }, [range, reloadKey, viewMode, timeZone]);
+
+  useEffect(() => {
+    if (viewInitialized) {
+      return;
+    }
+    if (focus?.viewMode) {
+      setViewMode(focus.viewMode);
+      setViewInitialized(true);
+      return;
+    }
+    if (timelinePrefs.defaultView && viewMode !== timelinePrefs.defaultView) {
+      setViewMode(timelinePrefs.defaultView);
+    }
+    setViewInitialized(true);
+  }, [focus?.viewMode, timelinePrefs.defaultView, viewInitialized, viewMode]);
 
   useEffect(() => {
     if (!focus) {
@@ -295,11 +430,12 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     }
     if (focus.viewMode) {
       setViewMode(focus.viewMode);
+      setViewInitialized(true);
     }
     if (focus.anchorDate) {
       const parsed = new Date(focus.anchorDate);
       if (!Number.isNaN(parsed.getTime())) {
-        setAnchorDate(parsed);
+        setAnchorDate(toZonedDate(parsed, timeZone));
       }
     }
     if (focus.itemId || focus.episodeContextId) {
@@ -313,7 +449,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
       setPendingSelection(null);
     }
     onFocusHandled?.();
-  }, [focus, onFocusHandled]);
+  }, [focus, onFocusHandled, timeZone]);
 
   const dayLookup = useMemo(() => {
     const map = new Map<string, TimelineDay>();
@@ -323,13 +459,13 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     return map;
   }, [days]);
 
-  const dayKey = useMemo(() => toDateKey(anchorDate), [anchorDate]);
+  const dayKey = useMemo(() => formatDateKey(anchorDate, timeZone), [anchorDate, timeZone]);
   const dayEpisodes = useMemo(() => {
-    if (viewMode !== 'day') {
+    if (viewMode !== 'day' || !showEpisodes) {
       return [];
     }
     return dayLookup.get(dayKey)?.episodes ?? [];
-  }, [dayLookup, dayKey, viewMode]);
+  }, [dayLookup, dayKey, showEpisodes, viewMode]);
 
   const daySummary = useMemo(() => {
     if (viewMode !== 'day') {
@@ -337,6 +473,31 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     }
     return dayLookup.get(dayKey)?.daily_summary ?? null;
   }, [dayLookup, dayKey, viewMode]);
+
+  const dayHighlight = useMemo(() => {
+    if (viewMode !== 'day') {
+      return null;
+    }
+    return dayLookup.get(dayKey)?.highlight ?? null;
+  }, [dayLookup, dayKey, viewMode]);
+
+  useEffect(() => {
+    if (!daySummary) {
+      setDailySummaryEditOpen(false);
+      setDailySummaryTitle('');
+      setDailySummaryText('');
+      setDailySummaryResetting(false);
+      setDailySummaryError(null);
+      setDailySummaryVoiceError(null);
+      return;
+    }
+    setDailySummaryEditOpen(false);
+    setDailySummaryTitle(daySummary.title || '');
+    setDailySummaryText(daySummary.summary || '');
+    setDailySummaryResetting(false);
+    setDailySummaryError(null);
+    setDailySummaryVoiceError(null);
+  }, [daySummary?.context_id]);
 
   const loadDayItems = async (reset = false) => {
     if (dayLoading && !reset) {
@@ -346,10 +507,10 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     setDayError(null);
     try {
       const nextOffset = reset ? 0 : dayOffset;
-      const tzOffsetMinutes = anchorDate.getTimezoneOffset();
+      const tzOffsetMinutes = getTimeZoneOffsetMinutes(anchorDate, timeZone);
       const query = new URLSearchParams({
-        start_date: toDateKey(anchorDate),
-        end_date: toDateKey(anchorDate),
+        start_date: formatDateKey(anchorDate, timeZone),
+        end_date: formatDateKey(anchorDate, timeZone),
         limit: DAY_PAGE_SIZE.toString(),
         offset: nextOffset.toString(),
         tz_offset_minutes: tzOffsetMinutes.toString(),
@@ -359,7 +520,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
       setDayTotal(data.total);
       setDayOffset(nextOffset + data.items.length);
     } catch (err) {
-      setDayError(err instanceof Error ? err.message : 'Failed to load memories.');
+      setDayError(err instanceof Error ? err.message : t('Failed to load memories.'));
     } finally {
       setDayLoading(false);
     }
@@ -382,7 +543,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
       setAllTotal(data.total);
       setAllOffset(nextOffset + data.items.length);
     } catch (err) {
-      setAllError(err instanceof Error ? err.message : 'Failed to load memories.');
+      setAllError(err instanceof Error ? err.message : t('Failed to load memories.'));
     } finally {
       setAllLoading(false);
     }
@@ -407,6 +568,12 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
   }, [viewMode, dayKey, reloadKey]);
 
   useEffect(() => {
+    setHighlightError(null);
+    setHighlightSavingId(null);
+    setHighlightClearing(false);
+  }, [dayKey, viewMode]);
+
+  useEffect(() => {
     setUploadOpen(false);
     setUploadFiles([]);
     setUploadError(null);
@@ -420,8 +587,8 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
   }, [dayKey, viewMode]);
 
   const uploadStart = useMemo(
-    () => buildDateWithTime(anchorDate, uploadStartTime),
-    [anchorDate, uploadStartTime]
+    () => buildDateWithTime(anchorDate, uploadStartTime, timeZone),
+    [anchorDate, uploadStartTime, timeZone]
   );
   const durationHours = useMemo(() => Math.max(0, Number(uploadDurationHours) || 0), [uploadDurationHours]);
   const uploadEnd = useMemo(
@@ -457,14 +624,41 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     return episodes;
   }, [dayEpisodes]);
 
+  const episodeCards = useMemo<EpisodeCard[]>(() => {
+    const base = showEpisodes ? sortedDayEpisodes.map((episode) => ({ ...episode, isSynthetic: false })) : [];
+    const singles: EpisodeCard[] = sortedDayItems.map((item) => ({
+      episode_id: `single-${item.id}`,
+      title: buildLabel(item),
+      summary: showCaptions
+        ? item.caption || item.original_filename || t('Single memory')
+        : '',
+      context_type: 'single_memory',
+      start_time_utc: item.captured_at,
+      end_time_utc: item.captured_at,
+      item_count: 1,
+      source_item_ids: [item.id],
+      context_ids: [],
+      preview_url: getThumbnail(item) || undefined,
+      isSynthetic: true,
+      syntheticItemId: item.id,
+    }));
+    const combined = [...base, ...singles];
+    combined.sort((a, b) => {
+      const aTime = a.start_time_utc ? new Date(a.start_time_utc).getTime() : 0;
+      const bTime = b.start_time_utc ? new Date(b.start_time_utc).getTime() : 0;
+      return aTime - bTime;
+    });
+    return combined;
+  }, [showCaptions, showEpisodes, sortedDayEpisodes, sortedDayItems]);
+
   const visibleDayEpisodes = useMemo(
-    () => sortedDayEpisodes.slice(0, episodeVisibleCount),
-    [sortedDayEpisodes, episodeVisibleCount]
+    () => episodeCards.slice(0, episodeVisibleCount),
+    [episodeCards, episodeVisibleCount]
   );
 
   const hasMoreEpisodes = useMemo(
-    () => sortedDayEpisodes.length > episodeVisibleCount,
-    [sortedDayEpisodes.length, episodeVisibleCount]
+    () => episodeCards.length > episodeVisibleCount,
+    [episodeCards.length, episodeVisibleCount]
   );
 
   const hasMoreAllItems = useMemo(
@@ -520,14 +714,17 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     return null;
   };
 
-  const memoryCount = useMemo(
-    () => sortedDayEpisodes.length + sortedDayItems.length,
-    [sortedDayEpisodes.length, sortedDayItems.length]
-  );
+  const memoryCount = useMemo(() => episodeCards.length, [episodeCards.length]);
 
   const hasItems = useMemo(() => days.some(day => day.items.length > 0), [days]);
-  const rangeDates = useMemo(() => buildDateRange(range.start, range.end), [range]);
-  const monthGrid = useMemo(() => buildMonthGrid(anchorDate), [anchorDate]);
+  const rangeDates = useMemo(
+    () => buildDateRange(range.start, range.end, timeZone),
+    [range, timeZone]
+  );
+  const monthGrid = useMemo(
+    () => buildMonthGrid(anchorDate, timeZone),
+    [anchorDate, timeZone]
+  );
 
   const rangeTotal = useMemo(
     () => days.reduce((sum, day) => sum + day.item_count, 0),
@@ -537,13 +734,41 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
   const monthTotals = useMemo(() => {
     const totals = Array.from({ length: 12 }, () => 0);
     days.forEach((day) => {
-      const parsed = new Date(`${day.date}T00:00:00`);
-      if (!Number.isNaN(parsed.getTime())) {
-        totals[parsed.getMonth()] += day.item_count;
+      const parts = parseDateKey(day.date);
+      if (!parts) {
+        return;
       }
+      totals[parts.month - 1] += day.item_count;
     });
     return totals;
   }, [days]);
+
+  const monthPreviewMap = useMemo(() => {
+    const map = new Map<number, { thumbnail: string; dayKey: string; priority: number; count: number; timestamp: number }>();
+    days.forEach((day) => {
+      const parts = parseDateKey(day.date);
+      if (!parts) {
+        return;
+      }
+      const thumbnail = getDayThumbnail(day, showHighlights);
+      if (!thumbnail) {
+        return;
+      }
+      const priority = showHighlights && day.highlight?.thumbnail_url ? 2 : 1;
+      const count = day.item_count;
+      const timestamp = Date.UTC(parts.year, parts.month - 1, parts.day);
+      const existing = map.get(parts.month - 1);
+      if (
+        !existing
+        || priority > existing.priority
+        || (priority === existing.priority && timestamp > existing.timestamp)
+        || (priority === existing.priority && timestamp === existing.timestamp && count > existing.count)
+      ) {
+        map.set(parts.month - 1, { thumbnail, dayKey: day.date, priority, count, timestamp });
+      }
+    });
+    return map;
+  }, [days, showHighlights]);
 
   const maxMonthTotal = useMemo(
     () => Math.max(1, ...monthTotals),
@@ -551,20 +776,21 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
   );
 
   const weekdayLabels = useMemo(() => {
-    const base = startOfWeek(new Date());
+    const base = startOfWeek(anchorDate, timeZone);
     return Array.from({ length: 7 }, (_, index) => {
-      const date = new Date(base);
-      date.setDate(base.getDate() + index);
-      return formatDayLabel(date);
+      const date = addDaysZoned(base, index, timeZone);
+      return formatDayLabel(date, locale, timeZone);
     });
-  }, []);
+  }, [anchorDate, locale, timeZone]);
 
   const removeItem = (itemId: string) => {
     setDays((prev) =>
       prev
         .map((day) => {
           const remaining = day.items.filter((item) => item.id !== itemId);
-          return { ...day, items: remaining, item_count: remaining.length };
+          const nextHighlight =
+            day.highlight && day.highlight.item_id === itemId ? null : day.highlight ?? null;
+          return { ...day, items: remaining, item_count: remaining.length, highlight: nextHighlight };
         })
         .filter((day) => day.items.length > 0)
     );
@@ -575,6 +801,142 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     if (selectedItemId === itemId) {
       setSelectedItemId(null);
       setDetail(null);
+    }
+  };
+
+  const setDayHighlight = async (item: TimelineItem) => {
+    const thumbnail = getThumbnail(item);
+    if (!thumbnail) {
+      setHighlightError(t('This memory does not have a preview thumbnail yet.'));
+      return;
+    }
+    setHighlightSavingId(item.id);
+    setHighlightError(null);
+    try {
+      await apiPost('/timeline/highlights', {
+        highlight_date: dayKey,
+        item_id: item.id,
+        tz_offset_minutes: getTimeZoneOffsetMinutes(anchorDate, timeZone),
+      });
+      setDays((prev) =>
+        prev.map((day) =>
+          day.date === dayKey
+            ? {
+                ...day,
+                highlight: {
+                  item_id: item.id,
+                  item_type: item.item_type,
+                  thumbnail_url: thumbnail,
+                },
+              }
+            : day
+        )
+      );
+    } catch (err) {
+      setHighlightError(err instanceof Error ? err.message : t('Failed to save highlight.'));
+    } finally {
+      setHighlightSavingId(null);
+    }
+  };
+
+  const clearDayHighlight = async () => {
+    setHighlightClearing(true);
+    setHighlightError(null);
+    try {
+      await apiDelete(`/timeline/highlights/${dayKey}`);
+      setDays((prev) =>
+        prev.map((day) => (day.date === dayKey ? { ...day, highlight: null } : day))
+      );
+    } catch (err) {
+      setHighlightError(err instanceof Error ? err.message : t('Failed to clear highlight.'));
+    } finally {
+      setHighlightClearing(false);
+    }
+  };
+
+  const applyDailySummary = (updated: TimelineDailySummary, previousDate?: string) => {
+    setDays((prev) =>
+      prev.map((day) => {
+        if (day.date === updated.summary_date) {
+          return { ...day, daily_summary: updated };
+        }
+        if (previousDate && day.date === previousDate) {
+          return { ...day, daily_summary: null };
+        }
+        return day;
+      })
+    );
+  };
+
+  const handleDailySummarySave = async () => {
+    if (!daySummary) {
+      return;
+    }
+    setDailySummarySaving(true);
+    setDailySummaryError(null);
+    try {
+      const payload = {
+        title: dailySummaryTitle,
+        summary: dailySummaryText,
+        tz_offset_minutes: getTimeZoneOffsetMinutes(anchorDate, timeZone),
+      };
+      const updated = await apiPatch<TimelineDailySummary>(
+        `/timeline/daily-summaries/${daySummary.context_id}`,
+        payload
+      );
+      applyDailySummary(updated, daySummary.summary_date);
+      setDailySummaryEditOpen(false);
+    } catch (err) {
+      setDailySummaryError(err instanceof Error ? err.message : t('Failed to update daily summary.'));
+    } finally {
+      setDailySummarySaving(false);
+    }
+  };
+
+  const handleDailySummaryVoice = async (file: File) => {
+    if (!daySummary) {
+      return;
+    }
+    setDailySummaryVoiceLoading(true);
+    setDailySummaryVoiceError(null);
+    try {
+      const form = new FormData();
+      form.append('file', file);
+      form.append('tz_offset_minutes', getTimeZoneOffsetMinutes(anchorDate, timeZone).toString());
+      const updated = await apiPostForm<TimelineDailySummary>(
+        `/timeline/daily-summaries/${daySummary.context_id}/voice`,
+        form
+      );
+      applyDailySummary(updated, daySummary.summary_date);
+      setDailySummaryTitle(updated.title || '');
+      setDailySummaryText(updated.summary || '');
+      setDailySummaryEditOpen(true);
+    } catch (err) {
+      setDailySummaryVoiceError(err instanceof Error ? err.message : t('Voice update failed.'));
+    } finally {
+      setDailySummaryVoiceLoading(false);
+    }
+  };
+
+  const handleDailySummaryReset = async () => {
+    if (!daySummary) {
+      return;
+    }
+    setDailySummaryResetting(true);
+    setDailySummaryError(null);
+    try {
+      const updated = await apiPost<TimelineDailySummary>(
+        `/timeline/daily-summaries/${daySummary.context_id}/reset`,
+        { tz_offset_minutes: getTimeZoneOffsetMinutes(anchorDate, timeZone) }
+      );
+      applyDailySummary(updated, daySummary.summary_date);
+      setDailySummaryTitle(updated.title || '');
+      setDailySummaryText(updated.summary || '');
+      setDailySummaryEditOpen(false);
+    } catch (err) {
+      setDailySummaryError(err instanceof Error ? err.message : t('Failed to reset daily summary.'));
+    } finally {
+      setDailySummaryResetting(false);
     }
   };
 
@@ -597,7 +959,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
         }
       } catch (err) {
         if (mounted) {
-          setSearchError(err instanceof Error ? err.message : 'Search failed.');
+          setSearchError(err instanceof Error ? err.message : t('Search failed.'));
         }
       } finally {
         if (mounted) {
@@ -643,7 +1005,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
   }, [days, pendingSelection]);
 
   const handleDelete = async (itemId: string) => {
-    if (!confirm('Delete this memory? This will remove it from storage and search.')) {
+    if (!confirm(t('Delete this memory? This will remove it from storage and search.'))) {
       return;
     }
     setDeletingId(itemId);
@@ -652,7 +1014,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
       removeItem(itemId);
       setReloadKey((value) => value + 1);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to delete item.');
+      setError(err instanceof Error ? err.message : t('Failed to delete item.'));
     } finally {
       setDeletingId(null);
     }
@@ -678,7 +1040,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
       setEpisodeEditOpen(false);
       setReloadKey((value) => value + 1);
     } catch (err) {
-      setEpisodeEditError(err instanceof Error ? err.message : 'Failed to update episode.');
+      setEpisodeEditError(err instanceof Error ? err.message : t('Failed to update episode.'));
     } finally {
       setEpisodeEditSaving(false);
     }
@@ -696,7 +1058,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
   const handleSearchSelect = (result: SearchResult) => {
     const eventTime = result.event_time_utc ? new Date(result.event_time_utc) : null;
     if (eventTime && !Number.isNaN(eventTime.getTime())) {
-      setAnchorDate(eventTime);
+      setAnchorDate(toZonedDate(eventTime, timeZone));
       setViewMode('day');
     }
     const isDaily = result.context_type === 'daily_summary';
@@ -760,6 +1122,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     });
 
     const newPending: string[] = [];
+    const pathDate = formatDateKey(anchorDate, timeZone);
     try {
       for (const [index, file] of uploadFiles.entries()) {
         const contentType = file.type || 'application/octet-stream';
@@ -767,6 +1130,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
           filename: file.name,
           content_type: contentType,
           prefix: 'uploads/ui',
+          path_date: pathDate,
         });
         if (!uploadMeta.url) {
           throw new Error(`Upload URL missing for ${file.name}`);
@@ -793,7 +1157,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
           original_filename: file.name,
           size_bytes: file.size,
           duration_sec: durationSec,
-          client_tz_offset_minutes: new Date().getTimezoneOffset(),
+          client_tz_offset_minutes: getTimeZoneOffsetMinutes(new Date(), timeZone),
         };
         if (overrideEnabled && captureTimes[index]) {
           ingestPayload.captured_at = captureTimes[index]?.toISOString();
@@ -811,7 +1175,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
 
       if (overrideEnabled) {
         setUploadSuccess(
-          `Queued ${uploadFiles.length} upload(s) for ${formatDate(anchorDate.toISOString())} (${formatClockTime(uploadStart)} - ${formatClockTime(uploadEnd)}).`
+          `Queued ${uploadFiles.length} upload(s) for ${formatDate(anchorDate, locale, timeZone)} (${formatClockTime(uploadStart, locale, timeZone)} - ${formatClockTime(uploadEnd, locale, timeZone)}).`
         );
       } else {
         setUploadSuccess(`Queued ${uploadFiles.length} upload(s) using file timestamps.`);
@@ -821,7 +1185,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
         setPendingUploadIds((prev) => [...prev, ...newPending]);
       }
     } catch (err) {
-      setUploadError(err instanceof Error ? err.message : 'Upload failed.');
+      setUploadError(err instanceof Error ? err.message : t('Upload failed.'));
     } finally {
       setUploading(false);
     }
@@ -876,7 +1240,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
         }
       } catch (err) {
         if (!cancelled && attempts >= 12) {
-          setUploadError('Uploads are still processing. Refresh later for updates.');
+          setUploadError(t('Uploads are still processing. Refresh later for updates.'));
           setPendingUploadIds([]);
           return;
         }
@@ -884,7 +1248,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
       if (!cancelled && attempts < 60) {
         timeoutId = window.setTimeout(poll, 5000);
       } else if (!cancelled) {
-        setUploadError('Uploads are still processing. Refresh later for updates.');
+        setUploadError(t('Uploads are still processing. Refresh later for updates.'));
         setPendingUploadIds([]);
       }
     };
@@ -906,7 +1270,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
       setEpisodeDetail(null);
       return;
     }
-    if (!sortedDayItems.length && !sortedDayEpisodes.length) {
+    if (!episodeCards.length) {
       setSelectedItemId(null);
       setDetail(null);
       setSelectedEpisodeId(null);
@@ -919,16 +1283,17 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     if (selectedItemId && dayItems.some((item) => item.id === selectedItemId)) {
       return;
     }
-    if (sortedDayEpisodes.length > 0) {
-      setSelectedEpisodeId(sortedDayEpisodes[0].episode_id);
-      setSelectedItemId(null);
+    const nextCard = episodeCards[0];
+    if (nextCard?.isSynthetic && nextCard.syntheticItemId) {
+      setSelectedItemId(nextCard.syntheticItemId);
+      setSelectedEpisodeId(null);
       return;
     }
-    if (sortedDayItems.length > 0) {
-      setSelectedItemId(sortedDayItems[0].id);
-      setSelectedEpisodeId(null);
+    if (nextCard) {
+      setSelectedEpisodeId(nextCard.episode_id);
+      setSelectedItemId(null);
     }
-  }, [sortedDayItems, sortedDayEpisodes, viewMode, selectedItemId, selectedEpisodeId]);
+  }, [episodeCards, sortedDayEpisodes, dayItems, viewMode, selectedItemId, selectedEpisodeId]);
 
   useEffect(() => {
     if (!selectedItemId) {
@@ -946,7 +1311,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
         }
       } catch (err) {
         if (mounted) {
-          setDetailError(err instanceof Error ? err.message : 'Failed to load memory detail.');
+          setDetailError(err instanceof Error ? err.message : t('Failed to load memory detail.'));
         }
       } finally {
         if (mounted) {
@@ -976,7 +1341,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
         }
       } catch (err) {
         if (mounted) {
-          setEpisodeError(err instanceof Error ? err.message : 'Failed to load episode detail.');
+          setEpisodeError(err instanceof Error ? err.message : t('Failed to load episode detail.'));
         }
       } finally {
         if (mounted) {
@@ -1004,37 +1369,41 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
   }, [episodeDetail, episodeEditOpen]);
 
   const moveAnchor = (direction: number) => {
-    const next = new Date(anchorDate);
     if (viewMode === 'all') {
       return;
     }
     if (viewMode === 'day') {
-      next.setDate(next.getDate() + direction);
+      setAnchorDate(addDaysZoned(anchorDate, direction, timeZone));
+      return;
     } else if (viewMode === 'week') {
-      next.setDate(next.getDate() + direction * 7);
+      setAnchorDate(addDaysZoned(anchorDate, direction * 7, timeZone));
+      return;
     } else if (viewMode === 'month') {
-      next.setMonth(next.getMonth() + direction);
+      setAnchorDate(addMonthsZoned(anchorDate, direction, timeZone));
+      return;
     } else {
-      next.setFullYear(next.getFullYear() + direction);
+      setAnchorDate(addYearsZoned(anchorDate, direction, timeZone));
+      return;
     }
-    setAnchorDate(next);
   };
 
   const handleToday = () => {
-    setAnchorDate(new Date());
+    setAnchorDate(toZonedDate(new Date(), timeZone));
     setViewMode('day');
   };
 
   return (
-    <div className="h-full overflow-y-auto p-4 md:p-8">
-      <div className="relative overflow-hidden rounded-[32px] border border-white/70 bg-gradient-to-br from-slate-50 via-white to-slate-100 shadow-[0_40px_120px_-60px_rgba(15,23,42,0.45)]">
-        <div className="absolute -top-32 -left-24 h-64 w-64 rounded-full bg-blue-200/40 blur-3xl" />
-        <div className="absolute -bottom-32 -right-20 h-64 w-64 rounded-full bg-indigo-200/40 blur-3xl" />
+    <PageMotion className="h-full overflow-y-auto p-4 md:p-8">
+      <div className="relative overflow-hidden rounded-[32px] border border-white/70 bg-gradient-to-br from-slate-50 via-white to-slate-100 shadow-[0_40px_120px_-60px_rgba(15,23,42,0.45)] dark:border-slate-800 dark:from-slate-950 dark:via-slate-900 dark:to-slate-950">
+        <div className="absolute -top-32 -left-24 h-64 w-64 rounded-full bg-blue-200/40 blur-3xl dark:bg-blue-900/30" />
+        <div className="absolute -bottom-32 -right-20 h-64 w-64 rounded-full bg-indigo-200/40 blur-3xl dark:bg-indigo-900/30" />
         <div className="relative z-10 space-y-6 p-6 md:p-10">
           <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
             <div>
-              <h1 className="text-3xl font-semibold tracking-tight text-slate-900">Timeline</h1>
-              <p className="text-sm text-slate-600">Move through your day, week, month, and year of memories.</p>
+              <h1 className="text-3xl font-semibold tracking-tight text-slate-900">{t('Timeline')}</h1>
+              <p className="text-sm text-slate-600">
+                {t('Move through your day, week, month, and year of memories.')}
+              </p>
             </div>
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
               <div className="flex items-center gap-1 rounded-full border border-white/70 bg-white/70 p-1 shadow-sm backdrop-blur">
@@ -1049,7 +1418,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                         : 'text-slate-600 hover:bg-white'
                     }`}
                   >
-                    {VIEW_LABELS[mode]}
+                    {viewLabels[mode]}
                   </button>
                 ))}
               </div>
@@ -1058,7 +1427,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                 <input
                   value={searchQuery}
                   onChange={(event) => setSearchQuery(event.target.value)}
-                  placeholder="Search memories"
+                  placeholder={t('Search memories')}
                   className="w-44 bg-transparent text-xs text-slate-700 placeholder:text-slate-400 focus:outline-none"
                 />
                 {searchQuery && (
@@ -1081,7 +1450,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                 </button>
                 <span className="flex items-center gap-2 px-1 text-xs font-semibold text-slate-700">
                   <Calendar className="h-4 w-4 text-slate-400" />
-                  {formatRangeLabel(viewMode, anchorDate)}
+                  {formatRangeLabel(viewMode, anchorDate, locale, timeZone)}
                 </span>
                 <button
                   type="button"
@@ -1095,7 +1464,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                   onClick={handleToday}
                   className="rounded-full px-2 text-[11px] font-semibold text-slate-600 hover:text-slate-900"
                 >
-                  Today
+                  {t('Today')}
                 </button>
               </div>
             </div>
@@ -1105,9 +1474,11 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
             <div className="rounded-2xl border border-white/70 bg-white/80 p-4 shadow-sm backdrop-blur">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div>
-                  <h2 className="text-sm font-semibold text-slate-900">Search results</h2>
+                  <h2 className="text-sm font-semibold text-slate-900">{t('Search results')}</h2>
                   <p className="text-xs text-slate-500">
-                    {searchLoading ? 'Searching...' : `${searchResults.length} result(s)`}
+                    {searchLoading
+                      ? t('Searching...')
+                      : t('{count} result(s)', { count: searchResults.length })}
                   </p>
                 </div>
                 <button
@@ -1115,19 +1486,23 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                   onClick={() => setSearchQuery('')}
                   className="text-xs font-semibold text-slate-500 hover:text-slate-700"
                 >
-                  Clear
+                  {t('Clear')}
                 </button>
               </div>
               {searchError && <div className="mt-3 text-xs text-red-600">{searchError}</div>}
               {!searchLoading && !searchError && searchResults.length === 0 && (
-                <div className="mt-3 text-xs text-slate-500">No matches found.</div>
+                <div className="mt-3 text-xs text-slate-500">{t('No matches found.')}</div>
               )}
               {searchResults.length > 0 && (
                 <div className="mt-3 space-y-2">
                   {searchResults.map((result) => {
                     const isEpisode = result.payload && result.payload['is_episode'] === true;
                     const isDaily = result.context_type === 'daily_summary';
-                    const label = isDaily ? 'Daily summary' : isEpisode ? 'Episode' : 'Memory';
+                    const label = isDaily
+                      ? t('Daily summary')
+                      : isEpisode
+                      ? t('Episode')
+                      : t('Memory');
                     return (
                       <button
                         key={result.context_id}
@@ -1138,16 +1513,16 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                         <div className="flex flex-wrap items-center gap-2 text-[10px] uppercase tracking-wide text-slate-400">
                           <span>{label}</span>
                           {result.context_type && !isDaily && (
-                            <span>{result.context_type.replace(/_/g, ' ')}</span>
+                            <span>{formatContextType(result.context_type)}</span>
                           )}
                           {result.event_time_utc && (
-                            <span>{formatDate(result.event_time_utc)}</span>
+                            <span>{formatDate(result.event_time_utc, locale, timeZone)}</span>
                           )}
                         </div>
                         <p className="mt-1 text-sm font-semibold text-slate-900">
-                          {result.title || 'Untitled result'}
+                          {result.title || t('Untitled result')}
                         </p>
-                        {result.summary && (
+                        {showCaptions && result.summary && (
                           <p className="mt-1 line-clamp-2 text-xs text-slate-600">{result.summary}</p>
                         )}
                       </button>
@@ -1160,7 +1535,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
 
           {loading && viewMode !== 'all' && (
             <div className="rounded-2xl border border-white/70 bg-white/80 p-6 text-sm text-slate-500 shadow-sm backdrop-blur">
-              Loading timeline...
+              {t('Loading timeline...')}
             </div>
           )}
 
@@ -1172,7 +1547,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
 
           {!loading && !error && !hasItems && viewMode !== 'all' && (
             <div className="rounded-2xl border border-dashed border-slate-300 bg-white/70 px-6 py-14 text-center text-sm text-slate-500 shadow-sm backdrop-blur">
-              No memories yet. Upload something to start your timeline.
+              {t('No memories yet. Upload something to start your timeline.')}
             </div>
           )}
 
@@ -1181,10 +1556,13 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
               <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
                 <div>
                   <h2 className="text-lg font-semibold text-slate-900">
-                    {VIEW_LABELS[viewMode]} overview
+                    {t('{label} overview', { label: viewLabels[viewMode] })}
                   </h2>
                   <p className="text-xs text-slate-500">
-                    {rangeDates.length} days, {rangeTotal} memories
+                    {t('{days} days, {memories} memories', {
+                      days: rangeDates.length,
+                      memories: rangeTotal,
+                    })}
                   </p>
                 </div>
               </div>
@@ -1192,11 +1570,12 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
               {viewMode === 'week' && (
                 <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-7">
                   {rangeDates.map((date) => {
-                    const key = toDateKey(date);
+                    const key = formatDateKey(date, timeZone);
                     const day = dayLookup.get(key);
                     const count = day?.item_count ?? 0;
-                    const preview = day?.items?.[0];
-                    const thumbnail = preview ? getThumbnail(preview) : null;
+                    const thumbnail = getDayThumbnail(day, showHighlights);
+                    const previewType = (showHighlights ? day?.highlight?.item_type : null) || day?.items?.[0]?.item_type;
+                    const hasHighlight = showHighlights && Boolean(day?.highlight);
                     return (
                       <button
                         key={key}
@@ -1205,41 +1584,52 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                           setAnchorDate(date);
                           setViewMode('day');
                         }}
-                        className={`rounded-2xl border p-4 text-left transition-all ${
+                        className={`group relative w-full overflow-hidden rounded-2xl border text-left transition-all ${
                           count > 0
                             ? 'border-slate-200 bg-white hover:border-slate-300 hover:shadow-md'
                             : 'border-white/60 bg-slate-50/70 text-slate-400'
                         }`}
                       >
-                        <div className="flex items-center justify-between">
-                          <span className="text-xs font-semibold uppercase tracking-wide">
-                            {formatDayLabel(date)}
-                          </span>
-                          <span className="text-xs font-semibold text-slate-500">
-                            {date.getDate()}
-                          </span>
-                        </div>
-                        <div className="mt-4 flex items-center justify-between">
-                          <span className="text-sm font-semibold">
-                            {count > 0 ? `${count} memories` : 'No memories'}
-                          </span>
+                        <div className="relative aspect-[4/3] w-full">
                           {thumbnail ? (
-                            <img
-                              src={thumbnail}
-                              alt="Preview"
-                              className="h-8 w-8 rounded-full object-cover"
-                            />
+                            <>
+                              <img
+                                src={thumbnail}
+                                alt={t('Preview')}
+                                className="absolute inset-0 h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+                                loading="lazy"
+                              />
+                              <div className="absolute inset-0 bg-gradient-to-t from-slate-900/70 via-slate-900/20 to-transparent" />
+                            </>
                           ) : (
-                            <div className="flex h-8 w-8 items-center justify-center rounded-full bg-slate-100 text-slate-400">
-                              {preview?.item_type === 'video' ? (
-                                <Video className="h-4 w-4" />
-                              ) : preview?.item_type === 'audio' ? (
-                                <Mic className="h-4 w-4" />
+                            <div className="absolute inset-0 flex items-center justify-center bg-slate-100 text-slate-400">
+                              {previewType === 'video' ? (
+                                <Video className="h-5 w-5" />
+                              ) : previewType === 'audio' ? (
+                                <Mic className="h-5 w-5" />
                               ) : (
-                                <ImageIcon className="h-4 w-4" />
+                                <ImageIcon className="h-5 w-5" />
                               )}
                             </div>
                           )}
+                            <div className={`relative z-10 flex h-full flex-col justify-between p-3 ${thumbnail ? 'text-white' : 'text-slate-500'}`}>
+                              <div className="flex items-center justify-between text-xs font-semibold uppercase tracking-wide">
+                                <span>{formatDayLabel(date, locale, timeZone)}</span>
+                                <span>{getDateParts(date, timeZone).day}</span>
+                              </div>
+                              <div className="flex items-center justify-between text-sm font-semibold">
+                                <span>
+                                  {count > 0
+                                    ? t('{count} memories', { count })
+                                    : t('No memories')}
+                                </span>
+                                {hasHighlight && (
+                                  <span className="flex h-6 w-6 items-center justify-center rounded-full bg-white/80 text-amber-500">
+                                    <Star className="h-3 w-3 fill-amber-400" />
+                                  </span>
+                              )}
+                            </div>
+                          </div>
                         </div>
                       </button>
                     );
@@ -1256,35 +1646,70 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                       </span>
                     ))}
                   </div>
-                  <div className="mt-2 grid grid-cols-7 gap-2">
-                    {monthGrid.map((date) => {
-                      const key = toDateKey(date);
-                      const day = dayLookup.get(key);
-                      const count = day?.item_count ?? 0;
-                      const isCurrent = isSameMonth(date, anchorDate);
-                      return (
-                        <button
-                          key={key}
-                          type="button"
-                          onClick={() => {
-                            setAnchorDate(date);
-                            setViewMode('day');
-                          }}
-                          className={`flex aspect-square flex-col items-center justify-center rounded-2xl border text-xs font-semibold transition-all ${
-                            isCurrent
-                              ? 'border-slate-200 bg-white hover:border-slate-300 hover:shadow-md'
-                              : 'border-white/60 bg-slate-50/70 text-slate-400'
-                          }`}
-                        >
-                          <span className="text-sm">{date.getDate()}</span>
+                <div className="mt-2 grid grid-cols-7 gap-2">
+                  {monthGrid.map((date) => {
+                    const key = formatDateKey(date, timeZone);
+                    const day = dayLookup.get(key);
+                    const count = day?.item_count ?? 0;
+                    const isCurrent = isSameMonth(date, anchorDate, timeZone);
+                    const thumbnail = getDayThumbnail(day, showHighlights);
+                    const previewType = (showHighlights ? day?.highlight?.item_type : null) || day?.items?.[0]?.item_type;
+                    const hasHighlight = showHighlights && Boolean(day?.highlight);
+                    return (
+                      <button
+                        key={key}
+                        type="button"
+                        onClick={() => {
+                          setAnchorDate(date);
+                          setViewMode('day');
+                        }}
+                        className={`group relative w-full aspect-square overflow-hidden rounded-2xl border text-xs font-semibold transition-all ${
+                          isCurrent
+                            ? 'border-slate-200 bg-white hover:border-slate-300 hover:shadow-md'
+                            : 'border-white/60 bg-slate-50/70 text-slate-400'
+                        }`}
+                      >
+                        {thumbnail ? (
+                          <>
+                            <img
+                              src={thumbnail}
+                              alt={t('Preview')}
+                              className={`absolute inset-0 h-full w-full object-cover transition-transform duration-300 group-hover:scale-105 ${
+                                isCurrent ? '' : 'opacity-60'
+                              }`}
+                              loading="lazy"
+                            />
+                            <div className="absolute inset-0 bg-gradient-to-t from-slate-900/60 via-slate-900/10 to-transparent" />
+                          </>
+                        ) : (
+                          <div className="absolute inset-0 flex items-center justify-center bg-slate-100 text-slate-400">
+                            {previewType === 'video' ? (
+                              <Video className="h-4 w-4" />
+                            ) : previewType === 'audio' ? (
+                              <Mic className="h-4 w-4" />
+                            ) : (
+                              <ImageIcon className="h-4 w-4" />
+                            )}
+                          </div>
+                        )}
+                        <div className={`relative z-10 flex h-full flex-col items-center justify-between p-2 ${thumbnail ? 'text-white' : 'text-slate-500'}`}>
+                          <span className="text-sm">{getDateParts(date, timeZone).day}</span>
                           {count > 0 && (
-                            <span className="text-[10px] text-slate-500">{count}</span>
+                            <span className={`text-[10px] ${thumbnail ? 'text-white/80' : 'text-slate-500'}`}>
+                              {count}
+                            </span>
                           )}
-                        </button>
-                      );
-                    })}
-                  </div>
+                        </div>
+                        {hasHighlight && (
+                          <span className="absolute top-1.5 right-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-white/80 text-amber-500">
+                            <Star className="h-3 w-3 fill-amber-400" />
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
                 </div>
+              </div>
               )}
 
               {viewMode === 'year' && (
@@ -1292,34 +1717,58 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                   {Array.from({ length: 12 }, (_, index) => {
                     const total = monthTotals[index];
                     const percent = Math.round((total / maxMonthTotal) * 100);
+                    const preview = monthPreviewMap.get(index);
+                    const anchorYear = getDateParts(anchorDate, timeZone).year;
+                    const monthDate = buildZonedDate(anchorYear, index + 1, 1, timeZone);
+                    const monthLabel = formatMonthLabel(monthDate, locale, timeZone);
                     return (
                       <button
                         key={index}
                         type="button"
                         onClick={() => {
-                          setAnchorDate(new Date(anchorDate.getFullYear(), index, 1));
+                          setAnchorDate(monthDate);
                           setViewMode('month');
                         }}
-                        className={`rounded-2xl border p-4 text-left transition-all ${
+                        className={`group relative w-full min-h-[140px] overflow-hidden rounded-3xl border p-4 text-left transition-all ${
                           total > 0
                             ? 'border-slate-200 bg-white hover:border-slate-300 hover:shadow-md'
                             : 'border-white/60 bg-slate-50/70 text-slate-400'
                         }`}
                       >
-                        <div className="flex items-center justify-between">
-                          <span className="text-sm font-semibold text-slate-900">
-                            {formatMonthLabel(new Date(anchorDate.getFullYear(), index, 1))}
-                          </span>
-                          <span className="text-xs font-semibold text-slate-500">
-                            {total}
-                          </span>
+                        {preview?.thumbnail && (
+                          <>
+                            <img
+                              src={preview.thumbnail}
+                              alt={t('{month} preview', { month: monthLabel })}
+                              className="absolute inset-0 h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+                              loading="lazy"
+                            />
+                            <div className="absolute inset-0 bg-gradient-to-t from-slate-900/75 via-slate-900/25 to-transparent" />
+                          </>
+                        )}
+                        <div className={`relative z-10 flex h-full flex-col justify-between ${preview?.thumbnail ? 'text-white' : 'text-slate-700'}`}>
+                          <div className="flex items-center justify-between">
+                            <span className="text-sm font-semibold">
+                              {monthLabel}
+                            </span>
+                            <span className={`text-xs font-semibold ${preview?.thumbnail ? 'text-white/80' : 'text-slate-500'}`}>
+                              {t('{count} memories', { count: total })}
+                            </span>
+                          </div>
+                          <div className="mt-6">
+                            <div className={`h-2 w-full rounded-full ${preview?.thumbnail ? 'bg-white/20' : 'bg-slate-100'}`}>
+                              <div
+                                className={`h-full rounded-full ${preview?.thumbnail ? 'bg-white' : 'bg-slate-900'}`}
+                                style={{ width: `${percent}%` }}
+                              />
+                            </div>
+                          </div>
                         </div>
-                        <div className="mt-4 h-2 w-full rounded-full bg-slate-100">
-                          <div
-                            className="h-full rounded-full bg-slate-900"
-                            style={{ width: `${percent}%` }}
-                          />
-                        </div>
+                        {showHighlights && preview?.priority === 2 && (
+                          <span className="absolute top-3 right-3 flex h-6 w-6 items-center justify-center rounded-full bg-white/80 text-amber-500">
+                            <Star className="h-3.5 w-3.5 fill-amber-400" />
+                          </span>
+                        )}
                       </button>
                     );
                   })}
@@ -1332,17 +1781,17 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
             <div className="rounded-2xl border border-white/70 bg-white/80 p-6 shadow-sm backdrop-blur">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
-                  <h2 className="text-lg font-semibold text-slate-900">All memories</h2>
-                  <p className="text-xs text-slate-500">{allTotal} total</p>
+                  <h2 className="text-lg font-semibold text-slate-900">{t('All memories')}</h2>
+                  <p className="text-xs text-slate-500">{t('{count} total', { count: allTotal })}</p>
                 </div>
-                <div className="text-xs text-slate-400">Newest first</div>
+                <div className="text-xs text-slate-400">{t('Newest first')}</div>
               </div>
               {allError && <div className="mt-4 text-xs text-red-600">{allError}</div>}
               {allLoading && allItems.length === 0 && (
-                <div className="mt-6 text-sm text-slate-500">Loading memories...</div>
+                <div className="mt-6 text-sm text-slate-500">{t('Loading memories...')}</div>
               )}
               {!allLoading && allItems.length === 0 && (
-                <div className="mt-6 text-sm text-slate-500">No memories yet.</div>
+                <div className="mt-6 text-sm text-slate-500">{t('No memories yet.')}</div>
               )}
               {allItems.length > 0 && (
                 <div className="mt-5 space-y-3">
@@ -1356,7 +1805,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                           if (item.captured_at) {
                             const parsed = new Date(item.captured_at);
                             if (!Number.isNaN(parsed.getTime())) {
-                              setAnchorDate(parsed);
+                              setAnchorDate(toZonedDate(parsed, timeZone));
                             }
                           }
                           setViewMode('day');
@@ -1368,7 +1817,12 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                       >
                         <div className="relative h-14 w-14 flex-shrink-0 overflow-hidden rounded-xl bg-slate-100">
                           {thumbnail ? (
-                            <img src={thumbnail} alt={buildLabel(item)} className="h-full w-full object-cover" />
+                            <img
+                              src={thumbnail}
+                              alt={buildLabel(item)}
+                              className="h-full w-full object-cover"
+                              loading="lazy"
+                            />
                           ) : item.item_type === 'video' ? (
                             <div className="flex h-full w-full items-center justify-center text-slate-400">
                               <Video className="h-5 w-5" />
@@ -1392,9 +1846,11 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                         </div>
                         <div className="min-w-0 flex-1">
                           <div className="flex flex-wrap items-center gap-2 text-[10px] uppercase tracking-wide text-slate-400">
-                            <span>{item.item_type}</span>
-                            <span>{formatDate(item.captured_at)}</span>
-                            {item.captured_at && <span>{formatTime(item.captured_at)}</span>}
+                            <span>{itemTypeLabels[item.item_type] ?? item.item_type}</span>
+                            <span>{formatDate(item.captured_at, locale, timeZone)}</span>
+                            {item.captured_at && (
+                              <span>{formatTime(item.captured_at, locale, timeZone)}</span>
+                            )}
                           </div>
                           <p className="mt-1 line-clamp-2 text-sm font-semibold text-slate-900">
                             {buildLabel(item)}
@@ -1412,7 +1868,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                   disabled={allLoading}
                   className="mt-5 w-full rounded-full border border-slate-200 px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-50 disabled:opacity-60"
                 >
-                  {allLoading ? 'Loading more...' : 'Load more memories'}
+                  {allLoading ? t('Loading more...') : t('Load more memories')}
                 </button>
               )}
             </div>
@@ -1423,11 +1879,14 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
               <div className="rounded-2xl border border-white/70 bg-white/80 p-4 shadow-sm backdrop-blur">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
-                    <h2 className="text-sm font-semibold text-slate-900">Daily timeline</h2>
+                    <h2 className="text-sm font-semibold text-slate-900">{t('Daily timeline')}</h2>
                     <p className="text-xs text-slate-500">
-                      {memoryCount} memories
+                      {t('{count} memories', { count: memoryCount })}
                       {dayTotal > 0 && dayItems.length < dayTotal
-                        ? ` · Showing ${dayItems.length} of ${dayTotal} items`
+                        ? t(' · Showing {shown} of {total} items', {
+                            shown: dayItems.length,
+                            total: dayTotal,
+                          })
                         : ''}
                     </p>
                   </div>
@@ -1435,17 +1894,17 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                     <div className="flex flex-wrap gap-1 text-[10px]">
                       {dayStats.photo > 0 && (
                         <span className="rounded-full bg-slate-900 px-2 py-0.5 text-white">
-                          {dayStats.photo} photos
+                          {t('{count} photos', { count: dayStats.photo })}
                         </span>
                       )}
                       {dayStats.video > 0 && (
                         <span className="rounded-full bg-white px-2 py-0.5 text-slate-700">
-                          {dayStats.video} videos
+                          {t('{count} videos', { count: dayStats.video })}
                         </span>
                       )}
                       {dayStats.audio > 0 && (
                         <span className="rounded-full bg-white px-2 py-0.5 text-slate-700">
-                          {dayStats.audio} audio
+                          {t('{count} audio', { count: dayStats.audio })}
                         </span>
                       )}
                     </div>
@@ -1455,7 +1914,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                       className="flex items-center gap-1 rounded-full border border-slate-200 bg-white px-3 py-1 text-[10px] font-semibold text-slate-700 hover:border-slate-300"
                     >
                       <UploadCloud className="h-3.5 w-3.5" />
-                      {uploadOpen ? 'Close uploader' : 'Upload for this day'}
+                      {uploadOpen ? t('Close uploader') : t('Upload for this day')}
                     </button>
                   </div>
                 </div>
@@ -1465,10 +1924,12 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                     <div className="flex items-start justify-between gap-3">
                       <div>
                         <h3 className="text-sm font-semibold text-slate-900">
-                          Upload memories for {formatDate(anchorDate.toISOString())}
+                          {t('Upload memories for {date}', {
+                            date: formatDate(anchorDate, locale, timeZone),
+                          })}
                         </h3>
                         <p className="text-xs text-slate-500">
-                          Choose how we should timestamp the uploads for this day.
+                          {t('Choose how we should timestamp the uploads for this day.')}
                         </p>
                       </div>
                       <button
@@ -1488,7 +1949,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                             timeMode === 'file' ? 'bg-slate-900 text-white' : 'hover:bg-white'
                           }`}
                         >
-                          Use file time
+                          {t('Use file time')}
                         </button>
                         <button
                           type="button"
@@ -1497,17 +1958,17 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                             timeMode === 'window' ? 'bg-slate-900 text-white' : 'hover:bg-white'
                           }`}
                         >
-                          Set time window
+                          {t('Set time window')}
                         </button>
                       </div>
                       {timeMode === 'file' ? (
                         <p className="text-xs text-slate-500">
-                          We use the file timestamp when available; otherwise the upload time is used.
+                          {t('We use the file timestamp when available; otherwise the upload time is used.')}
                         </p>
                       ) : (
                         <div className="grid gap-3 sm:grid-cols-[minmax(0,180px)_minmax(0,180px)_minmax(0,1fr)]">
                           <label className="text-xs text-slate-500">
-                            Start time
+                            {t('Start time')}
                             <input
                               type="time"
                               value={uploadStartTime}
@@ -1516,7 +1977,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                             />
                           </label>
                           <label className="text-xs text-slate-500">
-                            Duration (hours)
+                            {t('Duration (hours)')}
                             <input
                               type="number"
                               min="0.5"
@@ -1527,7 +1988,10 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                             />
                           </label>
                           <div className="flex items-end text-xs text-slate-500">
-                            Window: {formatClockTime(uploadStart)} - {formatClockTime(uploadEnd)}
+                            {t('Window: {start} - {end}', {
+                              start: formatClockTime(uploadStart, locale, timeZone),
+                              end: formatClockTime(uploadEnd, locale, timeZone),
+                            })}
                           </div>
                         </div>
                       )}
@@ -1535,7 +1999,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                     <div className="mt-4 flex flex-col gap-3">
                       <label className="flex cursor-pointer items-center justify-center gap-2 rounded-xl border border-dashed border-slate-200 bg-slate-50 px-4 py-3 text-xs font-semibold text-slate-600 hover:border-slate-300 hover:bg-slate-100">
                         <UploadCloud className="h-4 w-4" />
-                        Select files
+                        {t('Select files')}
                         <input
                           type="file"
                           multiple
@@ -1570,7 +2034,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                               onClick={clearUploadFiles}
                               className="text-xs text-slate-500 hover:text-slate-700"
                             >
-                              Clear files
+                              {t('Clear files')}
                             </button>
                             <button
                               type="button"
@@ -1579,10 +2043,13 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                               className="rounded-full bg-slate-900 px-4 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50"
                             >
                               {uploading
-                                ? `Uploading ${uploadedCount}/${uploadFiles.length}`
+                                ? t('Uploading {current}/{total}', {
+                                    current: uploadedCount,
+                                    total: uploadFiles.length,
+                                  })
                                 : timeMode === 'window'
-                                  ? 'Upload to this time window'
-                                  : 'Upload with file timestamps'}
+                                  ? t('Upload to this time window')
+                                  : t('Upload with file timestamps')}
                             </button>
                           </div>
                         </div>
@@ -1593,20 +2060,83 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                   </div>
                 )}
 
-                {sortedDayEpisodes.length > 0 && (
+                {showHighlights && (
+                  <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="text-sm font-semibold text-slate-900">{t('Day highlight')}</p>
+                        <p className="text-xs text-slate-500">
+                          {t('Pick one memory to represent this day in week/month/year views.')}
+                        </p>
+                      </div>
+                      {dayHighlight && (
+                        <button
+                          type="button"
+                          onClick={clearDayHighlight}
+                          disabled={highlightClearing}
+                          className="text-[11px] font-semibold text-slate-500 hover:text-slate-700 disabled:opacity-60"
+                        >
+                          {highlightClearing ? t('Clearing...') : t('Clear')}
+                        </button>
+                      )}
+                    </div>
+                    <div className="mt-3 flex items-center gap-3 rounded-xl border border-dashed border-slate-200 bg-slate-50 px-3 py-2">
+                      <div className="relative h-12 w-12 overflow-hidden rounded-lg bg-white">
+                        {dayHighlight?.thumbnail_url ? (
+                          <img
+                            src={dayHighlight.thumbnail_url}
+                            alt={t('Day highlight')}
+                            className="h-full w-full object-cover"
+                            loading="lazy"
+                          />
+                        ) : (
+                          <div className="flex h-full w-full items-center justify-center text-slate-400">
+                            <ImageIcon className="h-4 w-4" />
+                          </div>
+                        )}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="text-xs font-semibold text-slate-700">
+                          {dayHighlight
+                            ? t('Highlighted memory selected')
+                            : t('No highlight selected')}
+                        </p>
+                        <p className="text-[11px] text-slate-500">
+                          {dayHighlight
+                            ? t('Use the star next to a memory to switch.')
+                            : t('Use the star next to a memory to set one.')}
+                        </p>
+                      </div>
+                    </div>
+                    {highlightError && <div className="mt-2 text-xs text-red-600">{highlightError}</div>}
+                  </div>
+                )}
+
+                {episodeCards.length > 0 && (
                   <div className="mt-4 space-y-3">
                     <div className="flex items-center justify-between text-xs text-slate-500">
-                      <span className="font-semibold text-slate-700">Merged episodes</span>
-                      <span>{sortedDayEpisodes.length}</span>
+                      <span className="font-semibold text-slate-700">
+                        {showEpisodes ? t('Episodes') : t('Memories')}
+                      </span>
+                      <span>{episodeCards.length}</span>
                     </div>
                     {visibleDayEpisodes.map((episode) => {
-                      const isActive = episode.episode_id === selectedEpisodeId;
+                      const isSynthetic = Boolean(episode.isSynthetic);
+                      const isActive = isSynthetic
+                        ? selectedItemId === episode.syntheticItemId
+                        : episode.episode_id === selectedEpisodeId;
                       const preview = getEpisodePreview(episode);
+                      const label = isSynthetic ? t('Memory') : t('Episode');
                       return (
                         <button
                           key={episode.episode_id}
                           type="button"
                           onClick={() => {
+                            if (isSynthetic && episode.syntheticItemId) {
+                              setSelectedEpisodeId(null);
+                              setSelectedItemId(episode.syntheticItemId);
+                              return;
+                            }
                             setSelectedEpisodeId(episode.episode_id);
                             setSelectedItemId(null);
                           }}
@@ -1619,7 +2149,12 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                           <div className="flex items-start gap-3">
                             <div className="h-12 w-12 flex-shrink-0 overflow-hidden rounded-xl bg-slate-100">
                               {preview ? (
-                                <img src={preview} alt={episode.title} className="h-full w-full object-cover" />
+                                <img
+                                  src={preview}
+                                  alt={episode.title}
+                                  className="h-full w-full object-cover"
+                                  loading="lazy"
+                                />
                               ) : (
                                 <div className="flex h-full w-full items-center justify-center text-slate-400">
                                   <ImageIcon className="h-4 w-4" />
@@ -1629,21 +2164,23 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                             <div className="min-w-0 flex-1">
                               <div className="flex items-center justify-between text-[10px] uppercase tracking-wide">
                                 <span className={isActive ? 'text-white/70' : 'text-slate-400'}>
-                                  Episode
+                                  {label}
                                 </span>
                                 <span className={isActive ? 'text-white/70' : 'text-slate-400'}>
-                                  {episode.item_count} items
+                                  {t('{count} items', { count: episode.item_count })}
                                 </span>
                               </div>
                               <p className={`mt-1 text-sm font-semibold ${isActive ? 'text-white' : 'text-slate-900'}`}>
                                 {episode.title}
                               </p>
                               <p className={`mt-1 text-xs ${isActive ? 'text-white/70' : 'text-slate-500'}`}>
-                                {formatTimeRange(episode.start_time_utc, episode.end_time_utc)}
+                                {formatTimeRange(episode.start_time_utc, episode.end_time_utc, locale, timeZone)}
                               </p>
-                              <p className={`mt-1 line-clamp-2 text-xs ${isActive ? 'text-white/70' : 'text-slate-500'}`}>
-                                {episode.summary}
-                              </p>
+                              {showCaptions && episode.summary && (
+                                <p className={`mt-1 line-clamp-2 text-xs ${isActive ? 'text-white/70' : 'text-slate-500'}`}>
+                                  {episode.summary}
+                                </p>
+                              )}
                             </div>
                           </div>
                         </button>
@@ -1655,7 +2192,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                         onClick={() => setEpisodeVisibleCount((value) => value + EPISODES_PAGE_SIZE)}
                         className="w-full rounded-full border border-slate-200 px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-50"
                       >
-                        Show more episodes
+                        {t('Show more episodes')}
                       </button>
                     )}
                   </div>
@@ -1665,93 +2202,15 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                   <div className="mt-3 text-xs text-red-600">{dayError}</div>
                 )}
 
-                {dayLoading && dayItems.length === 0 && sortedDayEpisodes.length === 0 ? (
+                {dayLoading && dayItems.length === 0 && episodeCards.length === 0 ? (
                   <div className="py-8 text-center text-sm text-slate-500">
-                    Loading memories...
+                    {t('Loading memories...')}
                   </div>
-                ) : sortedDayItems.length === 0 && sortedDayEpisodes.length === 0 ? (
+                ) : episodeCards.length === 0 ? (
                   <div className="py-8 text-center text-sm text-slate-500">
-                    No memories for this day.
+                    {t('No memories for this day.')}
                   </div>
-                ) : sortedDayItems.length === 0 ? (
-                  <div className="py-4 text-center text-xs text-slate-500">
-                    No individual memories yet.
-                  </div>
-                ) : (
-                  <div className="mt-4 space-y-4">
-                    {sortedDayItems.map((item, index) => {
-                      const isActive = item.id === selectedItemId;
-                      const thumbnail = getThumbnail(item);
-                      const showConnector = index < sortedDayItems.length - 1;
-                      return (
-                        <button
-                          key={item.id}
-                          type="button"
-                          onClick={() => {
-                            setSelectedItemId(item.id);
-                            setSelectedEpisodeId(null);
-                          }}
-                          className="w-full text-left"
-                        >
-                          <div className="flex gap-3">
-                            <div className="flex flex-col items-center pt-1">
-                              <span className={`text-[10px] font-semibold ${isActive ? 'text-slate-900' : 'text-slate-400'}`}>
-                                {formatTime(item.captured_at)}
-                              </span>
-                              <span className={`mt-1 h-2.5 w-2.5 rounded-full ${isActive ? 'bg-slate-900' : 'bg-slate-300'}`} />
-                              {showConnector && <span className="mt-1 h-10 w-px bg-slate-200" />}
-                            </div>
-                            <div
-                              className={`flex flex-1 items-center gap-3 rounded-2xl border p-3 transition-all ${
-                                isActive
-                                  ? 'border-slate-900 bg-slate-900 text-white shadow-lg'
-                                  : 'border-white/60 bg-white/90 hover:border-slate-200 hover:shadow'
-                              }`}
-                            >
-                              <div className="relative h-14 w-14 flex-shrink-0 overflow-hidden rounded-xl bg-slate-100">
-                                {thumbnail ? (
-                                  <img src={thumbnail} alt={buildLabel(item)} className="h-full w-full object-cover" />
-                                ) : item.item_type === 'video' ? (
-                                  <div className="flex h-full w-full items-center justify-center text-slate-400">
-                                    <Video className="h-5 w-5" />
-                                  </div>
-                                ) : item.item_type === 'audio' ? (
-                                  <div className="flex h-full w-full items-center justify-center text-slate-400">
-                                    <Mic className="h-5 w-5" />
-                                  </div>
-                                ) : (
-                                  <div className="flex h-full w-full items-center justify-center text-slate-400">
-                                    <ImageIcon className="h-5 w-5" />
-                                  </div>
-                                )}
-                                {item.item_type === 'video' && (
-                                  <span className="absolute inset-0 flex items-center justify-center">
-                                    <span className="flex h-6 w-6 items-center justify-center rounded-full bg-black/60 text-white">
-                                      <Play className="h-3 w-3" />
-                                    </span>
-                                  </span>
-                                )}
-                              </div>
-                              <div className="min-w-0 flex-1">
-                                <div className="flex items-center justify-between text-[10px] uppercase tracking-wide">
-                                  <span className={`${isActive ? 'text-white/80' : 'text-slate-400'}`}>
-                                    {item.item_type}
-                                  </span>
-                                  <span className={`${isActive ? 'text-white/70' : 'text-slate-400'}`}>
-                                    {item.processed ? 'Processed' : 'Processing'}
-                                  </span>
-                                </div>
-                                <p className={`mt-1 line-clamp-2 text-sm font-semibold ${isActive ? 'text-white' : 'text-slate-900'}`}>
-                                  {buildLabel(item)}
-                                </p>
-                              </div>
-                            </div>
-                          </div>
-                        </button>
-                      );
-                    })}
-                  </div>
-                )}
+                ) : null}
                 {hasMoreDayItems && (
                   <button
                     type="button"
@@ -1759,7 +2218,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                     disabled={dayLoading}
                     className="mt-4 w-full rounded-full border border-slate-200 px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-50 disabled:opacity-60"
                   >
-                    {dayLoading ? 'Loading more...' : 'Load more memories'}
+                    {dayLoading ? t('Loading more...') : t('Load more memories')}
                   </button>
                 )}
               </div>
@@ -1767,37 +2226,126 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
               <div className="rounded-2xl border border-white/70 bg-white/80 p-6 shadow-sm backdrop-blur">
                 {viewMode === 'day' && daySummary && (
                   <div className="mb-6 rounded-2xl border border-slate-100 bg-white p-4">
-                    <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
-                      <FileText className="h-3 w-3" />
-                      Daily summary
-                    </div>
-                    <p className="mt-2 text-sm font-semibold text-slate-900">{daySummary.title}</p>
-                    <p className="mt-2 text-sm text-slate-600">{daySummary.summary}</p>
-                    {daySummary.keywords.length > 0 && (
-                      <div className="mt-3 flex flex-wrap gap-1">
-                        {daySummary.keywords.map((keyword) => (
-                          <span
-                            key={keyword}
-                            className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] text-slate-500"
-                          >
-                            {keyword}
-                          </span>
-                        ))}
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                        <FileText className="h-3 w-3" />
+                        {t('Daily summary')}
                       </div>
+                      <button
+                        type="button"
+                        onClick={() => setDailySummaryEditOpen((open) => !open)}
+                        className="text-[11px] font-semibold text-slate-500 hover:text-slate-700"
+                      >
+                        {dailySummaryEditOpen ? t('Close editor') : t('Edit summary')}
+                      </button>
+                    </div>
+
+                    {dailySummaryEditOpen ? (
+                      <div className="mt-3 space-y-3">
+                        <label className="text-xs text-slate-500">
+                          {t('Title')}
+                          <input
+                            value={dailySummaryTitle}
+                            onChange={(event) => setDailySummaryTitle(event.target.value)}
+                            className="mt-1 h-10 w-full rounded-lg border border-slate-200 px-3 text-sm text-slate-700"
+                          />
+                        </label>
+                        <label className="text-xs text-slate-500">
+                          {t('Summary')}
+                          <textarea
+                            value={dailySummaryText}
+                            onChange={(event) => setDailySummaryText(event.target.value)}
+                            rows={4}
+                            className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700"
+                          />
+                        </label>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={handleDailySummarySave}
+                            disabled={dailySummarySaving || dailySummaryResetting}
+                            className="rounded-full bg-slate-900 px-4 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-60"
+                          >
+                            {dailySummarySaving ? t('Saving...') : t('Save summary')}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setDailySummaryEditOpen(false);
+                              setDailySummaryTitle(daySummary.title || '');
+                              setDailySummaryText(daySummary.summary || '');
+                            }}
+                            className="rounded-full border border-slate-200 px-4 py-1.5 text-xs text-slate-600 hover:bg-slate-50"
+                          >
+                            {t('Cancel')}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={handleDailySummaryReset}
+                            disabled={dailySummaryResetting || dailySummarySaving}
+                            className="rounded-full border border-slate-200 px-4 py-1.5 text-xs text-slate-600 hover:bg-slate-50 disabled:opacity-60"
+                          >
+                            {dailySummaryResetting ? t('Resetting...') : t('Reset to auto summary')}
+                          </button>
+                          <label className="ml-auto inline-flex cursor-pointer items-center gap-2 rounded-full border border-slate-200 px-3 py-1.5 text-[11px] text-slate-600 hover:bg-slate-50">
+                            <input
+                              type="file"
+                              accept="audio/*"
+                              className="hidden"
+                              onChange={(event) => {
+                                const file = event.target.files?.[0];
+                                if (file) {
+                                  void handleDailySummaryVoice(file);
+                                }
+                                event.currentTarget.value = '';
+                              }}
+                            />
+                            {dailySummaryVoiceLoading ? t('Transcribing...') : t('Upload voice note')}
+                          </label>
+                        </div>
+                        <p className="text-[11px] text-slate-400">
+                          {t('Voice updates replace the summary with a transcript.')}
+                        </p>
+                        {dailySummaryError && (
+                          <div className="text-xs text-red-600">{dailySummaryError}</div>
+                        )}
+                        {dailySummaryVoiceError && (
+                          <div className="text-xs text-red-600">{dailySummaryVoiceError}</div>
+                        )}
+                      </div>
+                    ) : (
+                      <>
+                        <p className="mt-2 text-sm font-semibold text-slate-900">{daySummary.title}</p>
+                        <p className="mt-2 text-sm text-slate-600">{daySummary.summary}</p>
+                        {daySummary.keywords.length > 0 && (
+                          <div className="mt-3 flex flex-wrap gap-1">
+                            {daySummary.keywords.map((keyword) => (
+                              <span
+                                key={keyword}
+                                className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] text-slate-500"
+                              >
+                                {keyword}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </>
                     )}
                   </div>
                 )}
                 {selectedEpisodeId ? (
                   <>
-                    {episodeLoading && (
-                      <div className="text-sm text-slate-500">Loading episode details...</div>
-                    )}
-                    {episodeError && (
-                      <div className="text-sm text-red-600">{episodeError}</div>
-                    )}
-                    {!episodeLoading && !episodeDetail && (
-                      <div className="text-sm text-slate-500">Select an episode to see details.</div>
-                    )}
+                  {episodeLoading && (
+                      <div className="text-sm text-slate-500">{t('Loading episode details...')}</div>
+                  )}
+                  {episodeError && (
+                    <div className="text-sm text-red-600">{episodeError}</div>
+                  )}
+                  {!episodeLoading && !episodeDetail && (
+                      <div className="text-sm text-slate-500">
+                        {t('Select an episode to see details.')}
+                      </div>
+                  )}
                     {episodeDetail && (
                       <div className="space-y-6">
                         <div>
@@ -1805,12 +2353,12 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                             <div>
                               <h3 className="text-lg font-semibold text-slate-900">{episodeDetail.title}</h3>
                               <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-500">
-                                <span>{formatDate(episodeDetail.start_time_utc || undefined)}</span>
+                                <span>{formatDate(episodeDetail.start_time_utc || undefined, locale, timeZone)}</span>
                                 <span className="rounded-full bg-slate-900 px-2 py-0.5 text-white">
-                                  Episode
+                                  {t('Episode')}
                                 </span>
                                 <span className="rounded-full bg-white px-2 py-0.5 text-slate-600">
-                                  {episodeDetail.source_item_ids.length} items
+                                  {t('{count} items', { count: episodeDetail.source_item_ids.length })}
                                 </span>
                               </div>
                             </div>
@@ -1823,16 +2371,16 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                               disabled={episodeEditSaving || episodeEditOpen}
                               className="rounded-full border border-slate-200 px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-50 disabled:opacity-60"
                             >
-                              {episodeEditOpen ? 'Editing' : 'Edit episode'}
+                              {episodeEditOpen ? t('Editing') : t('Edit episode')}
                             </button>
                           </div>
                           <p className="mt-2 text-sm text-slate-600">
-                            {formatTimeRange(episodeDetail.start_time_utc, episodeDetail.end_time_utc)}
+                            {formatTimeRange(episodeDetail.start_time_utc, episodeDetail.end_time_utc, locale, timeZone)}
                           </p>
                           {episodeEditOpen ? (
                             <div className="mt-4 space-y-3 rounded-2xl border border-slate-100 bg-white p-4">
                               <label className="text-xs text-slate-500">
-                                Title
+                                {t('Title')}
                                 <input
                                   value={episodeEditTitle}
                                   onChange={(event) => setEpisodeEditTitle(event.target.value)}
@@ -1840,7 +2388,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                                 />
                               </label>
                               <label className="text-xs text-slate-500">
-                                Summary
+                                {t('Summary')}
                                 <textarea
                                   value={episodeEditSummary}
                                   onChange={(event) => setEpisodeEditSummary(event.target.value)}
@@ -1855,14 +2403,14 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                                   disabled={episodeEditSaving}
                                   className="rounded-full bg-slate-900 px-4 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-60"
                                 >
-                                  {episodeEditSaving ? 'Saving...' : 'Save changes'}
+                                  {episodeEditSaving ? t('Saving...') : t('Save changes')}
                                 </button>
                                 <button
                                   type="button"
                                   onClick={handleEpisodeCancel}
                                   className="rounded-full border border-slate-200 px-4 py-1.5 text-xs text-slate-600 hover:bg-slate-50"
                                 >
-                                  Cancel
+                                  {t('Cancel')}
                                 </button>
                               </div>
                               {episodeEditError && (
@@ -1875,12 +2423,12 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                         </div>
 
                         <div>
-                          <h4 className="text-sm font-semibold text-slate-900">Episode contexts</h4>
+                          <h4 className="text-sm font-semibold text-slate-900">{t('Episode contexts')}</h4>
                           <div className="mt-3 grid gap-3 sm:grid-cols-2">
                             {episodeDetail.contexts.map((context, index) => (
                               <div key={`${context.context_type}-${index}`} className="rounded-2xl border border-slate-100 bg-white p-4">
                                 <div className="flex items-center justify-between text-[10px] uppercase tracking-wide text-slate-400">
-                                  <span>{context.context_type.replace(/_/g, ' ')}</span>
+                                  <span>{formatContextType(context.context_type)}</span>
                                 </div>
                                 <p className="mt-2 text-sm font-semibold text-slate-900">{context.title}</p>
                                 <p className="mt-1 text-xs text-slate-600">{context.summary}</p>
@@ -1899,23 +2447,41 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                         </div>
 
                         <div>
-                          <h4 className="text-sm font-semibold text-slate-900">Episode items</h4>
+                          <h4 className="text-sm font-semibold text-slate-900">{t('Episode items')}</h4>
                           <div className="mt-3 grid gap-3 sm:grid-cols-2">
                             {episodeDetail.items.map((item) => (
-                              <button
+                              <div
                                 key={item.id}
-                                type="button"
+                                role="button"
+                                tabIndex={0}
                                 onClick={() => {
                                   setSelectedEpisodeId(null);
                                   setSelectedItemId(item.id);
+                                }}
+                                onKeyDown={(event) => {
+                                  if (event.key === 'Enter' || event.key === ' ') {
+                                    event.preventDefault();
+                                    setSelectedEpisodeId(null);
+                                    setSelectedItemId(item.id);
+                                  }
                                 }}
                                 className="flex items-center gap-3 rounded-2xl border border-slate-100 bg-white p-3 text-left hover:shadow"
                               >
                                 <div className="h-12 w-12 overflow-hidden rounded-xl bg-slate-100">
                                   {item.item_type === 'video' && item.poster_url ? (
-                                    <img src={item.poster_url} alt={buildLabel(item)} className="h-full w-full object-cover" />
+                                    <img
+                                      src={item.poster_url}
+                                      alt={buildLabel(item)}
+                                      className="h-full w-full object-cover"
+                                      loading="lazy"
+                                    />
                                   ) : item.item_type === 'photo' && item.download_url ? (
-                                    <img src={item.download_url} alt={buildLabel(item)} className="h-full w-full object-cover" />
+                                    <img
+                                      src={item.download_url}
+                                      alt={buildLabel(item)}
+                                      className="h-full w-full object-cover"
+                                      loading="lazy"
+                                    />
                                   ) : item.item_type === 'video' ? (
                                     <div className="flex h-full w-full items-center justify-center text-slate-400">
                                       <Video className="h-4 w-4" />
@@ -1931,12 +2497,52 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                                   )}
                                 </div>
                                 <div className="min-w-0 flex-1">
-                                  <p className="text-xs uppercase tracking-wide text-slate-400">{item.item_type}</p>
+                                  <p className="text-xs uppercase tracking-wide text-slate-400">
+                                    {itemTypeLabels[item.item_type] ?? item.item_type}
+                                  </p>
                                   <p className="mt-1 text-sm font-semibold text-slate-900 line-clamp-2">
                                     {buildLabel(item)}
                                   </p>
                                 </div>
-                              </button>
+                                {showHighlights &&
+                                  (() => {
+                                    const thumbnail = getThumbnail(item);
+                                    const canHighlight = Boolean(thumbnail);
+                                    const isHighlighted = dayHighlight?.item_id === item.id;
+                                    const isHighlighting = highlightSavingId === item.id;
+                                    return (
+                                      <button
+                                        type="button"
+                                        onClick={(event) => {
+                                          event.stopPropagation();
+                                          if (!canHighlight || isHighlighting) {
+                                            return;
+                                          }
+                                          void setDayHighlight(item);
+                                        }}
+                                        disabled={!canHighlight || isHighlighting}
+                                        className={`ml-auto flex h-8 w-8 items-center justify-center rounded-full border transition ${
+                                          isHighlighted
+                                            ? 'border-amber-400 bg-amber-400 text-white'
+                                            : 'border-slate-200 text-slate-500 hover:border-slate-300'
+                                        } ${!canHighlight ? 'opacity-40' : ''}`}
+                                        title={
+                                          canHighlight
+                                            ? isHighlighted
+                                              ? t('Highlighted')
+                                              : t('Set highlight')
+                                            : t('No thumbnail available')
+                                        }
+                                      >
+                                        {isHighlighting ? (
+                                          <span className="text-[10px] font-semibold">{t('...')}</span>
+                                        ) : (
+                                          <Star className={`h-4 w-4 ${isHighlighted ? 'fill-white' : ''}`} />
+                                        )}
+                                      </button>
+                                    );
+                                  })()}
+                              </div>
                             ))}
                           </div>
                         </div>
@@ -1946,13 +2552,15 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                 ) : (
                   <>
                     {detailLoading && (
-                      <div className="text-sm text-slate-500">Loading memory details...</div>
+                      <div className="text-sm text-slate-500">{t('Loading memory details...')}</div>
                     )}
                     {detailError && (
                       <div className="text-sm text-red-600">{detailError}</div>
                     )}
                     {!detailLoading && !detail && (
-                      <div className="text-sm text-slate-500">Select a memory to see details.</div>
+                      <div className="text-sm text-slate-500">
+                        {t('Select a memory to see details.')}
+                      </div>
                     )}
                     {detail && (
                       <div className="space-y-6">
@@ -1960,23 +2568,63 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                           <div>
                             <h3 className="text-lg font-semibold text-slate-900">{buildLabel(detail)}</h3>
                             <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-500">
-                              <span>{formatDate(detail.captured_at)}</span>
+                              <span>{formatDate(detail.captured_at, locale, timeZone)}</span>
                               <span className="rounded-full bg-slate-900 px-2 py-0.5 text-white">
-                                {detail.item_type}
+                                {itemTypeLabels[detail.item_type] ?? detail.item_type}
                               </span>
                               <span className="rounded-full bg-white px-2 py-0.5 text-slate-600">
-                                {detail.processed ? 'Processed' : 'Processing'}
+                                {detail.processed ? t('Processed') : t('Processing')}
                               </span>
                             </div>
                           </div>
-                          <button
-                            type="button"
-                            onClick={() => handleDelete(detail.id)}
-                            className="rounded-full border border-slate-200 px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-50"
-                            disabled={deletingId === detail.id}
-                          >
-                            {deletingId === detail.id ? 'Deleting...' : 'Delete'}
-                          </button>
+                          <div className="flex items-center gap-2">
+                            {showHighlights &&
+                              (() => {
+                                const thumbnail = getThumbnail(detail);
+                                const canHighlight = Boolean(thumbnail);
+                                const isHighlighted = dayHighlight?.item_id === detail.id;
+                                const isHighlighting = highlightSavingId === detail.id;
+                                return (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      if (!canHighlight || isHighlighting) {
+                                        return;
+                                      }
+                                      void setDayHighlight(detail);
+                                    }}
+                                    disabled={!canHighlight || isHighlighting}
+                                    className={`flex items-center gap-1 rounded-full border px-3 py-1.5 text-xs font-semibold transition ${
+                                      isHighlighted
+                                        ? 'border-amber-400 bg-amber-400 text-white'
+                                        : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                                    } ${!canHighlight ? 'opacity-40' : ''}`}
+                                    title={
+                                      canHighlight
+                                        ? isHighlighted
+                                          ? t('Highlighted')
+                                          : t('Set highlight')
+                                        : t('No thumbnail available')
+                                    }
+                                  >
+                                    {isHighlighting ? t('Saving...') : (
+                                      <>
+                                        <Star className={`h-3.5 w-3.5 ${isHighlighted ? 'fill-white' : ''}`} />
+                                        {isHighlighted ? t('Highlighted') : t('Set highlight')}
+                                      </>
+                                    )}
+                                  </button>
+                                );
+                              })()}
+                            <button
+                              type="button"
+                              onClick={() => handleDelete(detail.id)}
+                              className="rounded-full border border-slate-200 px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-50"
+                              disabled={deletingId === detail.id}
+                            >
+                              {deletingId === detail.id ? t('Deleting...') : t('Delete')}
+                            </button>
+                          </div>
                         </div>
 
                         <div className="overflow-hidden rounded-2xl border border-slate-200 bg-slate-50">
@@ -1991,7 +2639,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                                 playsInline
                               />
                             ) : (
-                              <div className="p-6 text-slate-400">Video unavailable.</div>
+                              <div className="p-6 text-slate-400">{t('Video unavailable.')}</div>
                             )
                           ) : detail.item_type === 'audio' ? (
                             detail.download_url ? (
@@ -1999,19 +2647,24 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                                 <audio src={detail.download_url} controls className="w-full" preload="metadata" />
                               </div>
                             ) : (
-                              <div className="p-6 text-slate-400">Audio unavailable.</div>
+                              <div className="p-6 text-slate-400">{t('Audio unavailable.')}</div>
                             )
                           ) : detail.download_url ? (
-                            <img src={detail.download_url} alt={buildLabel(detail)} className="w-full object-cover" />
+                            <img
+                              src={detail.download_url}
+                              alt={buildLabel(detail)}
+                              className="w-full object-cover"
+                              loading="lazy"
+                            />
                           ) : (
-                            <div className="p-6 text-slate-400">Preview unavailable.</div>
+                            <div className="p-6 text-slate-400">{t('Preview unavailable.')}</div>
                           )}
                         </div>
 
                         <div>
-                          <h4 className="text-sm font-semibold text-slate-900">Contexts</h4>
+                          <h4 className="text-sm font-semibold text-slate-900">{t('Contexts')}</h4>
                           {detail.contexts.length === 0 ? (
-                            <p className="mt-2 text-xs text-slate-500">No contexts extracted yet.</p>
+                            <p className="mt-2 text-xs text-slate-500">{t('No contexts extracted yet.')}</p>
                           ) : (
                             <div className="mt-3 grid gap-3 sm:grid-cols-2">
                               {detail.contexts.map((context, index) => {
@@ -2021,8 +2674,10 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                                 return (
                                   <div key={`${context.context_type}-${index}`} className="rounded-2xl border border-slate-100 bg-white p-4">
                                     <div className="flex items-center justify-between text-[10px] uppercase tracking-wide text-slate-400">
-                                      <span>{context.context_type.replace(/_/g, ' ')}</span>
-                                      {chunkIndex ? <span>Chunk {chunkIndex}</span> : null}
+                                      <span>{formatContextType(context.context_type)}</span>
+                                      {chunkIndex ? (
+                                        <span>{t('Chunk {index}', { index: chunkIndex })}</span>
+                                      ) : null}
                                     </div>
                                     <p className="mt-2 text-sm font-semibold text-slate-900">{context.title}</p>
                                     <p className="mt-1 text-xs text-slate-600">{context.summary}</p>
@@ -2044,7 +2699,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
 
                         {(detail.transcript_segments?.length || detail.transcript_text) && (
                           <div>
-                            <h4 className="text-sm font-semibold text-slate-900">Transcript</h4>
+                            <h4 className="text-sm font-semibold text-slate-900">{t('Transcript')}</h4>
                             {detail.transcript_segments && detail.transcript_segments.length > 0 ? (
                               <div className="mt-3 space-y-3 rounded-2xl border border-slate-100 bg-white p-4 max-h-56 overflow-y-auto">
                                 {detail.transcript_segments.map((segment, index) => (
@@ -2052,7 +2707,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
                                     <span className="text-[10px] uppercase tracking-wide text-slate-400">
                                       {formatDuration(segment.start_ms)} - {formatDuration(segment.end_ms)}
                                     </span>
-                                    <p className="mt-1 text-slate-700">{segment.text || '...'}</p>
+                                    <p className="mt-1 text-slate-700">{segment.text || t('...')}</p>
                                   </div>
                                 ))}
                               </div>
@@ -2070,6 +2725,6 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
           )}
         </div>
       </div>
-    </div>
+    </PageMotion>
   );
 };

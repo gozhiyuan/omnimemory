@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import random
+from datetime import datetime
 from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional
 from uuid import UUID
@@ -222,6 +223,8 @@ def _build_filter(
     *,
     is_episode: Optional[bool] = None,
     context_type: Optional[str] = None,
+    start_time: Optional[datetime | str] = None,
+    end_time: Optional[datetime | str] = None,
 ) -> Optional[qmodels.Filter]:
     must: list[qmodels.FieldCondition] = []
     if user_id:
@@ -230,6 +233,13 @@ def _build_filter(
         must.append(qmodels.FieldCondition(key="is_episode", match=qmodels.MatchValue(value=is_episode)))
     if context_type:
         must.append(qmodels.FieldCondition(key="context_type", match=qmodels.MatchValue(value=context_type)))
+    if start_time or end_time:
+        range_kwargs: dict[str, Any] = {}
+        if start_time:
+            range_kwargs["gte"] = start_time.isoformat() if isinstance(start_time, datetime) else start_time
+        if end_time:
+            range_kwargs["lt"] = end_time.isoformat() if isinstance(end_time, datetime) else end_time
+        must.append(qmodels.FieldCondition(key="event_time_utc", range=qmodels.Range(**range_kwargs)))
     if not must:
         return None
     return qmodels.Filter(must=must)
@@ -242,6 +252,8 @@ def search_contexts(
     *,
     is_episode: Optional[bool] = None,
     context_type: Optional[str] = None,
+    start_time: Optional[datetime | str] = None,
+    end_time: Optional[datetime | str] = None,
 ) -> List[Dict[str, Any]]:
     """Query Qdrant using the configured embedding model."""
 
@@ -254,7 +266,13 @@ def search_contexts(
         query_vector=vector,
         limit=limit,
         with_payload=True,
-        query_filter=_build_filter(user_id, is_episode=is_episode, context_type=context_type),
+        query_filter=_build_filter(
+            user_id,
+            is_episode=is_episode,
+            context_type=context_type,
+            start_time=start_time,
+            end_time=end_time,
+        ),
     )
     return [
         {

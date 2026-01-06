@@ -29,6 +29,76 @@ services:
       timeout: 5s
       retries: 5
 
+  authentik-db:
+    image: postgres:15-alpine
+    container_name: lifelog-authentik-db
+    environment:
+      - POSTGRES_DB=${AUTHENTIK_POSTGRES_DB:-authentik}
+      - POSTGRES_USER=${AUTHENTIK_POSTGRES_USER:-authentik}
+      - POSTGRES_PASSWORD=${AUTHENTIK_POSTGRES_PASSWORD:-authentik}
+    volumes:
+      - authentik_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AUTHENTIK_POSTGRES_USER:-authentik}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  authentik-redis:
+    image: redis:7-alpine
+    container_name: lifelog-authentik-redis
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    volumes:
+      - authentik_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  authentik-server:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_IMAGE_TAG:-latest}
+    container_name: lifelog-authentik
+    command: server
+    environment:
+      - AUTHENTIK_SECRET_KEY=${AUTHENTIK_SECRET_KEY:-dev-secret-change-me}
+      - AUTHENTIK_POSTGRESQL__HOST=authentik-db
+      - AUTHENTIK_POSTGRESQL__USER=${AUTHENTIK_POSTGRES_USER:-authentik}
+      - AUTHENTIK_POSTGRESQL__NAME=${AUTHENTIK_POSTGRES_DB:-authentik}
+      - AUTHENTIK_POSTGRESQL__PASSWORD=${AUTHENTIK_POSTGRES_PASSWORD:-authentik}
+      - AUTHENTIK_REDIS__HOST=authentik-redis
+      - AUTHENTIK_ERROR_REPORTING__ENABLED=false
+      - AUTHENTIK_BOOTSTRAP_PASSWORD=${AUTHENTIK_BOOTSTRAP_PASSWORD:-}
+      - AUTHENTIK_BOOTSTRAP_EMAIL=${AUTHENTIK_BOOTSTRAP_EMAIL:-}
+    ports:
+      - "9002:9000"
+      - "9443:9443"
+    volumes:
+      - authentik_media:/media
+      - authentik_templates:/templates
+    depends_on:
+      - authentik-db
+      - authentik-redis
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_IMAGE_TAG:-latest}
+    container_name: lifelog-authentik-worker
+    command: worker
+    environment:
+      - AUTHENTIK_SECRET_KEY=${AUTHENTIK_SECRET_KEY:-dev-secret-change-me}
+      - AUTHENTIK_POSTGRESQL__HOST=authentik-db
+      - AUTHENTIK_POSTGRESQL__USER=${AUTHENTIK_POSTGRES_USER:-authentik}
+      - AUTHENTIK_POSTGRESQL__NAME=${AUTHENTIK_POSTGRES_DB:-authentik}
+      - AUTHENTIK_POSTGRESQL__PASSWORD=${AUTHENTIK_POSTGRES_PASSWORD:-authentik}
+      - AUTHENTIK_REDIS__HOST=authentik-redis
+      - AUTHENTIK_ERROR_REPORTING__ENABLED=false
+    volumes:
+      - authentik_media:/media
+      - authentik_templates:/templates
+    depends_on:
+      - authentik-db
+      - authentik-redis
+
   rustfs:
     image: ${RUSTFS_IMAGE:-rustfs/rustfs:latest}
     container_name: lifelog-rustfs
@@ -55,48 +125,54 @@ services:
       timeout: 5s
       retries: 10
 
-# flower:
-#   image: mher/flower:latest
-#   container_name: lifelog-flower
-#   environment:
-#     - CELERY_BROKER_URL=redis://redis:6379/0
-#   ports:
-#     - "5555:5555"
-#   depends_on:
-#     - redis
+  flower:
+    image: mher/flower:latest
+    container_name: lifelog-flower
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
 
-# celery-exporter:
-#   image: danihodovic/celery-exporter:latest
-#   container_name: lifelog-celery-exporter
-#   environment:
-#     - CELERY_BROKER_URL=redis://redis:6379/0
-#   ports:
-#     - "9808:9808"   # /metrics
-#   depends_on:
-#     - redis
+  celery-exporter:
+    image: danihodovic/celery-exporter:latest
+    container_name: lifelog-celery-exporter
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+    command: ["--broker-url=redis://redis:6379/0"]
+    ports:
+      - "9808:9808"   # /metrics
+    depends_on:
+      - redis
 
-# prometheus:
-#   image: prom/prometheus:latest
-#   container_name: lifelog-prometheus
-#   command: ["--config.file=/etc/prometheus/prometheus.yml"]
-#   volumes:
-#     - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
-#   ports:
-#     - "9090:9090"
-#   depends_on:
-#     - celery-exporter
-#     - qdrant
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: lifelog-prometheus
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - celery-exporter
+      - qdrant
 
-# grafana:
-#   image: grafana/grafana:latest
-#   container_name: lifelog-grafana
-#   environment:
-#     - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
-#     - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
-#   ports:
-#     - "3001:3000"
-#   depends_on:
-#     - prometheus
+  grafana:
+    image: grafana/grafana:latest
+    container_name: lifelog-grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
 
 # api:
 #   build: ../services/api
@@ -129,3 +205,9 @@ volumes:
   pg_data:
   qdrant_data:
   rustfs_data:
+  prometheus_data:
+  grafana_data:
+  authentik_db_data:
+  authentik_redis_data:
+  authentik_media:
+  authentik_templates:

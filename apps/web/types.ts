@@ -99,6 +99,7 @@ export interface TimelineDay {
   items: TimelineItem[];
   episodes?: TimelineEpisode[];
   daily_summary?: TimelineDailySummary | null;
+  highlight?: TimelineHighlight | null;
 }
 
 export interface TimelineEpisode {
@@ -120,6 +121,12 @@ export interface TimelineDailySummary {
   title: string;
   summary: string;
   keywords: string[];
+}
+
+export interface TimelineHighlight {
+  item_id: string;
+  item_type: TimelineItem['item_type'];
+  thumbnail_url?: string | null;
 }
 
 export interface TimelineContext {
@@ -273,6 +280,8 @@ export interface GooglePhotosPickerItem {
 
 export interface GooglePhotosPickerItemsResponse {
   items: GooglePhotosPickerItem[];
+  status?: 'ready' | 'pending';
+  message?: string | null;
 }
 
 export interface GooglePhotosSyncRequest {

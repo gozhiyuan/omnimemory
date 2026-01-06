@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
+from uuid import UUID
 
 from loguru import logger
 
@@ -12,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_settings
-from .db.models import DataConnection, DEFAULT_TEST_USER_ID
+from .db.models import DataConnection
 
 
 GOOGLE_PHOTOS_PICKER_SESSIONS_ENDPOINT = "https://photospicker.googleapis.com/v1/sessions"
@@ -144,11 +145,12 @@ def extract_picker_location(item: dict) -> Optional[dict]:
 
 async def store_google_photos_tokens(
     session: AsyncSession,
+    user_id: UUID,
     token_data: dict,
     access_token: str,
     expires_at: Optional[datetime],
 ) -> None:
-    connection = await _get_google_photos_connection(session)
+    connection = await _get_google_photos_connection(session, user_id)
     connected_at = datetime.now(timezone.utc)
     refresh_token = token_data.get("refresh_token")
     if connection and not refresh_token:
@@ -163,7 +165,7 @@ async def store_google_photos_tokens(
 
     if connection is None:
         connection = DataConnection(
-            user_id=DEFAULT_TEST_USER_ID,
+            user_id=user_id,
             provider="google_photos",
             status="active",
             config=config,
@@ -321,10 +323,13 @@ async def fetch_picker_media_item(
     return payload if isinstance(payload, dict) else {}
 
 
-async def _get_google_photos_connection(session: AsyncSession) -> Optional[DataConnection]:
+async def _get_google_photos_connection(
+    session: AsyncSession,
+    user_id: UUID,
+) -> Optional[DataConnection]:
     result = await session.execute(
         select(DataConnection).where(
-            DataConnection.user_id == DEFAULT_TEST_USER_ID,
+            DataConnection.user_id == user_id,
             DataConnection.provider == "google_photos",
         )
     )

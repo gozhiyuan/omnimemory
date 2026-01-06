@@ -9,11 +9,11 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..auth import get_current_user_id
 from ..config import get_settings
-from ..db.models import DEFAULT_TEST_USER_ID, SourceItem, User
+from ..db.models import SourceItem, User
 from ..db.session import get_session
 from ..tasks.process_item import process_item
 
@@ -31,7 +31,7 @@ class ItemType(str, Enum):
 class IngestRequest(BaseModel):
     storage_key: str = Field(..., description="Key/path in object storage")
     item_type: ItemType = Field(..., description="Asset type")
-    user_id: UUID = Field(default=DEFAULT_TEST_USER_ID, description="Owner identifier")
+    user_id: Optional[UUID] = Field(default=None, description="Owner identifier")
     provider: Optional[str] = Field(default="upload", description="Source provider name")
     external_id: Optional[str] = Field(default=None, description="Source provider item id")
     captured_at: Optional[datetime] = Field(default=None, description="Original capture timestamp")
@@ -108,12 +108,12 @@ def _resolve_event_time(request: IngestRequest, provider: str) -> tuple[str, flo
     return event_time_source, event_time_confidence
 
 
-def _build_payload(request: IngestRequest, item_id: UUID) -> dict:
+def _build_payload(request: IngestRequest, item_id: UUID, user_id: UUID) -> dict:
     payload = {
         "item_id": str(item_id),
         "storage_key": request.storage_key,
         "item_type": request.item_type.value,
-        "user_id": str(request.user_id),
+        "user_id": str(user_id),
         "captured_at": request.captured_at.isoformat() if request.captured_at else None,
         "content_type": request.content_type,
         "original_filename": request.original_filename,
@@ -136,6 +136,7 @@ def _build_payload(request: IngestRequest, item_id: UUID) -> dict:
 @router.post("/ingest", response_model=IngestResponse)
 async def ingest_item(
     request: IngestRequest,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> IngestResponse:
     """Persist the source item and enqueue processing."""
@@ -146,9 +147,9 @@ async def ingest_item(
         status_code, detail = validation_error
         raise HTTPException(status_code=status_code, detail=detail)
 
-    user = await session.get(User, request.user_id)
+    user = await session.get(User, user_id)
     if user is None:
-        user = User(id=request.user_id)
+        user = User(id=user_id)
         session.add(user)
 
     item_id = uuid4()
@@ -156,7 +157,7 @@ async def ingest_item(
     event_time_source, event_time_confidence = _resolve_event_time(request, provider)
     source_item = SourceItem(
         id=item_id,
-        user_id=request.user_id,
+        user_id=user_id,
         provider=provider,
         external_id=request.external_id,
         storage_key=request.storage_key,
@@ -172,7 +173,7 @@ async def ingest_item(
     session.add(source_item)
     await session.commit()
 
-    payload = _build_payload(request, item_id)
+    payload = _build_payload(request, item_id, user_id)
 
     task = process_item.delay(payload)
 
@@ -182,6 +183,7 @@ async def ingest_item(
 @router.post("/ingest/batch", response_model=BatchIngestResponse)
 async def ingest_batch(
     request: BatchIngestRequest,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> BatchIngestResponse:
     """Persist source items in bulk and enqueue processing per item."""
@@ -197,23 +199,19 @@ async def ingest_batch(
 
     results: list[Optional[BatchIngestItemResponse]] = [None] * len(request.items)
     valid_entries: list[tuple[int, IngestRequest]] = []
-    valid_user_ids: set[UUID] = set()
-
     for index, item in enumerate(request.items):
-        error = _validate_ingest_request(item, settings)
+        normalized = item.model_copy(update={"user_id": user_id})
+        error = _validate_ingest_request(normalized, settings)
         if error:
             _, detail = error
             results[index] = BatchIngestItemResponse(index=index, status="rejected", error=detail)
             continue
-        valid_entries.append((index, item))
-        valid_user_ids.add(item.user_id)
+        valid_entries.append((index, normalized))
 
     source_items: list[SourceItem] = []
     if valid_entries:
-        existing_users: set[UUID] = set()
-        user_rows = await session.execute(select(User).where(User.id.in_(valid_user_ids)))
-        existing_users = {user.id for user in user_rows.scalars().all()}
-        for user_id in valid_user_ids - existing_users:
+        existing_user = await session.get(User, user_id)
+        if existing_user is None:
             session.add(User(id=user_id))
 
         for _, item in valid_entries:
@@ -223,7 +221,7 @@ async def ingest_batch(
             source_items.append(
                 SourceItem(
                     id=item_id,
-                    user_id=item.user_id,
+                    user_id=user_id,
                     provider=provider,
                     external_id=item.external_id,
                     storage_key=item.storage_key,
@@ -241,7 +239,7 @@ async def ingest_batch(
         await session.commit()
 
         for (index, item), source_item in zip(valid_entries, source_items):
-            payload = _build_payload(item, source_item.id)
+            payload = _build_payload(item, source_item.id, user_id)
             task = process_item.delay(payload)
             results[index] = BatchIngestItemResponse(
                 index=index,

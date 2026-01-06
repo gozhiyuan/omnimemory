@@ -30,6 +30,7 @@ from ..ai.prompts import (
 )
 from ..db.models import DataConnection, ProcessedContent, ProcessedContext, SourceItem
 from ..google_photos import get_valid_access_token
+from ..user_settings import resolve_language_code, resolve_language_label, resolve_ocr_language_hints
 from ..vectorstore import upsert_context_embeddings
 from .media_utils import (
     MediaToolError,
@@ -55,6 +56,11 @@ from .utils import (
     hamming_distance_hex,
     parse_exif_datetime,
 )
+
+
+def _resolve_language(config: PipelineConfig) -> tuple[str, str]:
+    code = resolve_language_code(config.user_settings)
+    return code, resolve_language_label(code)
 
 
 def _truncate_text(value: str, limit: int) -> str:
@@ -1066,7 +1072,12 @@ class OcrStep:
             return
         content_hash = artifacts.get("content_hash")
         provider = config.settings.ocr_provider
-        fingerprint = hash_parts([content_hash, provider, self.version])
+        language_code, _ = _resolve_language(config)
+        language_hints = resolve_ocr_language_hints(
+            config.settings.ocr_language_hints,
+            language_code,
+        )
+        fingerprint = hash_parts([content_hash, provider, self.version, ",".join(language_hints)])
         existing = await artifacts.store.get("ocr", provider, self.version, fingerprint)
         if existing:
             artifacts.set("ocr_text", (existing.payload or {}).get("text", ""))
@@ -1074,7 +1085,12 @@ class OcrStep:
 
         blob = artifacts.get("blob") or b""
         try:
-            payload = await run_ocr(blob, config.settings, item.content_type)
+            payload = await run_ocr(
+                blob,
+                config.settings,
+                item.content_type,
+                language_hints=language_hints,
+            )
         except Exception as exc:  # pragma: no cover - external service dependency
             logger.warning("OCR failed for item {}: {}", item.id, exc)
             payload = {"text": "", "status": "error", "error": str(exc)}
@@ -1102,7 +1118,8 @@ class VlmStep:
         ocr_text = artifacts.get("ocr_text", "")
         provider = config.settings.vlm_provider
         model = config.settings.gemini_model
-        fingerprint = hash_parts([content_hash, ocr_text, provider, model, self.version])
+        language_code, language_label = _resolve_language(config)
+        fingerprint = hash_parts([content_hash, ocr_text, provider, model, self.version, language_code])
         existing = await artifacts.store.get("vlm_observations", provider, model, fingerprint)
         if existing:
             contexts = (existing.payload or {}).get("contexts", [])
@@ -1110,7 +1127,7 @@ class VlmStep:
             return
 
         blob = artifacts.get("blob") or b""
-        prompt = build_lifelog_image_prompt(ocr_text)
+        prompt = build_lifelog_image_prompt(ocr_text, language=language_label)
         try:
             response = await analyze_image_with_vlm(
                 blob,
@@ -1271,6 +1288,7 @@ class MediaChunkUnderstandingStep:
             if item.item_type == "video"
             else config.settings.audio_understanding_model
         )
+        language_code, language_label = _resolve_language(config)
         if provider == "none":
             payload = {"status": "disabled", "reason": "provider_disabled"}
             await artifacts.store.upsert(
@@ -1297,6 +1315,7 @@ class MediaChunkUnderstandingStep:
                 self.version,
                 chunk_duration,
                 config.settings.media_chunk_target_bytes,
+                language_code,
             ]
         )
         existing = await artifacts.store.get("media_chunk_analysis", provider, model, fingerprint)
@@ -1330,7 +1349,7 @@ class MediaChunkUnderstandingStep:
                         chunk_duration_sec=chunk_duration,
                         output_ext=suffix or ".mp4",
                     )
-                    prompt = build_lifelog_video_chunk_prompt()
+                    prompt = build_lifelog_video_chunk_prompt(language=language_label)
                     max_bytes = config.settings.video_understanding_max_bytes
                     content_type = item.content_type or "video/mp4"
                 else:
@@ -1341,7 +1360,7 @@ class MediaChunkUnderstandingStep:
                         sample_rate_hz=config.settings.audio_sample_rate_hz,
                         channels=config.settings.audio_channels,
                     )
-                    prompt = build_lifelog_audio_chunk_prompt()
+                    prompt = build_lifelog_audio_chunk_prompt(language=language_label)
                     max_bytes = config.settings.audio_understanding_max_bytes
                     content_type = "audio/wav"
 

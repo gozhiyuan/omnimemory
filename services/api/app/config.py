@@ -72,6 +72,17 @@ class Settings(BaseSettings):
     )
     web_app_url: str = "http://localhost:3000"
 
+    # Auth (OIDC)
+    auth_enabled: bool = False
+    oidc_issuer_url: Optional[AnyUrl] = None
+    oidc_audience: Optional[str] = None
+    oidc_jwks_url: Optional[AnyUrl] = None
+    oidc_user_id_claim: str = "sub"
+    oidc_email_claim: str = "email"
+    oidc_name_claim: str = "name"
+    oidc_algorithms: list[str] = Field(default_factory=lambda: ["RS256"])
+    oidc_leeway_seconds: int = 60
+
     # Google Photos OAuth
     google_photos_client_id: Optional[str] = None
     google_photos_client_secret: Optional[str] = None

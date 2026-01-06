@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertTriangle, CheckCircle2, Info, X } from 'lucide-react';
 import { ToastPayload, ToastVariant } from '../services/toast';
+import { translateFromStorage } from '../i18n/core';
 
 type ToastRecord = {
   id: string;
@@ -137,7 +138,7 @@ export const ToastViewport: React.FC = () => {
               type="button"
               onClick={() => removeToast(toast.id)}
               className="text-slate-400 transition hover:text-slate-700"
-              aria-label="Dismiss notification"
+              aria-label={translateFromStorage('Dismiss notification')}
             >
               <X className="h-4 w-4" />
             </button>

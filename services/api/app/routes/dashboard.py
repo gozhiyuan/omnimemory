@@ -14,10 +14,10 @@ from sqlalchemy import Integer, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
+from ..auth import get_current_user_id
 from ..cache import get_cache_json, set_cache_json
 from ..config import get_settings
 from ..db.models import (
-    DEFAULT_TEST_USER_ID,
     AiUsageEvent,
     DataConnection,
     DerivedArtifact,
@@ -89,7 +89,7 @@ def _build_date_range(start_day: date, end_day: date) -> list[date]:
 
 @router.get("/stats", response_model=DashboardStats)
 async def get_dashboard_stats(
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,

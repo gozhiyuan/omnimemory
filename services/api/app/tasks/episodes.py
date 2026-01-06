@@ -27,6 +27,7 @@ from ..db.models import (
 )
 from ..db.session import isolated_session
 from ..pipeline.utils import build_vector_text, ensure_tz_aware, extract_keywords, parse_iso_datetime
+from ..user_settings import fetch_user_settings, resolve_language_code, resolve_language_label
 from ..vectorstore import delete_context_embeddings, search_contexts, upsert_context_embeddings
 
 
@@ -163,6 +164,7 @@ async def _generate_episode_summary(
     start_time: datetime,
     end_time: datetime,
     user_id: UUID,
+    language: str | None = None,
 ) -> Optional[dict[str, Any]]:
     if settings.video_understanding_provider != "gemini":
         return None
@@ -175,6 +177,7 @@ async def _generate_episode_summary(
         item_count=item_count,
         time_range=time_range,
         omitted_count=omitted_count,
+        language=language,
     )
     response = await summarize_text_with_gemini(
         prompt=prompt,
@@ -593,6 +596,9 @@ async def _update_episode_for_item(item_id: str) -> dict[str, Any]:
         if item.processing_status != "completed":
             return {"status": "not_ready"}
 
+        user_settings = await fetch_user_settings(session, item.user_id)
+        language = resolve_language_label(resolve_language_code(user_settings))
+
         context_stmt = select(ProcessedContext).where(
             ProcessedContext.user_id == item.user_id,
             ProcessedContext.is_episode.is_(False),
@@ -761,6 +767,7 @@ async def _update_episode_for_item(item_id: str) -> dict[str, Any]:
                     start_time=start_time,
                     end_time=end_time,
                     user_id=item.user_id,
+                    language=language,
                 )
 
         episode_records = _build_episode_context_records(

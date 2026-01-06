@@ -90,6 +90,7 @@ async def transcribe_media(
     user_id: UUID | str | None = None,
     item_id: UUID | str | None = None,
     step_name: str = "transcription",
+    language: str | None = None,
 ) -> Dict[str, Any]:
     if media_kind == "video":
         provider = settings.video_understanding_provider
@@ -106,7 +107,7 @@ async def transcribe_media(
     if provider != "gemini":
         return {"status": "disabled", "reason": f"unsupported_provider:{provider}", "text": ""}
 
-    prompt = build_lifelog_transcription_prompt(media_kind)
+    prompt = build_lifelog_transcription_prompt(media_kind, language=language)
     return await _call_gemini(
         media_bytes,
         prompt,

@@ -8,14 +8,15 @@ import re
 
 import uuid
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from ..auth import get_current_user
 from ..config import get_settings
 from ..storage import get_storage_provider
 
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_current_user)])
 
 
 def sanitize_filename(filename: str) -> str:

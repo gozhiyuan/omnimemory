@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from celery import Celery
+from celery.schedules import crontab
 from kombu import Exchange, Queue
 from loguru import logger
 
@@ -35,6 +36,10 @@ def configure_celery() -> None:
             "lifecycle-cleanup": {
                 "task": "maintenance.cleanup",
                 "schedule": 3600.0,
+            },
+            "weekly-recap": {
+                "task": "recaps.weekly",
+                "schedule": crontab(day_of_week="sun", hour=9, minute=0),
             },
         },
         task_queues=(

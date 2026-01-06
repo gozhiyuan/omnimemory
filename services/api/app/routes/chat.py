@@ -22,9 +22,9 @@ from ..ai.prompts import (
     build_lifelog_image_prompt,
     build_lifelog_session_title_prompt,
 )
+from ..auth import get_current_user_id
 from ..config import get_settings
 from ..db.models import (
-    DEFAULT_TEST_USER_ID,
     ChatAttachment,
     ChatFeedback,
     ChatMessage,
@@ -470,8 +470,25 @@ async def _get_or_create_session(
     return record
 
 
-async def _load_daily_summaries(session: AsyncSession, user_id: UUID, days: int = 7) -> list[DailySummary]:
-    since = date_today = datetime.now(timezone.utc).date()
+def _summary_display_date(
+    summary: DailySummary,
+    tz_offset_minutes: Optional[int],
+) -> date:
+    metadata = summary.summary_metadata or {}
+    if isinstance(metadata, dict) and metadata.get("tz_offset_minutes") is not None:
+        return summary.summary_date
+    offset_delta = timedelta(minutes=tz_offset_minutes or 0)
+    return (datetime.combine(summary.summary_date, time.min, tzinfo=timezone.utc) - offset_delta).date()
+
+
+async def _load_daily_summaries(
+    session: AsyncSession,
+    user_id: UUID,
+    days: int = 7,
+    tz_offset_minutes: Optional[int] = None,
+) -> list[DailySummary]:
+    offset_delta = timedelta(minutes=tz_offset_minutes or 0)
+    since = date_today = (datetime.now(timezone.utc) - offset_delta).date()
     start_date = date_today - timedelta(days=days - 1)
     stmt = (
         select(DailySummary)
@@ -817,11 +834,16 @@ async def _run_chat(
         if context:
             ordered_entries.append((context, hit))
 
-    daily_summaries = await _load_daily_summaries(session, user_id, days=7)
+    daily_summaries = await _load_daily_summaries(
+        session,
+        user_id,
+        days=7,
+        tz_offset_minutes=tz_offset_minutes,
+    )
     summary_block = ""
     if daily_summaries:
         summary_block = "\n".join(
-            f"{(datetime.combine(summary.summary_date, time.min, tzinfo=timezone.utc) - offset_delta).date().isoformat()}: {summary.summary}"
+            f"{_summary_display_date(summary, tz_offset_minutes).isoformat()}: {summary.summary}"
             for summary in daily_summaries
             if summary.summary
         )
@@ -933,7 +955,7 @@ async def _run_chat(
 @router.post("", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> ChatResponse:
     return await _run_chat(
@@ -952,7 +974,7 @@ async def chat_with_image(
     message: str = Form(""),
     session_id: Optional[UUID] = Form(None),
     tz_offset_minutes: Optional[int] = Form(None),
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> ChatResponse:
     settings = get_settings()
@@ -990,7 +1012,7 @@ async def chat_with_image(
 @router.post("/agents/cartoon", response_model=AgentImageResponse)
 async def agent_cartoon_day_summary(
     payload: AgentImageRequest,
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> AgentImageResponse:
     settings = get_settings()
@@ -1123,7 +1145,7 @@ async def agent_cartoon_day_summary(
 @router.post("/agents/insights", response_model=AgentImageResponse)
 async def agent_day_insights(
     payload: AgentInsightsRequest,
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> AgentImageResponse:
     settings = get_settings()
@@ -1347,7 +1369,7 @@ async def agent_day_insights(
 async def upload_chat_attachment(
     image: UploadFile = File(...),
     session_id: Optional[UUID] = Form(None),
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> ChatAttachmentResponse:
     settings = get_settings()
@@ -1388,7 +1410,7 @@ async def upload_chat_attachment(
 
 @router.get("/sessions", response_model=list[ChatSessionSummary])
 async def list_sessions(
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> list[ChatSessionSummary]:
     stmt = (
@@ -1416,7 +1438,7 @@ async def list_sessions(
 @router.get("/sessions/{session_id}", response_model=ChatSessionDetail)
 async def get_session(
     session_id: UUID,
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> ChatSessionDetail:
     chat_session = await session.get(ChatSession, session_id)
@@ -1457,7 +1479,7 @@ async def get_session(
 @router.post("/feedback")
 async def submit_feedback(
     payload: ChatFeedbackRequest,
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     if payload.rating not in (-1, 1):

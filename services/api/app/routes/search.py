@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
@@ -9,7 +10,8 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..db.models import DEFAULT_TEST_USER_ID, ProcessedContext
+from ..auth import get_current_user_id
+from ..db.models import ProcessedContext, SourceItem
 from ..db.session import get_session
 from ..vectorstore import search_contexts
 
@@ -21,12 +23,40 @@ router = APIRouter()
 async def search_items(
     q: str = Query(..., description="Search query"),
     limit: int = Query(5, ge=1, le=50),
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    start_date: Optional[date] = Query(default=None, description="Filter start date (YYYY-MM-DD)"),
+    end_date: Optional[date] = Query(default=None, description="Filter end date (YYYY-MM-DD)"),
+    provider: Optional[str] = Query(default=None, description="Filter by source provider"),
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    results = search_contexts(q, limit=limit, user_id=str(user_id), is_episode=True)
+    filter_start: Optional[datetime] = None
+    filter_end: Optional[datetime] = None
+    if start_date or end_date:
+        range_end = end_date or date.today()
+        range_start = start_date or range_end
+        if range_start > range_end:
+            range_start, range_end = range_end, range_start
+        filter_start = datetime.combine(range_start, time.min, tzinfo=timezone.utc)
+        filter_end = datetime.combine(range_end, time.min, tzinfo=timezone.utc) + timedelta(days=1)
+
+    provider_filter = provider.strip() if provider else None
+
+    results = search_contexts(
+        q,
+        limit=limit,
+        user_id=str(user_id),
+        is_episode=True,
+        start_time=filter_start,
+        end_time=filter_end,
+    )
     if len(results) < limit:
-        fallback = search_contexts(q, limit=limit * 2, user_id=str(user_id))
+        fallback = search_contexts(
+            q,
+            limit=limit * 2,
+            user_id=str(user_id),
+            start_time=filter_start,
+            end_time=filter_end,
+        )
         seen = {result.get("context_id") for result in results}
         for entry in fallback:
             payload = entry.get("payload") or {}
@@ -52,6 +82,21 @@ async def search_items(
         db_results = await session.execute(stmt)
         contexts_by_id = {context.id: context for context in db_results.scalars().all()}
 
+    provider_source_ids: Optional[set[UUID]] = None
+    if provider_filter and contexts_by_id:
+        source_ids: set[UUID] = set()
+        for context in contexts_by_id.values():
+            source_ids.update(context.source_item_ids)
+        if source_ids:
+            provider_stmt = select(SourceItem.id).where(
+                SourceItem.id.in_(source_ids),
+                SourceItem.provider == provider_filter,
+            )
+            provider_rows = await session.execute(provider_stmt)
+            provider_source_ids = {row[0] for row in provider_rows.fetchall()}
+        else:
+            provider_source_ids = set()
+
     enriched_results = []
     for result in results:
         context_id_raw = result.get("context_id")
@@ -61,6 +106,11 @@ async def search_items(
         except (TypeError, ValueError):
             context_id = None
         context = contexts_by_id.get(context_id) if context_id else None
+        if provider_source_ids is not None:
+            if not context:
+                continue
+            if not any(source_id in provider_source_ids for source_id in context.source_item_ids):
+                continue
         enriched_results.append(
             {
                 "context_id": context_id_raw,

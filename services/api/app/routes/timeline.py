@@ -9,27 +9,32 @@ import json
 from typing import List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
+from ..auth import get_current_user_id
 from ..celery_app import celery_app
+from ..ai import transcribe_media
 from ..config import get_settings
 from ..db.models import (
-    DEFAULT_TEST_USER_ID,
     DataConnection,
+    DailySummary,
     DerivedArtifact,
     ProcessedContent,
     ProcessedContext,
     SourceItem,
+    TimelineDayHighlight,
 )
 from ..db.session import get_session
 from ..google_photos import get_valid_access_token
 from ..storage import get_storage_provider
+from ..tasks.episodes import _update_daily_summary as refresh_daily_summary
+from ..user_settings import fetch_user_settings, resolve_language_label, resolve_language_code
 from ..vectorstore import delete_context_embeddings, upsert_context_embeddings
-from ..pipeline.utils import build_vector_text, ensure_tz_aware
+from ..pipeline.utils import build_vector_text, ensure_tz_aware, extract_keywords
 
 
 router = APIRouter()
@@ -62,6 +67,7 @@ class TimelineDay(BaseModel):
     items: List[TimelineItem]
     episodes: list["TimelineEpisode"] = []
     daily_summary: Optional["TimelineDailySummary"] = None
+    highlight: Optional["TimelineHighlight"] = None
 
 
 class TimelineContext(BaseModel):
@@ -120,6 +126,23 @@ class TimelineDailySummary(BaseModel):
     keywords: list[str]
 
 
+class TimelineHighlight(BaseModel):
+    item_id: str
+    item_type: str
+    thumbnail_url: Optional[str] = None
+
+
+class DailySummaryUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    summary: Optional[str] = None
+    keywords: Optional[list[str]] = None
+    tz_offset_minutes: Optional[int] = None
+
+
+class DailySummaryResetRequest(BaseModel):
+    tz_offset_minutes: Optional[int] = None
+
+
 class TimelineEpisodeDetail(BaseModel):
     episode_id: str
     title: str
@@ -139,9 +162,193 @@ class EpisodeUpdateRequest(BaseModel):
     context_type: str = "activity_context"
 
 
+class TimelineHighlightRequest(BaseModel):
+    highlight_date: date
+    item_id: UUID
+    tz_offset_minutes: Optional[int] = None
+
+
+class TimelineHighlightResponse(BaseModel):
+    highlight_date: date
+    item_id: UUID
+    status: str
+
+
+class TimelineHighlightDeleteResponse(BaseModel):
+    highlight_date: date
+    status: str
+
+
 class DeleteResponse(BaseModel):
     item_id: UUID
     status: str
+
+
+def _resolve_tz_offset_minutes(
+    context: ProcessedContext,
+    tz_offset_minutes: Optional[int] = None,
+) -> int:
+    if tz_offset_minutes is not None:
+        return int(tz_offset_minutes)
+    versions = context.processor_versions or {}
+    if isinstance(versions, dict):
+        stored = versions.get("tz_offset_minutes")
+        if stored is not None:
+            try:
+                return int(stored)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def _summary_date_from_context(
+    context: ProcessedContext,
+    tz_offset_minutes: Optional[int] = None,
+) -> date:
+    summary_time = ensure_tz_aware(context.start_time_utc or context.event_time_utc or context.created_at)
+    offset_minutes = _resolve_tz_offset_minutes(context, tz_offset_minutes)
+    offset = timedelta(minutes=offset_minutes)
+    return (summary_time - offset).date()
+
+
+def _summary_window(summary_date: date, tz_offset_minutes: int) -> tuple[datetime, datetime]:
+    offset = timedelta(minutes=tz_offset_minutes)
+    start = datetime.combine(summary_date, time.min, tzinfo=timezone.utc) + offset
+    end = start + timedelta(days=1)
+    return start, end
+
+
+async def _load_daily_summary_context(
+    context_id: str,
+    user_id: UUID,
+    session: AsyncSession,
+) -> ProcessedContext:
+    try:
+        context_uuid = UUID(context_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=404, detail="Daily summary not found")
+    context = await session.get(ProcessedContext, context_uuid)
+    if not context or context.user_id != user_id or context.context_type != "daily_summary":
+        raise HTTPException(status_code=404, detail="Daily summary not found")
+    return context
+
+
+async def _persist_daily_summary_update(
+    *,
+    context: ProcessedContext,
+    user_id: UUID,
+    session: AsyncSession,
+    title: Optional[str] = None,
+    summary: Optional[str] = None,
+    keywords: Optional[list[str]] = None,
+    tz_offset_minutes: Optional[int] = None,
+    mark_edited: bool = True,
+) -> TimelineDailySummary:
+    if title is not None:
+        context.title = title
+    if summary is not None:
+        context.summary = summary
+    if summary is not None and keywords is None:
+        keywords = extract_keywords(summary)
+    if keywords is not None:
+        context.keywords = keywords
+
+    processor_versions = context.processor_versions or {}
+    existing_summary_date: Optional[date] = None
+    existing_edited = False
+    existing_offset: Optional[int] = None
+    if isinstance(processor_versions, dict):
+        date_value = processor_versions.get("daily_summary_date")
+        if date_value:
+            try:
+                existing_summary_date = date.fromisoformat(date_value)
+            except ValueError:
+                existing_summary_date = None
+        existing_edited = bool(processor_versions.get("edited_by_user"))
+        stored_offset = processor_versions.get("tz_offset_minutes")
+        if stored_offset is not None:
+            try:
+                existing_offset = int(stored_offset)
+            except (TypeError, ValueError):
+                existing_offset = None
+
+    resolved_offset = _resolve_tz_offset_minutes(context, tz_offset_minutes)
+    should_align_window = tz_offset_minutes is not None or existing_offset is not None
+    summary_date = _summary_date_from_context(context, tz_offset_minutes=resolved_offset)
+    if should_align_window:
+        start, end = _summary_window(summary_date, resolved_offset)
+        context.event_time_utc = start
+        context.start_time_utc = start
+        context.end_time_utc = end
+
+    context.vector_text = build_vector_text(context.title, context.summary, context.keywords or [])
+    if isinstance(processor_versions, dict):
+        is_user_edit = mark_edited or existing_edited
+        if is_user_edit:
+            processor_versions["edited_by_user"] = True
+        else:
+            processor_versions.pop("edited_by_user", None)
+        processor_versions["daily_summary_date"] = summary_date.isoformat()
+        if should_align_window:
+            processor_versions["tz_offset_minutes"] = resolved_offset
+    context.processor_versions = processor_versions
+    await session.flush()
+    try:
+        upsert_context_embeddings([context])
+    except Exception as exc:  # pragma: no cover - external service dependency
+        logger.warning("Daily summary embedding update failed for {}: {}", context.id, exc)
+
+    metadata: dict = {}
+    existing_summary = await session.execute(
+        select(DailySummary).where(
+            DailySummary.user_id == user_id,
+            DailySummary.summary_date == summary_date,
+        )
+    )
+    existing = existing_summary.scalar_one_or_none()
+    if existing and isinstance(existing.summary_metadata, dict):
+        metadata.update(existing.summary_metadata)
+    metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
+    if mark_edited or existing_edited:
+        metadata["edited_by_user"] = True
+    else:
+        metadata.pop("edited_by_user", None)
+    if should_align_window:
+        metadata["tz_offset_minutes"] = resolved_offset
+
+    daily_table = DailySummary.__table__
+    daily_upsert = insert(daily_table).values(
+        {
+            daily_table.c.user_id: user_id,
+            daily_table.c.summary_date: summary_date,
+            daily_table.c.summary: context.summary,
+            daily_table.c.metadata: metadata,
+        }
+    )
+    daily_upsert = daily_upsert.on_conflict_do_update(
+        index_elements=[daily_table.c.user_id, daily_table.c.summary_date],
+        set_={
+            daily_table.c.summary: context.summary,
+            daily_table.c.metadata: metadata,
+        },
+    )
+    await session.execute(daily_upsert)
+    if existing_summary_date and existing_summary_date != summary_date:
+        await session.execute(
+            delete(DailySummary).where(
+                DailySummary.user_id == user_id,
+                DailySummary.summary_date == existing_summary_date,
+            )
+        )
+    await session.commit()
+
+    return TimelineDailySummary(
+        context_id=str(context.id),
+        summary_date=summary_date,
+        title=context.title,
+        summary=context.summary,
+        keywords=context.keywords or [],
+    )
 
 
 WEB_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
@@ -149,7 +356,7 @@ WEB_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 
 @router.get("/", response_model=list[TimelineDay])
 async def get_timeline(
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
     limit: int = 200,
     provider: Optional[str] = None,
@@ -187,12 +394,32 @@ async def get_timeline(
     result = await session.execute(stmt)
     items: list[SourceItem] = list(result.scalars().all())
 
+    highlight_stmt = select(TimelineDayHighlight).where(TimelineDayHighlight.user_id == user_id)
+    if start_date:
+        highlight_stmt = highlight_stmt.where(TimelineDayHighlight.highlight_date >= start_date)
+    if end_date:
+        highlight_stmt = highlight_stmt.where(TimelineDayHighlight.highlight_date <= end_date)
+    highlight_rows = await session.execute(highlight_stmt)
+    highlight_entries = list(highlight_rows.scalars().all())
+    highlights_by_date = {entry.highlight_date: entry for entry in highlight_entries}
+    highlight_item_ids = [entry.source_item_id for entry in highlight_entries]
+
+    item_ids = [item.id for item in items]
+    lookup_item_ids = list(dict.fromkeys(item_ids + highlight_item_ids))
+    items_by_id = {item.id: item for item in items}
+    highlight_items_by_id: dict[UUID, SourceItem] = {}
+    missing_highlight_ids = [item_id for item_id in highlight_item_ids if item_id not in items_by_id]
+    if missing_highlight_ids:
+        highlight_item_rows = await session.execute(
+            select(SourceItem).where(SourceItem.id.in_(missing_highlight_ids))
+        )
+        highlight_items_by_id = {item.id: item for item in highlight_item_rows.scalars().all()}
+
     captions: dict[UUID, str] = {}
     context_summaries: dict[UUID, str] = {}
     preview_keys: dict[UUID, str] = {}
     keyframe_keys: dict[UUID, str] = {}
-    if items:
-        item_ids = [item.id for item in items]
+    if item_ids:
         caption_stmt = select(ProcessedContent.item_id, ProcessedContent.data).where(
             ProcessedContent.item_id.in_(item_ids),
             ProcessedContent.content_role == "caption",
@@ -218,8 +445,9 @@ async def get_timeline(
                 if source_id not in context_summaries or context.context_type == "activity_context":
                     context_summaries[source_id] = context.summary
 
+    if lookup_item_ids:
         preview_stmt = select(DerivedArtifact.source_item_id, DerivedArtifact.payload).where(
-            DerivedArtifact.source_item_id.in_(item_ids),
+            DerivedArtifact.source_item_id.in_(lookup_item_ids),
             DerivedArtifact.artifact_type == "preview_image",
         )
         preview_rows = await session.execute(preview_stmt)
@@ -229,7 +457,7 @@ async def get_timeline(
                 preview_keys[row.source_item_id] = payload["storage_key"]
 
         keyframe_stmt = select(DerivedArtifact.source_item_id, DerivedArtifact.payload).where(
-            DerivedArtifact.source_item_id.in_(item_ids),
+            DerivedArtifact.source_item_id.in_(lookup_item_ids),
             DerivedArtifact.artifact_type == "keyframes",
         )
         keyframe_rows = await session.execute(keyframe_stmt)
@@ -266,14 +494,21 @@ async def get_timeline(
     poster_urls: dict[UUID, Optional[str]] = {}
     connections: dict[UUID, DataConnection] = {}
     tokens: dict[UUID, str] = {}
-    if items:
-        connection_ids = [getattr(item, "connection_id", None) for item in items if getattr(item, "connection_id", None)]
+    all_items_by_id = dict(items_by_id)
+    all_items_by_id.update(highlight_items_by_id)
+    items_for_signing = list(all_items_by_id.values())
+    if items_for_signing:
+        connection_ids = [
+            getattr(item, "connection_id", None)
+            for item in items_for_signing
+            if getattr(item, "connection_id", None)
+        ]
         if connection_ids:
             conn_rows = await session.execute(select(DataConnection).where(DataConnection.id.in_(connection_ids)))
             connections = {conn.id: conn for conn in conn_rows.scalars().all()}
             http_connection_ids = {
                 item.connection_id
-                for item in items
+                for item in items_for_signing
                 if item.connection_id
                 and item.storage_key
                 and item.storage_key.startswith(("http://", "https://"))
@@ -335,6 +570,37 @@ async def get_timeline(
         poster_urls = {
             item_id: url for (item_id, _), url in zip(poster_candidates, poster_signed)
         }
+
+    async def build_thumbnail(item: SourceItem) -> Optional[str]:
+        if item.item_type == "photo":
+            content_type = (item.content_type or "").lower()
+            if content_type in WEB_IMAGE_TYPES:
+                return await download_url_for(item, None)
+            preview_key = preview_keys.get(item.id)
+            if preview_key:
+                return await download_url_for(item, preview_key)
+            return None
+        if item.item_type == "video":
+            key = keyframe_keys.get(item.id)
+            if key:
+                return await sign_url(key)
+        return None
+
+    highlight_thumbnails: dict[UUID, Optional[str]] = {}
+    if highlight_item_ids:
+        highlight_items = [
+            all_items_by_id[item_id]
+            for item_id in highlight_item_ids
+            if item_id in all_items_by_id
+        ]
+        if highlight_items:
+            highlight_signed = await asyncio.gather(
+                *(build_thumbnail(item) for item in highlight_items),
+                return_exceptions=False,
+            )
+            highlight_thumbnails = {
+                item.id: url for item, url in zip(highlight_items, highlight_signed)
+            }
 
     item_by_id = {item.id: item for item in items}
 
@@ -470,6 +736,18 @@ async def get_timeline(
     timeline: list[TimelineDay] = []
     for day in sorted(grouped.keys(), reverse=True):
         day_items = grouped[day]
+        highlight_entry = highlights_by_date.get(day)
+        highlight: Optional[TimelineHighlight] = None
+        if highlight_entry:
+            highlight_item = items_by_id.get(highlight_entry.source_item_id) or highlight_items_by_id.get(
+                highlight_entry.source_item_id
+            )
+            if highlight_item:
+                highlight = TimelineHighlight(
+                    item_id=str(highlight_item.id),
+                    item_type=highlight_item.item_type,
+                    thumbnail_url=highlight_thumbnails.get(highlight_item.id),
+                )
         timeline.append(
             TimelineDay(
                 date=day,
@@ -496,15 +774,195 @@ async def get_timeline(
                     reverse=False,
                 ),
                 daily_summary=daily_summaries_by_date.get(day),
+                highlight=highlight,
             )
         )
 
     return timeline
 
 
+@router.patch("/daily-summaries/{context_id}", response_model=TimelineDailySummary)
+async def update_daily_summary(
+    context_id: str,
+    payload: DailySummaryUpdateRequest,
+    user_id: UUID = Depends(get_current_user_id),
+    session: AsyncSession = Depends(get_session),
+) -> TimelineDailySummary:
+    context = await _load_daily_summary_context(context_id, user_id, session)
+    if payload.title is None and payload.summary is None and payload.keywords is None:
+        if payload.tz_offset_minutes is not None:
+            return await _persist_daily_summary_update(
+                context=context,
+                user_id=user_id,
+                session=session,
+                tz_offset_minutes=payload.tz_offset_minutes,
+                mark_edited=False,
+            )
+        return TimelineDailySummary(
+            context_id=str(context.id),
+            summary_date=_summary_date_from_context(context),
+            title=context.title,
+            summary=context.summary,
+            keywords=context.keywords or [],
+        )
+
+    return await _persist_daily_summary_update(
+        context=context,
+        user_id=user_id,
+        session=session,
+        title=payload.title,
+        summary=payload.summary,
+        keywords=payload.keywords,
+        tz_offset_minutes=payload.tz_offset_minutes,
+    )
+
+
+@router.post("/daily-summaries/{context_id}/voice", response_model=TimelineDailySummary)
+async def update_daily_summary_from_voice(
+    context_id: str,
+    file: UploadFile = File(...),
+    tz_offset_minutes: Optional[int] = Form(None),
+    user_id: UUID = Depends(get_current_user_id),
+    session: AsyncSession = Depends(get_session),
+) -> TimelineDailySummary:
+    context = await _load_daily_summary_context(context_id, user_id, session)
+    blob = await file.read()
+    if not blob:
+        raise HTTPException(status_code=400, detail="Empty audio payload")
+
+    settings = get_settings()
+    user_settings = await fetch_user_settings(session, user_id)
+    language = resolve_language_label(resolve_language_code(user_settings))
+    transcript = await transcribe_media(
+        blob,
+        settings,
+        content_type=file.content_type,
+        media_kind="audio",
+        user_id=user_id,
+        item_id=context.id,
+        step_name="daily_summary_voice",
+        language=language,
+    )
+    if transcript.get("status") != "ok":
+        reason = transcript.get("reason") or transcript.get("error") or "transcription_failed"
+        raise HTTPException(status_code=502, detail=f"Voice transcription failed ({reason})")
+    text = (transcript.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="No transcript returned")
+
+    return await _persist_daily_summary_update(
+        context=context,
+        user_id=user_id,
+        session=session,
+        summary=text,
+        tz_offset_minutes=tz_offset_minutes,
+    )
+
+
+@router.post("/daily-summaries/{context_id}/reset", response_model=TimelineDailySummary)
+async def reset_daily_summary(
+    context_id: str,
+    payload: DailySummaryResetRequest,
+    user_id: UUID = Depends(get_current_user_id),
+    session: AsyncSession = Depends(get_session),
+) -> TimelineDailySummary:
+    context = await _load_daily_summary_context(context_id, user_id, session)
+    resolved_offset = _resolve_tz_offset_minutes(context, payload.tz_offset_minutes)
+    summary_date = _summary_date_from_context(context, tz_offset_minutes=resolved_offset)
+    await refresh_daily_summary(
+        session,
+        user_id,
+        summary_date,
+        tz_offset_minutes=resolved_offset,
+        context_id=context.id,
+        force_regen=True,
+    )
+    await session.commit()
+    refreshed = await session.get(ProcessedContext, context.id)
+    if not refreshed:
+        raise HTTPException(status_code=404, detail="Daily summary not found")
+    return TimelineDailySummary(
+        context_id=str(refreshed.id),
+        summary_date=_summary_date_from_context(refreshed, tz_offset_minutes=resolved_offset),
+        title=refreshed.title,
+        summary=refreshed.summary,
+        keywords=refreshed.keywords or [],
+    )
+
+
+@router.post("/highlights", response_model=TimelineHighlightResponse)
+async def set_timeline_highlight(
+    request: TimelineHighlightRequest,
+    user_id: UUID = Depends(get_current_user_id),
+    session: AsyncSession = Depends(get_session),
+) -> TimelineHighlightResponse:
+    item = await session.get(SourceItem, request.item_id)
+    if not item or item.user_id != user_id:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    offset_minutes = request.tz_offset_minutes or 0
+    offset = timedelta(minutes=offset_minutes)
+    item_time = ensure_tz_aware(item.event_time_utc or item.captured_at or item.created_at)
+    local_date = (item_time - offset).date()
+    if local_date != request.highlight_date:
+        raise HTTPException(status_code=400, detail="Item does not belong to the highlight date")
+
+    stmt = select(TimelineDayHighlight).where(
+        TimelineDayHighlight.user_id == user_id,
+        TimelineDayHighlight.highlight_date == request.highlight_date,
+    )
+    rows = await session.execute(stmt)
+    highlight = rows.scalars().first()
+    now = datetime.now(timezone.utc)
+    if highlight:
+        highlight.source_item_id = item.id
+        highlight.updated_at = now
+    else:
+        highlight = TimelineDayHighlight(
+            user_id=user_id,
+            highlight_date=request.highlight_date,
+            source_item_id=item.id,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(highlight)
+    await session.commit()
+
+    return TimelineHighlightResponse(
+        highlight_date=request.highlight_date,
+        item_id=item.id,
+        status="ok",
+    )
+
+
+@router.delete("/highlights/{highlight_date}", response_model=TimelineHighlightDeleteResponse)
+async def clear_timeline_highlight(
+    highlight_date: date,
+    user_id: UUID = Depends(get_current_user_id),
+    session: AsyncSession = Depends(get_session),
+) -> TimelineHighlightDeleteResponse:
+    stmt = select(TimelineDayHighlight).where(
+        TimelineDayHighlight.user_id == user_id,
+        TimelineDayHighlight.highlight_date == highlight_date,
+    )
+    rows = await session.execute(stmt)
+    highlight = rows.scalars().first()
+    if highlight:
+        await session.delete(highlight)
+        await session.commit()
+        status = "cleared"
+    else:
+        status = "missing"
+
+    return TimelineHighlightDeleteResponse(
+        highlight_date=highlight_date,
+        status=status,
+    )
+
+
 @router.get("/items", response_model=TimelineItemsPage)
 async def get_timeline_items(
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
     limit: int = 50,
     offset: int = 0,
@@ -724,7 +1182,7 @@ async def get_timeline_items(
 @router.get("/items/{item_id}", response_model=TimelineItemDetail)
 async def get_timeline_item_detail(
     item_id: UUID,
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> TimelineItemDetail:
     item = await session.get(SourceItem, item_id)
@@ -905,7 +1363,7 @@ async def get_timeline_item_detail(
 @router.get("/episodes/{episode_id}", response_model=TimelineEpisodeDetail)
 async def get_timeline_episode_detail(
     episode_id: str,
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> TimelineEpisodeDetail:
     episode_stmt = select(ProcessedContext).where(
@@ -1101,7 +1559,7 @@ async def get_timeline_episode_detail(
 async def update_episode_detail(
     episode_id: str,
     payload: EpisodeUpdateRequest,
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> TimelineEpisodeDetail:
     context_stmt = select(ProcessedContext).where(
@@ -1147,7 +1605,7 @@ async def update_episode_detail(
 @router.delete("/items/{item_id}", response_model=DeleteResponse)
 async def delete_timeline_item(
     item_id: UUID,
-    user_id: UUID = DEFAULT_TEST_USER_ID,
+    user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> DeleteResponse:
     item = await session.get(SourceItem, item_id)

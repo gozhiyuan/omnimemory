@@ -12,7 +12,10 @@ from ..config import Settings
 
 
 async def _run_google_cloud_vision(
-    image_bytes: bytes, settings: Settings, content_type: str | None
+    image_bytes: bytes,
+    settings: Settings,
+    content_type: str | None,
+    language_hints: list[str] | None,
 ) -> Dict[str, Any]:
     api_key = settings.ocr_google_api_key
     if not api_key:
@@ -24,7 +27,7 @@ async def _run_google_cloud_vision(
             {
                 "image": {"content": encoded},
                 "features": [{"type": "TEXT_DETECTION", "maxResults": 1}],
-                "imageContext": {"languageHints": settings.ocr_language_hints},
+                "imageContext": {"languageHints": language_hints or settings.ocr_language_hints},
             }
         ]
     }
@@ -57,10 +60,11 @@ async def run_ocr(
     image_bytes: bytes,
     settings: Settings,
     content_type: str | None = None,
+    language_hints: list[str] | None = None,
 ) -> Dict[str, Any]:
     provider = settings.ocr_provider
     if provider == "none":
         return {"text": "", "status": "disabled", "reason": "provider_disabled"}
     if provider == "google_cloud_vision":
-        return await _run_google_cloud_vision(image_bytes, settings, content_type)
+        return await _run_google_cloud_vision(image_bytes, settings, content_type, language_hints)
     return {"text": "", "status": "disabled", "reason": f"unsupported_provider:{provider}"}

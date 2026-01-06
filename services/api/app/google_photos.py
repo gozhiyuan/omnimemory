@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
+from uuid import UUID
 
 from loguru import logger
 
@@ -12,13 +13,32 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_settings
-from .db.models import DataConnection, DEFAULT_TEST_USER_ID
+from .db.models import DataConnection
 
 
 GOOGLE_PHOTOS_PICKER_SESSIONS_ENDPOINT = "https://photospicker.googleapis.com/v1/sessions"
 GOOGLE_PHOTOS_PICKER_MEDIA_ENDPOINT = "https://photospicker.googleapis.com/v1/mediaItems"
 GOOGLE_PHOTOS_PICKER_MEDIA_ITEM_ENDPOINT = "https://photospicker.googleapis.com/v1/mediaItems/"
 GOOGLE_PHOTOS_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+
+
+class PickerPendingError(RuntimeError):
+    """Raised when the picker session is awaiting user selection."""
+
+
+def _is_pending_picker_error(payload: dict) -> bool:
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict):
+        return False
+    if error.get("status") != "FAILED_PRECONDITION":
+        return False
+    details = error.get("details")
+    if isinstance(details, list):
+        for detail in details:
+            if isinstance(detail, dict) and detail.get("reason") == "PENDING_USER_ACTION":
+                return True
+    message = error.get("message") or ""
+    return "not picked media items" in message.lower()
 
 
 def parse_google_timestamp(value: Optional[str]) -> Optional[datetime]:
@@ -125,11 +145,12 @@ def extract_picker_location(item: dict) -> Optional[dict]:
 
 async def store_google_photos_tokens(
     session: AsyncSession,
+    user_id: UUID,
     token_data: dict,
     access_token: str,
     expires_at: Optional[datetime],
 ) -> None:
-    connection = await _get_google_photos_connection(session)
+    connection = await _get_google_photos_connection(session, user_id)
     connected_at = datetime.now(timezone.utc)
     refresh_token = token_data.get("refresh_token")
     if connection and not refresh_token:
@@ -144,7 +165,7 @@ async def store_google_photos_tokens(
 
     if connection is None:
         connection = DataConnection(
-            user_id=DEFAULT_TEST_USER_ID,
+            user_id=user_id,
             provider="google_photos",
             status="active",
             config=config,
@@ -252,6 +273,13 @@ async def fetch_picker_media_items(access_token: str, session_id: str) -> list[d
                 params["pageToken"] = page_token
             response = await client.get(GOOGLE_PHOTOS_PICKER_MEDIA_ENDPOINT, headers=headers, params=params)
             if response.status_code >= 400:
+                if response.status_code == 400:
+                    try:
+                        payload = response.json()
+                    except Exception:
+                        payload = {}
+                    if _is_pending_picker_error(payload):
+                        raise PickerPendingError("picker selection pending")
                 if use_fields_mask and response.status_code == 400 and "fields" in response.text:
                     logger.warning("Picker media request failed with fields mask; retrying without fields: {}", response.text)
                     use_fields_mask = False
@@ -295,10 +323,13 @@ async def fetch_picker_media_item(
     return payload if isinstance(payload, dict) else {}
 
 
-async def _get_google_photos_connection(session: AsyncSession) -> Optional[DataConnection]:
+async def _get_google_photos_connection(
+    session: AsyncSession,
+    user_id: UUID,
+) -> Optional[DataConnection]:
     result = await session.execute(
         select(DataConnection).where(
-            DataConnection.user_id == DEFAULT_TEST_USER_ID,
+            DataConnection.user_id == user_id,
             DataConnection.provider == "google_photos",
         )
     )

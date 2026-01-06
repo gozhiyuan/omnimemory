@@ -9,9 +9,9 @@
 
 ## 1. Executive Summary
 
-Build OmniMemory, an AI-powered personal memory assistant that ingests multimodal data from 3rd-party sources and user uploads, processes and organizes it into a queryable knowledge base, and provides conversational access through a web-based chat interface.
+Build OmniMemory, an AI-powered personal memory assistant that ingests multimodal data from 3rd-party sources and user uploads, processes and organizes it into a queryable knowledge base, and provides conversational access through a web-based chat interface with OIDC-based authentication and per-user settings.
 
-**MVP Scope (8-12 weeks):** React + Vite single-page web app (tabs: Dashboard, Timeline, Chat, Ingest) backed by FastAPI + Celery, focusing on manual uploads, Google Photos picker-based ingest, the ingestion pipeline, timeline/day summaries, and RAG-powered chat.
+**MVP Scope (8-12 weeks):** React + Vite single-page web app (tabs: Dashboard, Timeline, Chat, Ingest, Settings) backed by FastAPI + Celery, focusing on manual uploads, Google Photos picker-based ingest, the ingestion pipeline, timeline/day summaries, and RAG-powered chat with OIDC auth.
 
 ---
 
@@ -76,15 +76,16 @@ Build OmniMemory, an AI-powered personal memory assistant that ingests multimoda
 - Chat (web): Gemini via FastAPI RAG pipeline (citations + recent summaries)
 
 **3.5 Application Layer (Web Only)**
-- Single-page React + Vite app with shared layout and tabbed views (auth deferred; current dev flow uses a test user)
+- Single-page React + Vite app with shared layout and tabbed views (OIDC auth supported via Authentik in local dev; auth can be disabled for seeding)
 - **Ingest Tab:** Drag-and-drop uploads + Google Photos connection card with OAuth + Picker launch, selection count, and ingest status
 - **Chat Tab:** RAG chat with citations, session history, image upload, and chat attachments
 - **Agents (Studio sidebar):** Cartoon Day Summary + Day Insights Infographic (image + stats + surprise moment)
 - **Timeline Tab:** Day/week/month/year views, episode list with drill-down details, daily summary, search bar, per-day upload flow
 - **Dashboard Tab:** Ingestion stats, storage usage, connected-source health indicators, and AI usage (tokens + cost)
+- **Settings Tab:** Profile (name/photo/email), language + timezone, timeline defaults, notifications (weekly recap), usage cards wired to `/dashboard/stats`
 
 **3.6 Infrastructure**
-- **Auth/DB/Storage:** Postgres + RustFS/S3 (auth provider TBD; Supabase optional)
+- **Auth/DB/Storage:** Postgres + RustFS/S3 + OIDC (Authentik for local dev; Supabase optional)
 - **Vector DB:** Qdrant Cloud (start) → self-hosted Qdrant (scale)
 - **API Backend:** FastAPI (Python)
 - **Task Queue:** Celery + Valkey (Redis-compatible) for async processing
@@ -93,8 +94,13 @@ Build OmniMemory, an AI-powered personal memory assistant that ingests multimoda
 - **Cloud:** Start with Postgres + RustFS/S3 + Qdrant Cloud + Cloud Run (FastAPI + Celery) while serving the SPA from Cloud Storage/Cloud CDN; migrate to more GCP-native services if commercialization requires
 - **Security Baseline:** Encrypt at rest/in transit, store OAuth tokens with AES-256 + rotation, implement user data deletion workflow within 24h, document GDPR-compliant privacy policy
 
+**Local OIDC Configuration (Dev)**
+- Start Authentik via `make authentik-up` and create an OIDC provider + application (slug `omnimemory`).
+- API env (`.env.dev`): `AUTH_ENABLED=true`, `OIDC_ISSUER_URL=http://localhost:9002/application/o/omnimemory/`, `OIDC_JWKS_URL=http://localhost:9002/application/o/omnimemory/jwks/`, `OIDC_AUDIENCE=omnimemory`.
+- Web env (`apps/web/.env.local`): `VITE_OIDC_ISSUER_URL`, `VITE_OIDC_CLIENT_ID`, `VITE_OIDC_AUTH_URL`, `VITE_OIDC_TOKEN_URL`, plus `VITE_OIDC_REDIRECT_URI=http://localhost:3000/`.
+
 ### OUT OF SCOPE (Post-MVP) ❌
-- Authentication + multi-user RBAC (current dev mode uses a test user)
+- Advanced RBAC, social logins, account recovery, and enterprise auth policies
 - Mobile apps (iOS/Android)
 - Desktop capture agent
 - Automated screenshot/video capture
@@ -109,7 +115,7 @@ Build OmniMemory, an AI-powered personal memory assistant that ingests multimoda
 - mem0 conversation memory and graph-based retrieval
 - Scheduled clustering jobs for event/memory aggregation
 - “Surprise me” insights and customizable ingestion pipeline
-- Full Settings surface for user preferences
+- Full privacy/data controls beyond the current Settings subset
 
 ---
 
@@ -727,7 +733,7 @@ Chat history is stored in Postgres (`chat_sessions`, `chat_messages`, `chat_atta
 
 2. **Access Control:**
    - Row-Level Security (RLS) in Postgres for all user data tables
-   - API authentication: JWT tokens from auth provider (TBD)
+   - API authentication: OIDC JWT tokens validated via JWKS (Authentik for local dev)
    - Rate limiting: 100 requests/min per user
 
 3. **Privacy:**
@@ -767,6 +773,9 @@ POST   /upload/ingest                   # Create SourceItem + enqueue processing
 GET    /timeline                        # Timeline feed (grouped by day)
 GET    /timeline/items                  # Timeline items (paged)
 GET    /dashboard/stats                 # Dashboard aggregates
+GET    /settings                        # User settings
+PUT    /settings                        # Update user settings
+POST   /settings/weekly-recap           # Trigger weekly recap generation
 GET    /search?q=...                    # Qdrant-backed search
 
 GET    /integrations/google/photos/auth-url
@@ -872,11 +881,11 @@ POST   /chat/feedback                   # Per-message feedback
 - [ ] Set up monorepo structure
 - [ ] Initialize Postgres + object storage (RustFS/S3) for MVP
 - [ ] Set up Qdrant Cloud instance
-- [ ] Implement FastAPI boilerplate with auth integration (provider TBD)
+- [x] Implement FastAPI boilerplate with OIDC auth integration (Authentik for local dev)
 - [ ] Create initial database schema (users, data_connections, source_items, processed_content, daily_summaries)
 - [ ] Set up Celery + Valkey (Redis-compatible) for task queue
-- [ ] Create/maintain React + Vite SPA with auth integration (provider TBD)
-- [ ] Implement login/logout flow
+- [x] Create/maintain React + Vite SPA with OIDC auth integration
+- [x] Implement login/logout flow
 
 ### Week 3-4: Data Ingestion
 - [ ] Harden manual upload + Google Photos Picker ingest (keep current flows working)

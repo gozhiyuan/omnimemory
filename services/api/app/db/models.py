@@ -47,6 +47,35 @@ class User(Base):
     items: Mapped[list["SourceItem"]] = relationship(back_populates="user")
 
 
+class Device(Base):
+    __tablename__ = "devices"
+    __table_args__ = (
+        UniqueConstraint("device_token_hash", name="devices_token_hash_idx"),
+        UniqueConstraint("pairing_code_hash", name="devices_pairing_code_hash_idx"),
+        Index("devices_user_id_idx", "user_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"))
+    name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    device_token_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    token_salt: Mapped[str] = mapped_column(String(64), nullable=False)
+    pairing_code_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    pairing_code_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("NOW()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("NOW()"), nullable=False
+    )
+
+    user: Mapped[User] = relationship()
+
+
 class UserSettings(Base):
     __tablename__ = "user_settings"
     __table_args__ = (UniqueConstraint("user_id", name="user_settings_user_id_idx"),)
@@ -95,12 +124,18 @@ class SourceItem(Base):
             "processing_status IN ('pending','processing','completed','failed')",
             name="source_items_processing_status_check",
         ),
+        UniqueConstraint("device_id", "device_seq", name="source_items_device_seq_idx"),
+        Index("source_items_device_id_idx", "device_id"),
     )
 
     id: Mapped[UUID] = mapped_column(
         PGUUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
     user_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"))
+    device_id: Mapped[Optional[UUID]] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("devices.id", ondelete="SET NULL"), nullable=True
+    )
+    device_seq: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     connection_id: Mapped[Optional[UUID]] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("data_connections.id", ondelete="SET NULL"), nullable=True
     )
@@ -130,6 +165,7 @@ class SourceItem(Base):
     )
 
     user: Mapped[User] = relationship(back_populates="items")
+    device: Mapped[Optional[Device]] = relationship()
     connection: Mapped[Optional[DataConnection]] = relationship(back_populates="items")
     processed_content: Mapped[list["ProcessedContent"]] = relationship(
         back_populates="item",
@@ -460,6 +496,7 @@ class AiUsageEvent(Base):
 __all__ = [
     "Base",
     "User",
+    "Device",
     "DataConnection",
     "SourceItem",
     "ProcessedContent",

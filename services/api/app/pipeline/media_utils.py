@@ -157,6 +157,240 @@ def segment_audio(
     return [str(path) for path in sorted(Path(output_dir).glob("chunk_*.wav"))]
 
 
+def _get_duration_sec(path: str) -> Optional[float]:
+    try:
+        metadata = probe_media(path)
+    except MediaToolError:
+        return None
+    duration = (metadata.get("format") or {}).get("duration")
+    return parse_fraction(duration) if isinstance(duration, str) else None
+
+
+def detect_speech_segments(
+    input_path: str,
+    *,
+    silence_db: float,
+    min_silence_sec: float,
+    padding_sec: float,
+    min_segment_sec: float,
+    duration_sec: Optional[float],
+) -> list[tuple[float, float]]:
+    if duration_sec is None:
+        duration_sec = _get_duration_sec(input_path)
+    if duration_sec is None:
+        return []
+
+    args = [
+        "ffmpeg",
+        "-i",
+        input_path,
+        "-af",
+        f"silencedetect=noise={silence_db}dB:d={min_silence_sec}",
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        result = _run_command(args)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise MediaToolError(f"ffmpeg silencedetect failed: {exc}") from exc
+
+    silences: list[tuple[float, float]] = []
+    current_start: Optional[float] = None
+    for line in result.stderr.splitlines():
+        if "silence_start" in line:
+            match = re.search(r"silence_start:\s*([0-9.]+)", line)
+            if match:
+                current_start = float(match.group(1))
+        elif "silence_end" in line:
+            match = re.search(r"silence_end:\s*([0-9.]+)", line)
+            if match:
+                end = float(match.group(1))
+                start = current_start if current_start is not None else max(0.0, end - min_silence_sec)
+                silences.append((start, end))
+                current_start = None
+
+    if current_start is not None:
+        silences.append((current_start, duration_sec))
+
+    silences.sort()
+    speech_segments: list[tuple[float, float]] = []
+    cursor = 0.0
+    for start, end in silences:
+        if start > cursor:
+            speech_segments.append((cursor, start))
+        cursor = max(cursor, end)
+    if cursor < duration_sec:
+        speech_segments.append((cursor, duration_sec))
+
+    if padding_sec > 0:
+        padded: list[tuple[float, float]] = []
+        for start, end in speech_segments:
+            padded_start = max(0.0, start - padding_sec)
+            padded_end = min(duration_sec, end + padding_sec)
+            padded.append((padded_start, padded_end))
+        speech_segments = padded
+
+    merged: list[tuple[float, float]] = []
+    for start, end in speech_segments:
+        if not merged:
+            merged.append((start, end))
+            continue
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end + 0.05:
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+
+    filtered = [
+        (start, end) for start, end in merged if (end - start) >= min_segment_sec
+    ]
+    return filtered
+
+
+def extract_audio_segment(
+    input_path: str,
+    output_path: str,
+    *,
+    start_sec: float,
+    duration_sec: float,
+    sample_rate_hz: int,
+    channels: int,
+) -> None:
+    args = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{start_sec:.3f}",
+        "-t",
+        f"{duration_sec:.3f}",
+        "-i",
+        input_path,
+        "-vn",
+        "-ac",
+        str(channels),
+        "-ar",
+        str(sample_rate_hz),
+        "-c:a",
+        "pcm_s16le",
+        output_path,
+    ]
+    try:
+        _run_command(args)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise MediaToolError(f"ffmpeg audio segment extraction failed: {exc}") from exc
+
+
+def segment_audio_with_vad(
+    input_path: str,
+    output_dir: str,
+    *,
+    chunk_duration_sec: int,
+    sample_rate_hz: int,
+    channels: int,
+    vad_enabled: bool,
+    vad_silence_db: float,
+    vad_min_silence_sec: float,
+    vad_padding_sec: float,
+    vad_min_segment_sec: float,
+    duration_sec: Optional[float],
+) -> list[dict[str, float | str]]:
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    if not vad_enabled:
+        chunk_paths = segment_audio(
+            input_path,
+            output_dir,
+            chunk_duration_sec=chunk_duration_sec,
+            sample_rate_hz=sample_rate_hz,
+            channels=channels,
+        )
+        chunk_infos: list[dict[str, float | str]] = []
+        for idx, chunk_path in enumerate(chunk_paths):
+            start = idx * chunk_duration_sec
+            end = (idx + 1) * chunk_duration_sec
+            if isinstance(duration_sec, (int, float)):
+                end = min(duration_sec, end)
+            chunk_infos.append(
+                {
+                    "path": chunk_path,
+                    "start_ms": start * 1000,
+                    "end_ms": end * 1000,
+                }
+            )
+        return chunk_infos
+
+    speech_segments = detect_speech_segments(
+        input_path,
+        silence_db=vad_silence_db,
+        min_silence_sec=vad_min_silence_sec,
+        padding_sec=vad_padding_sec,
+        min_segment_sec=vad_min_segment_sec,
+        duration_sec=duration_sec,
+    )
+    if not speech_segments:
+        return segment_audio_with_vad(
+            input_path,
+            output_dir,
+            chunk_duration_sec=chunk_duration_sec,
+            sample_rate_hz=sample_rate_hz,
+            channels=channels,
+            vad_enabled=False,
+            vad_silence_db=vad_silence_db,
+            vad_min_silence_sec=vad_min_silence_sec,
+            vad_padding_sec=vad_padding_sec,
+            vad_min_segment_sec=vad_min_segment_sec,
+            duration_sec=duration_sec,
+        )
+
+    chunk_infos: list[dict[str, float | str]] = []
+    for seg_idx, (seg_start, seg_end) in enumerate(speech_segments):
+        seg_duration = max(0.0, seg_end - seg_start)
+        if seg_duration <= 0:
+            continue
+        segment_dir = Path(output_dir) / f"speech_{seg_idx:05d}"
+        segment_dir.mkdir(parents=True, exist_ok=True)
+        segment_path = segment_dir / "segment.wav"
+        extract_audio_segment(
+            input_path,
+            str(segment_path),
+            start_sec=seg_start,
+            duration_sec=seg_duration,
+            sample_rate_hz=sample_rate_hz,
+            channels=channels,
+        )
+
+        if seg_duration <= chunk_duration_sec:
+            chunk_infos.append(
+                {
+                    "path": str(segment_path),
+                    "start_ms": seg_start * 1000,
+                    "end_ms": seg_end * 1000,
+                }
+            )
+            continue
+
+        chunk_paths = segment_audio(
+            str(segment_path),
+            str(segment_dir),
+            chunk_duration_sec=chunk_duration_sec,
+            sample_rate_hz=sample_rate_hz,
+            channels=channels,
+        )
+        for idx, chunk_path in enumerate(chunk_paths):
+            start = seg_start + idx * chunk_duration_sec
+            end = min(seg_end, seg_start + (idx + 1) * chunk_duration_sec)
+            chunk_infos.append(
+                {
+                    "path": chunk_path,
+                    "start_ms": start * 1000,
+                    "end_ms": end * 1000,
+                }
+            )
+
+    return chunk_infos
+
+
 def segment_video(
     input_path: str,
     output_dir: str,

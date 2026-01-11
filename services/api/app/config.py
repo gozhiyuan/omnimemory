@@ -83,6 +83,10 @@ class Settings(BaseSettings):
     oidc_algorithms: list[str] = Field(default_factory=lambda: ["RS256"])
     oidc_leeway_seconds: int = 60
 
+    # Device auth (ESP32)
+    device_token_secret: str = Field(default="dev-device-token-secret")
+    device_pairing_code_ttl_minutes: int = Field(default=10, ge=1)
+
     # Google Photos OAuth
     google_photos_client_id: Optional[str] = None
     google_photos_client_secret: Optional[str] = None
@@ -125,6 +129,11 @@ class Settings(BaseSettings):
     audio_understanding_temperature: float = 0.2
     audio_understanding_timeout_seconds: int = 60
     audio_understanding_max_bytes: int = Field(default=19_000_000, ge=1)
+    audio_vad_enabled: bool = True
+    audio_vad_silence_db: float = Field(default=-35.0)
+    audio_vad_min_silence_sec: float = Field(default=0.4, ge=0.0)
+    audio_vad_padding_sec: float = Field(default=0.15, ge=0.0)
+    audio_vad_min_segment_sec: float = Field(default=0.8, ge=0.0)
 
     # Chat/RAG settings
     chat_provider: Literal["gemini", "none"] = "gemini"
@@ -174,6 +183,7 @@ class Settings(BaseSettings):
     episode_merge_enabled: bool = True
     episode_merge_max_gap_minutes: int = Field(default=90, ge=1)
     episode_merge_similarity_threshold: float = Field(default=0.78, ge=0.0, le=1.0)
+    device_episode_merge_window_minutes: int = Field(default=5, ge=0)
     memory_graph_enabled: bool = True
 
     # Maps/Geocoding settings

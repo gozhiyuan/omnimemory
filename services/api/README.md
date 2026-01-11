@@ -110,7 +110,7 @@ beat scheduler that triggers recurring jobs defined in `configure_celery()`.
 # Terminal 1 – execute background jobs (process_item, maintenance.cleanup, health.ping, ...)
 uv run celery -A app.celery_app.celery_app worker --loglevel=info
 
-# Terminal 2 – emit scheduled tasks like the hourly lifecycle cleanup
+# Terminal 2 – emit scheduled tasks like the hourly lifecycle + device pairing cleanup
 uv run celery -A app.celery_app.celery_app beat --loglevel=info
 ```
 
@@ -180,6 +180,17 @@ uv run python scripts/seed_ingest_flow.py ./fixtures/sample.jpg \
 ```
 
 Use `--direct-upload` to upload directly to Supabase without relying on `/storage/upload-url`.
+
+### Device pairing cleanup (`app/scripts/cleanup_expired_pairing_codes.py`)
+
+Clear expired device pairing codes (optional maintenance task):
+
+```bash
+uv run python -m app.scripts.cleanup_expired_pairing_codes --dry-run
+uv run python -m app.scripts.cleanup_expired_pairing_codes
+```
+
+Use `--delete-orphans` to delete devices that never activated (no token) and only had an expired pairing code.
 
 ### Storage migration (`scripts/migrate_supabase_to_rustfs.py`)
 

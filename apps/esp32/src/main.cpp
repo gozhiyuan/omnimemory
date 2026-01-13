@@ -65,6 +65,10 @@ static unsigned long last_wifi_attempt = 0;
 static unsigned long last_ntp_attempt = 0;
 static unsigned long last_retention_check = 0;
 static unsigned long last_telemetry = 0;
+static unsigned long wifi_window_start = 0;
+static unsigned long last_wifi_cycle = 0;
+static bool wifi_window_active = false;
+static bool wifi_backlog_window = false;
 static uint8_t upload_buf[UPLOAD_CHUNK_BYTES];
 static bool audio_ok = false;
 static bool audio_recording = false;
@@ -1150,22 +1154,75 @@ void setup() {
     // Capture one immediately on boot.
     capture_and_save();
 
-    wifi_ok = connect_wifi_best_effort();
-    if (wifi_ok) {
-        Serial.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
+    if (WIFI_DUTY_CYCLE_ENABLED) {
+        WiFi.mode(WIFI_OFF);
+        wifi_ok = false;
+        wifi_window_active = false;
+        wifi_backlog_window = false;
+        last_wifi_cycle = millis() - WIFI_DUTY_CYCLE_INTERVAL_MS;
     } else {
-        Serial.println("WiFi connect failed");
+        wifi_ok = connect_wifi_best_effort();
+        if (wifi_ok) {
+            Serial.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
+        } else {
+            Serial.println("WiFi connect failed");
+        }
+        ntp_synced = wifi_ok ? sync_time_best_effort() : false;
+        Serial.printf("NTP sync: %s\n", ntp_synced ? "ok" : "failed");
     }
-
-    ntp_synced = wifi_ok ? sync_time_best_effort() : false;
-    Serial.printf("NTP sync: %s\n", ntp_synced ? "ok" : "failed");
 }
 
 void loop() {
     audio_tick();
     unsigned long now = millis();
 
-    if (!wifi_ok && !audio_recording && now - last_wifi_attempt >= 10000) {
+    if (WIFI_DUTY_CYCLE_ENABLED) {
+        bool window_due = now - last_wifi_cycle >= WIFI_DUTY_CYCLE_INTERVAL_MS;
+        bool backlog_due = false;
+        if (!wifi_window_active) {
+            if (count_pending_manifests() > 0 && now - last_wifi_cycle >= WIFI_DUTY_CYCLE_COOLDOWN_MS) {
+                backlog_due = true;
+            }
+        }
+
+        if (!wifi_window_active && (window_due || backlog_due)) {
+            wifi_window_active = true;
+            wifi_backlog_window = backlog_due && !window_due;
+            wifi_window_start = now;
+            last_wifi_cycle = now;
+            wifi_ok = connect_wifi_best_effort(5000);
+            last_wifi_attempt = now;
+            if (wifi_ok) {
+                Serial.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
+            } else {
+                Serial.println("WiFi connect failed (window start)");
+            }
+        }
+
+        if (wifi_window_active && !wifi_ok && !audio_recording && now - last_wifi_attempt >= 10000) {
+            wifi_ok = connect_wifi_best_effort(500);
+            last_wifi_attempt = now;
+            if (wifi_ok) {
+                Serial.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
+            }
+        }
+
+        if (wifi_window_active) {
+            unsigned long window_limit = wifi_backlog_window ? WIFI_DUTY_CYCLE_MAX_WINDOW_MS : WIFI_DUTY_CYCLE_WINDOW_MS;
+            bool window_expired = now - wifi_window_start >= window_limit;
+            bool backlog_cleared = count_pending_manifests() == 0;
+            if (window_expired || backlog_cleared) {
+                if (WiFi.status() == WL_CONNECTED) {
+                    WiFi.disconnect(true);
+                }
+                WiFi.mode(WIFI_OFF);
+                wifi_ok = false;
+                wifi_window_active = false;
+                wifi_backlog_window = false;
+                Serial.println("WiFi window closed");
+            }
+        }
+    } else if (!wifi_ok && !audio_recording && now - last_wifi_attempt >= 10000) {
         wifi_ok = connect_wifi_best_effort(200);
         last_wifi_attempt = now;
         if (wifi_ok) {

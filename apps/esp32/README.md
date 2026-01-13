@@ -26,6 +26,17 @@ pio device monitor
 If you see `SDMMCFS: some SD pins are not set`, verify the SD_MMC pin defines in
 `apps/esp32/include/board_pins.h`.
 
+## Wi‑Fi Duty Cycle (Power)
+
+When `WIFI_DUTY_CYCLE_ENABLED=1`, Wi‑Fi turns on during upload windows:
+- `WIFI_DUTY_CYCLE_INTERVAL_MS`: scheduled window cadence (default 1 hour).
+- `WIFI_DUTY_CYCLE_WINDOW_MS`: scheduled window duration (default 2 minutes).
+- `WIFI_DUTY_CYCLE_MAX_WINDOW_MS`: backlog window cap (default 30 minutes).
+- `WIFI_DUTY_CYCLE_COOLDOWN_MS`: cooldown between backlog windows (default 10 minutes).
+
+If backlog exists, the device can open a longer window (up to `MAX_WINDOW_MS`), then cool down
+and retry later. Uploads, NTP sync, and telemetry only happen when Wi‑Fi is on.
+
 ## Audio MVP (VAD + WAV)
 
 - Set mic pins in `apps/esp32/include/board_pins.h`.

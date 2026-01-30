@@ -1,3 +1,5 @@
+"""Tests for the dashboard routes."""
+
 from collections import namedtuple
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
@@ -9,52 +11,7 @@ from app.main import app
 from app.db.session import get_session
 from app.routes import dashboard as dashboard_module
 
-
-class FakeScalarResult:
-    def __init__(self, items):
-        self._items = items
-
-    def all(self):
-        return self._items
-
-
-class FakeResult:
-    def __init__(self, scalars=None, rows=None, scalar=None):
-        self._scalars = scalars or []
-        self._rows = rows or []
-        self._scalar = scalar
-
-    def scalars(self):
-        return FakeScalarResult(self._scalars)
-
-    def fetchall(self):
-        return self._rows
-
-    def scalar_one(self):
-        return self._scalar
-
-    def one(self):
-        if self._rows:
-            return self._rows[0]
-        return self._scalar
-
-
-class FakeSession:
-    def __init__(self, results):
-        self._results = list(results)
-
-    async def execute(self, _stmt):
-        return self._results.pop(0)
-
-
-class FakeStorage:
-    def get_presigned_download(self, key: str, _expires_s: int):
-        return {"url": f"http://example.test/{key}"}
-
-
-class FailingStorage:
-    def get_presigned_download(self, _key: str, _expires_s: int):
-        raise RuntimeError("signing failed")
+from tests.helpers import FakeResult, FakeSession, FakeStorage, FailingStorage, override_get_session
 
 
 def test_dashboard_stats_returns_activity_and_recent_items(monkeypatch):
@@ -94,16 +51,13 @@ def test_dashboard_stats_returns_activity_and_recent_items(monkeypatch):
         ]
     )
 
-    async def override_get_session():
-        yield fake_session
-
     async def fake_cache_get(_key: str):
         return None
 
     async def fake_cache_set(_key: str, _payload, _ttl: int):
         return None
 
-    app.dependency_overrides[get_session] = override_get_session
+    app.dependency_overrides[get_session] = override_get_session(fake_session)
     monkeypatch.setattr(dashboard_module, "get_storage_provider", lambda: FakeStorage())
     monkeypatch.setattr(dashboard_module, "get_cache_json", fake_cache_get)
     monkeypatch.setattr(dashboard_module, "set_cache_json", fake_cache_set)
@@ -156,16 +110,13 @@ def test_dashboard_handles_signing_failures(monkeypatch):
         ]
     )
 
-    async def override_get_session():
-        yield fake_session
-
     async def fake_cache_get(_key: str):
         return None
 
     async def fake_cache_set(_key: str, _payload, _ttl: int):
         return None
 
-    app.dependency_overrides[get_session] = override_get_session
+    app.dependency_overrides[get_session] = override_get_session(fake_session)
     monkeypatch.setattr(dashboard_module, "get_storage_provider", lambda: FailingStorage())
     monkeypatch.setattr(dashboard_module, "get_cache_json", fake_cache_get)
     monkeypatch.setattr(dashboard_module, "set_cache_json", fake_cache_set)
@@ -206,7 +157,7 @@ def test_dashboard_stats_uses_cache(monkeypatch):
         async def execute(self, _stmt):
             raise AssertionError("DB queries should not run on cache hit.")
 
-    async def override_get_session():
+    async def override_get_session_failing():
         yield FailingSession()
 
     async def fake_cache_get(_key: str):
@@ -215,7 +166,7 @@ def test_dashboard_stats_uses_cache(monkeypatch):
     async def fake_cache_set(_key: str, _payload, _ttl: int):
         raise AssertionError("Cache write should not run on cache hit.")
 
-    app.dependency_overrides[get_session] = override_get_session
+    app.dependency_overrides[get_session] = override_get_session_failing
     monkeypatch.setattr(dashboard_module, "get_cache_json", fake_cache_get)
     monkeypatch.setattr(dashboard_module, "set_cache_json", fake_cache_set)
 

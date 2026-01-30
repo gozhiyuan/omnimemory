@@ -24,13 +24,15 @@ make verify          # Run all tests (API + web e2e)
 
 ### Backend API (services/api/)
 ```bash
-uv sync                                    # Install dependencies
+uv sync --extra dev                        # Install dependencies (including pytest)
 uv run python -m app.db.migrator           # Run database migrations
 uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000  # Start API
 uv run celery -A app.celery_app.celery_app worker --loglevel=info  # Start worker
 uv run celery -A app.celery_app.celery_app beat --loglevel=info    # Start scheduler
-uv run pytest tests                        # Run tests
-uv run pytest tests/test_foo.py::test_bar  # Run single test
+uv run pytest tests                        # Run all tests
+uv run pytest tests/test_dashboard.py      # Run single test file
+uv run pytest tests/test_foo.py::test_bar  # Run single test function
+uv run pytest --cov=app --cov-report=term-missing tests  # Run with coverage
 ```
 
 ### Frontend (apps/web/)

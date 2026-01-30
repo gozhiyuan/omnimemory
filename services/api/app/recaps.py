@@ -7,6 +7,8 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+from loguru import logger
+
 
 @dataclass(frozen=True)
 class WeekWindow:
@@ -29,7 +31,8 @@ def resolve_week_window(
         try:
             tzinfo = ZoneInfo(tz_name)
             resolved_tz = tz_name
-        except Exception:
+        except Exception as exc:
+            logger.warning("Invalid timezone '{}', falling back to UTC: {}", tz_name, exc)
             tzinfo = timezone.utc
             resolved_tz = "UTC"
 

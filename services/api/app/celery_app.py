@@ -37,6 +37,10 @@ def configure_celery() -> None:
                 "task": "maintenance.cleanup",
                 "schedule": 3600.0,
             },
+            "devices-pairing-cleanup": {
+                "task": "devices.cleanup_pairing_codes",
+                "schedule": 3600.0,
+            },
             "weekly-recap": {
                 "task": "recaps.weekly",
                 "schedule": crontab(day_of_week="sun", hour=9, minute=0),

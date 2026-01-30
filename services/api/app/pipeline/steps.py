@@ -41,7 +41,7 @@ from .media_utils import (
     parse_fraction,
     parse_iso6709,
     probe_media,
-    segment_audio,
+    segment_audio_with_vad,
     segment_video,
 )
 from .types import PipelineArtifacts, PipelineConfig, PipelineStep
@@ -1307,17 +1307,26 @@ class MediaChunkUnderstandingStep:
             if item.item_type == "video"
             else self._compute_audio_chunk_duration(config)
         )
-        fingerprint = hash_parts(
-            [
-                artifacts.get("content_hash"),
-                provider,
-                model,
-                self.version,
-                chunk_duration,
-                config.settings.media_chunk_target_bytes,
-                language_code,
-            ]
-        )
+        fingerprint_parts: list[Any] = [
+            artifacts.get("content_hash"),
+            provider,
+            model,
+            self.version,
+            chunk_duration,
+            config.settings.media_chunk_target_bytes,
+            language_code,
+        ]
+        if item.item_type == "audio":
+            fingerprint_parts.extend(
+                [
+                    config.settings.audio_vad_enabled,
+                    config.settings.audio_vad_silence_db,
+                    config.settings.audio_vad_min_silence_sec,
+                    config.settings.audio_vad_padding_sec,
+                    config.settings.audio_vad_min_segment_sec,
+                ]
+            )
+        fingerprint = hash_parts(fingerprint_parts)
         existing = await artifacts.store.get("media_chunk_analysis", provider, model, fingerprint)
         if existing:
             payload = existing.payload or {}
@@ -1353,32 +1362,49 @@ class MediaChunkUnderstandingStep:
                     max_bytes = config.settings.video_understanding_max_bytes
                     content_type = item.content_type or "video/mp4"
                 else:
-                    chunk_paths = segment_audio(
+                    chunk_infos = segment_audio_with_vad(
                         str(media_path),
                         tmpdir,
                         chunk_duration_sec=chunk_duration,
                         sample_rate_hz=config.settings.audio_sample_rate_hz,
                         channels=config.settings.audio_channels,
+                        vad_enabled=config.settings.audio_vad_enabled,
+                        vad_silence_db=config.settings.audio_vad_silence_db,
+                        vad_min_silence_sec=config.settings.audio_vad_min_silence_sec,
+                        vad_padding_sec=config.settings.audio_vad_padding_sec,
+                        vad_min_segment_sec=config.settings.audio_vad_min_segment_sec,
+                        duration_sec=duration_sec if isinstance(duration_sec, (int, float)) else None,
                     )
                     prompt = build_lifelog_audio_chunk_prompt(language=language_label)
                     max_bytes = config.settings.audio_understanding_max_bytes
                     content_type = "audio/wav"
 
-                if not chunk_paths:
+                if item.item_type == "video":
+                    chunk_infos = [
+                        {
+                            "path": path,
+                            "start_ms": idx * chunk_duration * 1000,
+                            "end_ms": int(
+                                (min(duration_sec, (idx + 1) * chunk_duration) if isinstance(duration_sec, (int, float))
+                                 else (idx + 1) * chunk_duration)
+                                * 1000
+                            ),
+                        }
+                        for idx, path in enumerate(chunk_paths)
+                    ]
+
+                if not chunk_infos:
                     raise MediaToolError("no media chunks produced")
 
-                for idx, chunk_path in enumerate(chunk_paths):
+                for idx, chunk_info in enumerate(chunk_infos):
                     if idx >= max_chunks:
                         break
-                    chunk_file = Path(chunk_path)
+                    chunk_file = Path(chunk_info["path"])
                     if not chunk_file.exists():
                         continue
                     chunk_bytes = chunk_file.read_bytes()
-                    start_ms = int(idx * chunk_duration * 1000)
-                    end_bound = (idx + 1) * chunk_duration
-                    if isinstance(duration_sec, (int, float)):
-                        end_bound = min(duration_sec, end_bound)
-                    end_ms = int(end_bound * 1000)
+                    start_ms = int(chunk_info["start_ms"])
+                    end_ms = int(chunk_info["end_ms"])
                     if max_bytes and len(chunk_bytes) > max_bytes:
                         errors.append("chunk_too_large")
                         transcript_segments.append(

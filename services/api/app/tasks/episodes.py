@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone, date
+from zoneinfo import ZoneInfo
 import json
 from typing import Any, Iterable, Optional
 from uuid import UUID, uuid4
@@ -165,12 +166,22 @@ async def _generate_episode_summary(
     end_time: datetime,
     user_id: UUID,
     language: str | None = None,
+    tz_name: str | None = None,
 ) -> Optional[dict[str, Any]]:
     if settings.video_understanding_provider != "gemini":
         return None
     if not settings.gemini_api_key:
         return None
-    time_range = f"{start_time.isoformat()} to {end_time.isoformat()}"
+    local_tz = timezone.utc
+    tz_label = "UTC"
+    if tz_name:
+        try:
+            local_tz = ZoneInfo(tz_name)
+            tz_label = tz_name
+        except Exception:
+            local_tz = timezone.utc
+            tz_label = "UTC"
+    time_range = f"{start_time.astimezone(local_tz).isoformat()} to {end_time.astimezone(local_tz).isoformat()} ({tz_label})"
     items_json = json.dumps(items, ensure_ascii=True)
     prompt = build_lifelog_episode_summary_prompt(
         items_json,
@@ -598,6 +609,11 @@ async def _update_episode_for_item(item_id: str) -> dict[str, Any]:
 
         user_settings = await fetch_user_settings(session, item.user_id)
         language = resolve_language_label(resolve_language_code(user_settings))
+        tz_name = None
+        if isinstance(user_settings, dict):
+            preferences = user_settings.get("preferences")
+            if isinstance(preferences, dict):
+                tz_name = preferences.get("timezone")
 
         context_stmt = select(ProcessedContext).where(
             ProcessedContext.user_id == item.user_id,
@@ -669,6 +685,66 @@ async def _update_episode_for_item(item_id: str) -> dict[str, Any]:
                 episode_contexts = list(episode_rows.scalars().all())
                 if episode_contexts:
                     existing_by_type = {context.context_type: context for context in episode_contexts}
+
+        if item.device_id and settings.device_episode_merge_window_minutes > 0:
+            window = timedelta(minutes=settings.device_episode_merge_window_minutes)
+            window_start = event_time - window
+            window_end = event_time + window
+            time_stmt = select(ProcessedContext).where(
+                ProcessedContext.user_id == item.user_id,
+                ProcessedContext.is_episode.is_(True),
+                ProcessedContext.context_type == "activity_context",
+                ProcessedContext.start_time_utc <= window_end,
+                ProcessedContext.end_time_utc >= window_start,
+            ).order_by(ProcessedContext.start_time_utc.asc())
+            time_rows = await session.execute(time_stmt)
+            time_candidates = list(time_rows.scalars().all())
+            if time_candidates:
+                candidate_source_ids: list[UUID] = []
+                for candidate in time_candidates:
+                    if candidate.source_item_ids:
+                        candidate_source_ids.extend(candidate.source_item_ids)
+                source_device_map: dict[UUID, Optional[UUID]] = {}
+                if candidate_source_ids:
+                    source_stmt = select(SourceItem.id, SourceItem.device_id).where(
+                        SourceItem.id.in_(candidate_source_ids)
+                    )
+                    source_rows = await session.execute(source_stmt)
+                    source_device_map = {item_id: device_id for item_id, device_id in source_rows.fetchall()}
+
+                best_time_candidate: Optional[ProcessedContext] = None
+                best_gap: Optional[timedelta] = None
+                for candidate in time_candidates:
+                    if not candidate.source_item_ids:
+                        continue
+                    if not any(
+                        source_device_map.get(source_id) == item.device_id
+                        for source_id in candidate.source_item_ids
+                    ):
+                        continue
+                    start_bound = ensure_tz_aware(candidate.start_time_utc or candidate.event_time_utc)
+                    end_bound = ensure_tz_aware(candidate.end_time_utc or candidate.event_time_utc)
+                    if event_time < start_bound:
+                        gap = start_bound - event_time
+                    elif event_time > end_bound:
+                        gap = event_time - end_bound
+                    else:
+                        gap = timedelta(0)
+                    if best_gap is None or gap < best_gap:
+                        best_gap = gap
+                        best_time_candidate = candidate
+
+                if best_time_candidate:
+                    episode_id = _episode_id_from_context(best_time_candidate) or str(best_time_candidate.id)
+                    episode_stmt = select(ProcessedContext).where(
+                        ProcessedContext.user_id == item.user_id,
+                        ProcessedContext.is_episode.is_(True),
+                        _episode_query_filter(episode_id),
+                    )
+                    episode_rows = await session.execute(episode_stmt)
+                    episode_contexts = list(episode_rows.scalars().all())
+                    if episode_contexts:
+                        existing_by_type = {context.context_type: context for context in episode_contexts}
 
         if episode_id is None:
             episode_id = str(uuid4())
@@ -768,6 +844,7 @@ async def _update_episode_for_item(item_id: str) -> dict[str, Any]:
                     end_time=end_time,
                     user_id=item.user_id,
                     language=language,
+                    tz_name=tz_name,
                 )
 
         episode_records = _build_episode_context_records(

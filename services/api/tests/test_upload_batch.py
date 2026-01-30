@@ -1,3 +1,5 @@
+"""Tests for the batch upload ingest endpoint."""
+
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -7,61 +9,18 @@ from app.db.session import get_session
 from app.main import app
 from app.routes import upload as upload_module
 
-
-class FakeScalarResult:
-    def __init__(self, items):
-        self._items = items
-
-    def all(self):
-        return self._items
-
-
-class FakeResult:
-    def __init__(self, scalars=None):
-        self._scalars = scalars or []
-
-    def scalars(self):
-        return FakeScalarResult(self._scalars)
-
-
-class FakeSession:
-    def __init__(self, existing_users=None):
-        self._existing_users = existing_users or []
-        self.added = []
-        self.committed = False
-
-    async def execute(self, _stmt):
-        return FakeResult(self._existing_users)
-
-    async def get(self, _model, user_id):
-        for user in self._existing_users:
-            if getattr(user, "id", None) == user_id:
-                return user
-        return None
-
-    def add(self, obj):
-        self.added.append(obj)
-
-    def add_all(self, objs):
-        self.added.extend(objs)
-
-    async def commit(self):
-        self.committed = True
+from tests.helpers import FakeSession, override_get_session
 
 
 def test_batch_ingest_queues_items(monkeypatch):
     fake_session = FakeSession()
-
-    async def override_get_session():
-        yield fake_session
-
     tasks = []
 
     def fake_delay(payload):
         tasks.append(payload)
         return SimpleNamespace(id=f"task-{payload['item_id']}")
 
-    app.dependency_overrides[get_session] = override_get_session
+    app.dependency_overrides[get_session] = override_get_session(fake_session)
     monkeypatch.setattr(upload_module.process_item, "delay", fake_delay)
 
     client = TestClient(app)
@@ -97,10 +56,6 @@ def test_batch_ingest_queues_items(monkeypatch):
 
 def test_batch_ingest_rejects_invalid_items(monkeypatch):
     fake_session = FakeSession()
-
-    async def override_get_session():
-        yield fake_session
-
     tasks = []
 
     def fake_delay(payload):
@@ -109,7 +64,7 @@ def test_batch_ingest_rejects_invalid_items(monkeypatch):
 
     settings = get_settings()
 
-    app.dependency_overrides[get_session] = override_get_session
+    app.dependency_overrides[get_session] = override_get_session(fake_session)
     monkeypatch.setattr(upload_module.process_item, "delay", fake_delay)
 
     client = TestClient(app)

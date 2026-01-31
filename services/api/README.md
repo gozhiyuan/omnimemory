@@ -12,7 +12,7 @@ This service handles synchronous requests (uploads, storage signing, timeline/da
    ```
 
    You can inspect the DB with
-   `docker compose -f orchestration/docker-compose.dev.yml exec postgres psql -U lifelog -d lifelog`
+   `docker compose exec postgres psql -U lifelog -d lifelog`
    or watch Flower at http://localhost:5555 to ensure Celery can reach Redis.
 
 2. In `services/api/`, create the virtual environment and install dependencies:
@@ -47,7 +47,7 @@ This service handles synchronous requests (uploads, storage signing, timeline/da
    uv run python -m app.db.migrator
    ```
 
-   Environment variables set in your shell override values from `.env.dev`/`.env`. The Supabase
+   Environment variables set in your shell override values from `.env`. The Supabase
    database password is available in the Supabase dashboard under Project Settings → Database.
    If your network only resolves the pooler hostname (common on some IPv4-only Wi‑Fi/DNS setups),
    use the connection pooling host/port and the pooler username from Supabase:

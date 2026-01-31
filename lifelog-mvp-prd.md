@@ -96,7 +96,7 @@ Build OmniMemory, an AI-powered personal memory assistant that ingests multimoda
 
 **Local OIDC Configuration (Dev)**
 - Start Authentik via `make authentik-up` and create an OIDC provider + application (slug `omnimemory`).
-- API env (`.env.dev`): `AUTH_ENABLED=true`, `OIDC_ISSUER_URL=http://localhost:9002/application/o/omnimemory/`, `OIDC_JWKS_URL=http://localhost:9002/application/o/omnimemory/jwks/`, `OIDC_AUDIENCE=omnimemory`.
+- API env (`.env`): `AUTH_ENABLED=true`, `OIDC_ISSUER_URL=http://localhost:9002/application/o/omnimemory/`, `OIDC_JWKS_URL=http://localhost:9002/application/o/omnimemory/jwks/`, `OIDC_AUDIENCE=omnimemory`.
 - Web env (`apps/web/.env.local`): `VITE_OIDC_ISSUER_URL`, `VITE_OIDC_CLIENT_ID`, `VITE_OIDC_AUTH_URL`, `VITE_OIDC_TOKEN_URL`, plus `VITE_OIDC_REDIRECT_URI=http://localhost:3000/`.
 
 ### OUT OF SCOPE (Post-MVP) ❌

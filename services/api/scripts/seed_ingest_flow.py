@@ -50,14 +50,14 @@ def load_env_file(path: Path) -> None:
 
 def load_env_defaults() -> None:
     candidates = [
-        Path(".env.dev"),
         Path(".env"),
-        Path("../.env.dev"),
+        Path(".env.dev"),  # Legacy fallback
         Path("../.env"),
-        Path("../../.env.dev"),
+        Path("../.env.dev"),
         Path("../../.env"),
-        Path("../../../.env.dev"),
+        Path("../../.env.dev"),
         Path("../../../.env"),
+        Path("../../../.env.dev"),
     ]
     for candidate in candidates:
         load_env_file(candidate)

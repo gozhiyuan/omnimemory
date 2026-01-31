@@ -12,14 +12,14 @@ class Settings(BaseSettings):
     """Central configuration for the API service."""
 
     _env_paths = [
-        ".env.dev",
         ".env",
-        "../.env.dev",
+        ".env.dev",  # Legacy fallback
         "../.env",
-        "../../.env.dev",
+        "../.env.dev",
         "../../.env",
-        "../../../.env.dev",
+        "../../.env.dev",
         "../../../.env",
+        "../../../.env.dev",
     ]
 
     model_config = SettingsConfigDict(

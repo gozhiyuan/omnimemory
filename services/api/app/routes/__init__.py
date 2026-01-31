@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter
 
-from . import chat, dashboard, devices, health, integrations, search, settings, storage, timeline, upload
+from . import chat, dashboard, devices, health, integrations, openclaw, search, settings, storage, timeline, upload
 
 
 def get_api_router() -> APIRouter:
@@ -11,6 +11,7 @@ def get_api_router() -> APIRouter:
     router.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"])
     router.include_router(chat.router, prefix="/chat", tags=["chat"])
     router.include_router(integrations.router, tags=["integrations"])
+    router.include_router(openclaw.router, prefix="/api/openclaw", tags=["openclaw"])
     router.include_router(search.router, prefix="/search", tags=["search"])
     router.include_router(settings.router, tags=["settings"])
     router.include_router(devices.router, prefix="/devices", tags=["devices"])

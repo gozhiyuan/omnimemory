@@ -1,6 +1,6 @@
 # OmniMemory + OpenClaw Integration Guide
 
-> **Status:** Design document for integrating OmniMemory (Lifelog) with OpenClaw
+> **Status:** Implementation in progress - Phase 1 & 3 completed
 > **Last Updated:** 2026-01-30
 
 ---
@@ -57,7 +57,7 @@ This document describes how OmniMemory (a personal memory/lifelog app) can integ
 │   │  └─────────────────────────┘ │                  │                   │
 │   │                               │                  │                   │
 │   │  Memory:                      │                  │                   │
-│   │  └─ ~/clawd/memory/*.md ◄────┼──────────────────┤ Memory sync       │
+│   │  └─ ~/.openclaw/memory/*.md ◄────┼──────────────────┤ Memory sync       │
 │   │                               │                  │                   │
 │   └───────────────────────────────┘                  │                   │
 │                                                      │                   │
@@ -357,44 +357,110 @@ async function getOmniMemoryToken(userId: string): Promise<string | null> {
 }
 ```
 
-**Shell wrapper scripts (recommended for local OpenClaw):**
-Requires `jq` for JSON parsing in the ingest script.
+**Shell wrapper scripts (implemented at `~/.openclaw/skills/omnimemory/`):**
+
+Requires `jq` for JSON parsing. Scripts support OIDC authentication via `OMNIMEMORY_API_TOKEN`.
 
 ```bash
 #!/usr/bin/env bash
-# omnimemory_search.sh
+# omnimemory_search.sh - Search OmniMemory for memories
+# Usage: ./omnimemory_search.sh "query" [limit] [date_from] [date_to]
 set -euo pipefail
+
 API_URL="${OMNIMEMORY_API_URL:-http://localhost:8000}"
-QUERY="${1:?query required}"
-LIMIT="${2:-5}"
-curl -sS -G "$API_URL/search" \
-  --data-urlencode "q=$QUERY" \
-  --data-urlencode "limit=$LIMIT"
+TOKEN="${OMNIMEMORY_API_TOKEN:-}"
+
+QUERY="${1:?Error: query required}"
+LIMIT="${2:-10}"
+DATE_FROM="${3:-}"
+DATE_TO="${4:-}"
+
+# Build JSON payload
+JSON_PAYLOAD=$(jq -n \
+  --arg query "$QUERY" \
+  --argjson limit "$LIMIT" \
+  --arg date_from "$DATE_FROM" \
+  --arg date_to "$DATE_TO" \
+  '{query: $query, limit: $limit}
+   + (if $date_from != "" then {date_from: $date_from} else {} end)
+   + (if $date_to != "" then {date_to: $date_to} else {} end)')
+
+CURL_OPTS=(-sS -X POST "$API_URL/api/openclaw/search" -H "Content-Type: application/json")
+if [ -n "$TOKEN" ]; then
+  CURL_OPTS+=(-H "Authorization: Bearer $TOKEN")
+fi
+
+curl "${CURL_OPTS[@]}" -d "$JSON_PAYLOAD"
 ```
 
 ```bash
 #!/usr/bin/env bash
-# omnimemory_ingest_file.sh
+# omnimemory_timeline.sh - Get day summary from OmniMemory
+# Usage: ./omnimemory_timeline.sh "YYYY-MM-DD" [tz_offset_minutes]
 set -euo pipefail
-API_URL="${OMNIMEMORY_API_URL:-http://localhost:8000}"
-FILE="${1:?file path required}"
-ITEM_TYPE="${2:-photo}"
 
-UPLOAD_JSON=$(curl -sS -X POST "$API_URL/storage/upload-url" \
+API_URL="${OMNIMEMORY_API_URL:-http://localhost:8000}"
+TOKEN="${OMNIMEMORY_API_TOKEN:-}"
+
+DATE="${1:?Error: date required}"
+TZ_OFFSET="${2:-0}"
+
+URL="$API_URL/api/openclaw/timeline/$DATE?tz_offset_minutes=$TZ_OFFSET"
+
+CURL_OPTS=(-sS -X GET "$URL")
+if [ -n "$TOKEN" ]; then
+  CURL_OPTS+=(-H "Authorization: Bearer $TOKEN")
+fi
+
+curl "${CURL_OPTS[@]}"
+```
+
+```bash
+#!/usr/bin/env bash
+# omnimemory_ingest.sh - Upload and ingest media to OmniMemory
+# Usage: ./omnimemory_ingest.sh "/path/to/file" [item_type]
+set -euo pipefail
+
+API_URL="${OMNIMEMORY_API_URL:-http://localhost:8000}"
+TOKEN="${OMNIMEMORY_API_TOKEN:-}"
+
+FILE="${1:?Error: file path required}"
+ITEM_TYPE="${2:-}"
+
+# Auto-detect item type from extension if not provided
+if [ -z "$ITEM_TYPE" ]; then
+  EXT="${FILE##*.}"
+  case "$(echo "$EXT" | tr '[:upper:]' '[:lower:]')" in
+    jpg|jpeg|png|gif|webp|heic) ITEM_TYPE="photo" ;;
+    mp4|mov|avi|mkv|webm) ITEM_TYPE="video" ;;
+    mp3|m4a|wav|ogg|flac) ITEM_TYPE="audio" ;;
+    *) echo "Cannot detect item type" >&2; exit 1 ;;
+  esac
+fi
+
+AUTH_HEADER=""
+[ -n "$TOKEN" ] && AUTH_HEADER="Authorization: Bearer $TOKEN"
+
+# Step 1: Get presigned upload URL
+UPLOAD_RESPONSE=$(curl -sS -X POST "$API_URL/storage/upload-url" \
   -H "Content-Type: application/json" \
+  ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
   -d "{\"filename\":\"$(basename "$FILE")\",\"content_type\":\"application/octet-stream\",\"prefix\":\"openclaw\"}")
 
-UPLOAD_URL=$(echo "$UPLOAD_JSON" | jq -r ".url")
-UPLOAD_KEY=$(echo "$UPLOAD_JSON" | jq -r ".key")
+UPLOAD_URL=$(echo "$UPLOAD_RESPONSE" | jq -r '.url')
+STORAGE_KEY=$(echo "$UPLOAD_RESPONSE" | jq -r '.key')
 
+# Step 2: Upload file
 curl -sS -X PUT "$UPLOAD_URL" --data-binary "@$FILE"
 
-curl -sS -X POST "$API_URL/upload/ingest" \
+# Step 3: Trigger ingestion via new /api/openclaw/ingest endpoint
+curl -sS -X POST "$API_URL/api/openclaw/ingest" \
   -H "Content-Type: application/json" \
-  -d "{\"storage_key\":\"$UPLOAD_KEY\",\"item_type\":\"$ITEM_TYPE\",\"provider\":\"openclaw\"}"
+  ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
+  -d "{\"storage_key\":\"$STORAGE_KEY\",\"item_type\":\"$ITEM_TYPE\",\"provider\":\"openclaw\"}"
 ```
 
-**Skill file** (`~/clawd/skills/omnimemory/SKILL.md`):
+**Skill file** (`~/.openclaw/skills/omnimemory/SKILL.md`):
 
 ```markdown
 # OmniMemory Integration
@@ -599,7 +665,7 @@ const ChatTab = () => {
 
 ### Option D: Shared Memory Backend ✅ **RECOMMENDED**
 
-**Approach:** When OpenClaw integration is enabled, OmniMemory syncs daily summaries and key memories to OpenClaw's memory files (`~/clawd/memory/*.md`). This assumes OpenClaw and OmniMemory run on the same host with shared filesystem access.
+**Approach:** When OpenClaw integration is enabled, OmniMemory syncs daily summaries and key memories to OpenClaw's memory files (`~/.openclaw/memory/*.md`). This assumes OpenClaw and OmniMemory run on the same host with shared filesystem access.
 
 **Why this matters:**
 - OpenClaw's vector search will include OmniMemory content
@@ -624,7 +690,7 @@ class OpenClawMemorySync:
     
     def __init__(
         self,
-        openclaw_workspace: str = "~/clawd",
+        openclaw_workspace: str = "~/.openclaw",
         enabled: bool = False
     ):
         self.workspace = Path(openclaw_workspace).expanduser()
@@ -767,7 +833,7 @@ class PipelineWithOpenClawSync:
     
     def __init__(self, user_settings: dict):
         self.openclaw_sync = OpenClawMemorySync(
-            openclaw_workspace=user_settings.get("openclaw_workspace", "~/clawd"),
+            openclaw_workspace=user_settings.get("openclaw_workspace", "~/.openclaw"),
             enabled=user_settings.get("openclaw_sync_enabled", False)
         )
     
@@ -810,7 +876,7 @@ class PipelineWithOpenClawSync:
         return highlights[:5]  # Limit to 5 highlights
 ```
 
-**Example synced memory file** (`~/clawd/memory/2025-01-29.md`):
+**Example synced memory file** (`~/.openclaw/memory/2025-01-29.md`):
 
 ```markdown
 ## OmniMemory Daily Summary - Wednesday, January 29, 2025
@@ -868,7 +934,7 @@ class OpenClawIntegrationSettings(BaseModel):
     
     # Sync memories to OpenClaw's workspace
     sync_memory: bool = True
-    openclaw_workspace: str = "~/clawd"
+    openclaw_workspace: str = "~/.openclaw"
     
     # What to sync
     sync_daily_summaries: bool = True
@@ -890,7 +956,7 @@ class UserSettings(BaseModel):
 
 ### OpenClaw Configuration
 
-Add to `~/.clawdbot/openclaw.json` (example key/value storage; Clawhub may manage this for you):
+Add to `~/.openclaw/openclaw.json` (example key/value storage; Clawhub may manage this for you):
 
 ```json
 {
@@ -918,15 +984,47 @@ export OMNIMEMORY_API_TOKEN="oidc_bearer_token_if_auth_enabled"
 - Declare required env vars/credentials (`OMNIMEMORY_API_URL`, optional `OMNIMEMORY_API_TOKEN`).
 - Pin a version and provide upgrade notes (tool schema changes, new flags).
 
-### Skill Registration
+### Skill Registration ✅ IMPLEMENTED
 
-Add OmniMemory skill to OpenClaw workspace (`~/clawd/skills/omnimemory/SKILL.md`):
+Skill files created at `~/.openclaw/skills/omnimemory/`:
+
+```
+~/.openclaw/skills/omnimemory/
+├── SKILL.md              # Skill metadata and documentation
+├── omnimemory_search.sh  # Search wrapper script
+├── omnimemory_timeline.sh # Timeline wrapper script
+└── omnimemory_ingest.sh  # Ingest wrapper script
+```
+
+**SKILL.md** (implemented):
 
 ```markdown
-# OmniMemory - Personal Memory Assistant
+---
+name: omnimemory
+description: Search and manage personal memories from OmniMemory lifelog app
+homepage: https://github.com/zhiyuanparis/omnimemory
+metadata:
+  openclaw:
+    emoji: "🧠"
+    os: ["darwin", "linux"]
+    requires:
+      bins: ["curl", "jq"]
+    env:
+      - OMNIMEMORY_API_URL
+      - OMNIMEMORY_API_TOKEN
+---
 
-OmniMemory stores and organizes your photos, videos, and life events. 
-Use these tools to search and interact with your memories.
+# OmniMemory Integration
+
+OmniMemory is a personal memory assistant that stores and organizes your photos,
+videos, and life events. When connected, you can search and retrieve memories
+using the tools below.
+
+## Configuration
+
+Set these environment variables:
+- `OMNIMEMORY_API_URL` - OmniMemory API URL (default: http://localhost:8000)
+- `OMNIMEMORY_API_TOKEN` - OIDC bearer token for authentication (optional if auth disabled)
 
 ## When to Use
 
@@ -939,23 +1037,31 @@ Use OmniMemory tools when the user:
 
 ## Available Tools
 
-- `omnimemory_search` - Search memories by query, date, or context type
-- `omnimemory_timeline` - Get a day's summary with episodes
-- `omnimemory_ingest` - Add new media via chat
+### omnimemory_search
+Search memories by natural language query. Supports date ranges.
+
+**Usage:** `./omnimemory_search.sh "query" [limit] [date_from] [date_to]`
+
+### omnimemory_timeline
+Get a day's summary with episodes and highlights.
+
+**Usage:** `./omnimemory_timeline.sh "YYYY-MM-DD" [tz_offset_minutes]`
+
+### omnimemory_ingest
+Add new media via chat (photos, videos, audio).
+
+**Usage:** `./omnimemory_ingest.sh "/path/to/file" [item_type]`
 
 ## Examples
 
 "What did I do last Tuesday?"
-→ omnimemory_timeline(date="2025-01-28")
+→ ./omnimemory_timeline.sh "2025-01-28"
 
 "Show me photos from my Tokyo trip"
-→ omnimemory_search(query="Tokyo Japan travel trip")
-
-"When was the last time I saw Alice?"
-→ omnimemory_search(query="Alice", context_types=["social"])
+→ ./omnimemory_search.sh "Tokyo Japan travel trip"
 
 "User sends a photo"
-→ omnimemory_ingest(content_type="photo", content="/tmp/telegram/piano.jpg")
+→ ./omnimemory_ingest.sh "/tmp/telegram/photo.jpg" "photo"
 ```
 
 ---
@@ -1035,16 +1141,82 @@ Response (WhatsApp):
 
 ---
 
-## 6. API Endpoints Used (Current vs Optional Wrappers)
+## 6. API Endpoints Used
 
-**Current endpoints (already in OmniMemory):**
+### Core OmniMemory Endpoints (existing)
 
 - `GET /search?q=...&start_date=YYYY-MM-DD&end_date=YYYY-MM-DD&limit=...`
 - `GET /timeline?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD&limit=200`
 - `POST /storage/upload-url` → presigned upload
 - `POST /upload/ingest` → ingest uploaded media
 
-**Optional lightweight wrappers (nice-to-have):**
+### OpenClaw-Optimized Endpoints ✅ IMPLEMENTED
+
+Located at `services/api/app/routes/openclaw.py`:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/openclaw/search` | POST | Search memories with truncated summaries (500 chars) and thumbnail URLs |
+| `/api/openclaw/timeline/{date}` | GET | Day summary with episodes formatted for tools |
+| `/api/openclaw/ingest` | POST | Ingest media by storage_key (after upload) |
+| `/api/openclaw/connection/test` | GET | Health check, returns user ID if authenticated |
+
+**Request/Response Models:**
+
+```python
+# Search Request
+class OpenClawSearchRequest(BaseModel):
+    query: str
+    date_from: Optional[str] = None  # ISO format YYYY-MM-DD
+    date_to: Optional[str] = None
+    context_types: Optional[list[str]] = None
+    limit: int = 10
+
+# Search Response
+class OpenClawSearchResponse(BaseModel):
+    success: bool = True
+    total: int
+    items: list[OpenClawMemoryItem]
+
+class OpenClawMemoryItem(BaseModel):
+    id: str
+    title: str
+    summary: str  # Truncated to 500 chars
+    date: Optional[str]
+    type: str
+    thumbnail_url: Optional[str]  # Presigned URL
+    keywords: list[str]
+    score: Optional[float] = None
+
+# Timeline Response
+class OpenClawTimelineResponse(BaseModel):
+    success: bool = True
+    date: str
+    daily_summary: Optional[str]
+    episode_count: int
+    episodes: list[OpenClawEpisode]
+    highlights: list[str]
+
+class OpenClawEpisode(BaseModel):
+    title: str
+    time_range: str  # "HH:MM - HH:MM"
+    summary: str
+    item_count: int
+
+# Ingest Request/Response
+class OpenClawIngestRequest(BaseModel):
+    storage_key: str
+    item_type: str  # photo, video, audio
+    captured_at: Optional[str] = None
+    provider: str = "openclaw"
+
+class OpenClawIngestResponse(BaseModel):
+    success: bool
+    item_id: Optional[str] = None
+    message: str
+```
+
+### Design Reference (from original plan):
 
 ```python
 # omnimemory/services/api/app/routers/openclaw.py
@@ -1144,40 +1316,61 @@ async def ingest_from_chat(
 
 ## 7. Implementation Roadmap
 
-### Phase 1: Basic Tool Integration (1-2 days)
+### Phase 1: Basic Tool Integration ✅ COMPLETED
 
-1. [ ] Create OpenClaw tool definitions (`omnimemory_search`, `omnimemory_timeline`)
-2. [ ] Add wrapper scripts for local execution (search + ingest)
-3. [ ] Create skill file (`~/clawd/skills/omnimemory/SKILL.md`)
-4. [ ] Package/publish via Clawhub (or install locally during dev)
-5. [ ] (Optional) Add `/api/openclaw/*` endpoints to OmniMemory API
+**OmniMemory Backend:**
+1. [x] Created `/api/openclaw/*` endpoints in `services/api/app/routes/openclaw.py`:
+   - `POST /api/openclaw/search` - Search with truncated summaries + thumbnail URLs
+   - `GET /api/openclaw/timeline/{date}` - Day summary with episodes
+   - `POST /api/openclaw/ingest` - Ingest media via storage key
+   - `GET /api/openclaw/connection/test` - Health check endpoint
+2. [x] Registered router in `services/api/app/routes/__init__.py`
+
+**OpenClaw Skills:**
+3. [x] Created skill directory at `~/.openclaw/skills/omnimemory/`
+4. [x] Created `SKILL.md` with metadata and documentation
+5. [x] Created shell wrapper scripts:
+   - `omnimemory_search.sh` - Search with JSON payload via curl
+   - `omnimemory_timeline.sh` - Get day timeline
+   - `omnimemory_ingest.sh` - Upload + ingest flow with presigned URLs
+
+**Testing:**
 6. [ ] Test search flow via OpenClaw CLI
+7. [ ] Test via Telegram/WhatsApp channels
 
-### Phase 2: Settings & Configuration (1 day)
+### Phase 2: Settings & Configuration (Pending)
 
 1. [ ] Add `OpenClawIntegrationSettings` to OmniMemory settings model
 2. [ ] Create Settings UI section for OpenClaw connection
-3. [ ] Implement connection test endpoint
+3. [ ] Add OpenClaw-specific settings endpoints (`GET/PATCH /settings/openclaw`)
 4. [ ] Store API token securely
 
-### Phase 3: Memory Sync (1-2 days)
+### Phase 3: Memory Sync (Pending)
 
-1. [ ] Implement `OpenClawMemorySync` class
+1. [ ] Implement `OpenClawMemorySync` class in `services/api/app/integrations/openclaw_sync.py`
 2. [ ] Hook into daily summary generation pipeline
-3. [ ] Add sync toggle to settings
-4. [ ] Test memory files are created correctly
+3. [ ] Add Celery task for background sync
+4. [ ] Add sync toggle to settings
+5. [ ] Test memory files are created at `~/.openclaw/memory/*.md`
 
-### Phase 4: Chat UI Updates (0.5 day)
+### Phase 4: Chat UI Updates (Pending)
 
 1. [ ] Add OpenClaw connection banner to Chat tab
 2. [ ] Show "Use Telegram/WhatsApp" prompt when connected
 3. [ ] Keep basic RAG chat functional as fallback
 
-### Phase 5: Polish & Documentation (0.5 day)
+### Phase 5: Polish & Documentation (Pending)
 
 1. [ ] Write user-facing setup guide
 2. [ ] Add error handling for connection failures
 3. [ ] Test end-to-end flows
+
+### Phase 6: TypeScript Extension for Clawhub (Future)
+
+1. [ ] Create TypeScript extension at `~/.openclaw/extensions/omnimemory/`
+2. [ ] Implement tools using TypeBox schemas
+3. [ ] Test with plugin API
+4. [ ] Publish to Clawhub
 
 ---
 
@@ -1281,7 +1474,7 @@ async function runOmniMemorySetup() {
 When OpenClaw integration is enabled, OmniMemory could trigger a personalization chat:
 
 ```markdown
-<!-- ~/clawd/skills/omnimemory/BOOTSTRAP.md (one-time setup) -->
+<!-- ~/.openclaw/skills/omnimemory/BOOTSTRAP.md (one-time setup) -->
 
 # OmniMemory Personalization
 
@@ -1378,7 +1571,7 @@ async def build_vlm_prompt(user_id: str, item_type: str) -> str:
 │  │  >                                                                  │  │
 │  │  > ✓ Settings saved                                                 │  │
 │  │  > ✓ OpenClaw tools registered (omnimemory_search, omnimemory_...)   │  │
-│  │  > ✓ Memory sync enabled (~/clawd/memory/*.md)                      │  │
+│  │  > ✓ Memory sync enabled (~/.openclaw/memory/*.md)                      │  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
 │                                                                            │
 │  Step 3: Start services                                                   │

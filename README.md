@@ -21,9 +21,8 @@ This repository houses the Lifelog AI MVP: a FastAPI + Celery backend (Postgres,
 
 ### Local Environment Setup
 
-1. Copy `.env.example` → `.env` at the repo root for Docker Compose (Postgres/RustFS/Qdrant/Authentik).
+1. Copy `.env.example` → `.env` at the repo root. This single file configures both Docker Compose and API/Celery.
    - Set `AUTHENTIK_SECRET_KEY` and a valid `AUTHENTIK_IMAGE_TAG` if you plan to use local OIDC.
-2. Copy `.env.dev.example` → `.env.dev` at the repo root for the FastAPI/Celery runtime.
    - If you want uploads to work from the web UI or seed script, keep `STORAGE_PROVIDER=s3` with the RustFS defaults or switch to Supabase.
    - If the frontend cannot reach the API due to CORS, set `CORS_ALLOW_ORIGINS=http://localhost:3000` (comma-separated for multiple origins).
 3. Start supporting services:
@@ -85,7 +84,7 @@ The API validates bearer tokens against OIDC JWKS when auth is enabled. For loca
    - Add redirect URI: `http://localhost:3000/`.
    - Save the provider.
    - Create an **Application** that uses the provider and set its slug to `omnimemory`.
-3. Configure API auth in `.env.dev`:
+3. Configure API auth in `.env`:
    ```
    AUTH_ENABLED=true
    OIDC_ISSUER_URL=http://localhost:9002/application/o/omnimemory/
@@ -130,7 +129,7 @@ uv run python -m app.scripts.migrate_user_id --new-email you@example.com --delet
 
 ### Docker Compose Notes
 
-- `orchestration/docker-compose.dev.yml` is source of truth for local infra; `make dev-up` uses it.
+- `docker-compose.yml` at repo root is the source of truth for local infra; `make dev-up` uses it.
 - API/worker/beat services run locally for now and are not wired into Compose.
 - `make authentik-up` starts the local OIDC provider. `make observability` starts Prometheus/Grafana/celery-exporter.
 - Prometheus scrape config lives in `orchestration/prometheus.yml` (uncomment API job when `/metrics` is active in Docker).

@@ -86,9 +86,8 @@ Upload → /storage/upload-url (presigned) → Object Storage → /upload/ingest
 
 ## Environment Configuration
 
-- `.env` - Docker Compose variables
-- `.env.dev` - API/Celery runtime (copy from `.env.dev.example`)
-- `apps/web/.env.local` - Frontend (copy from `.env.local.example`)
+- `.env` - All backend config (copy from `.env.example`). Used by Docker Compose and API/Celery.
+- `apps/web/.env.local` - Frontend only (copy from `.env.local.example`). Required for Vite `VITE_` prefix.
 
 Key settings:
 - `STORAGE_PROVIDER=s3|supabase` - Upload storage backend

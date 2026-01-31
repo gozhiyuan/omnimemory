@@ -1,30 +1,40 @@
-Local Orchestration (Docker Compose)
+# Orchestration
 
-Services included:
+This folder contains supporting config files for the Docker Compose stack.
+
+## Files
+
+- `prometheus.yml` - Prometheus scrape configuration
+
+## Usage
+
+The main `docker-compose.yml` is at repo root. Run with:
+
+```bash
+make dev-up      # Start all infrastructure
+make dev-down    # Stop all containers
+make dev-logs    # Tail logs
+```
+
+## Services
+
 - Postgres 15 (app database)
 - Redis (Celery broker/cache)
 - Qdrant (vector DB)
+- RustFS (S3-compatible storage)
+- Authentik (OIDC provider)
 - Flower (Celery monitoring)
-- Celery Exporter (Prometheus metrics for Celery)
-- Prometheus (metrics collection)
-- Grafana (dashboards)
+- Prometheus + Grafana (observability)
 
-Quick start
-- Prereq: Docker + Docker Compose
-- Copy `.env.dev.example` to `.env.dev` at repo root and fill values as needed (Grafana creds optional)
-- Start stack: `make dev-up`
-- Stop stack: `make dev-down`
-- Tail logs: `make dev-logs`
-- Open Grafana: http://localhost:3001 (default admin/admin or values from env)
-- Open Prometheus: http://localhost:9090
-- Open Flower: http://localhost:5555
-- Qdrant UI/API: http://localhost:6333
-- Postgres: localhost:5432 (user/pass from `.env.dev`)
+## URLs
 
-Notes
-- API/worker/beat services are stubbed (commented) until the backend exists at `services/api`.
-- Prometheus scrapes Celery exporter and Qdrant. When your API exposes `/metrics`, uncomment the `api` job in `prometheus.yml`.
-- Volumes: Qdrant data persisted in the `qdrant_data` volume.
-
-Production orchestration
-- Use managed services per the MVP plan (Supabase, Qdrant Cloud, Redis/Upstash, Vercel/Cloud Run). Terraform/IaC can be added later; start by configuring via provider dashboards.
+| Service | URL |
+|---------|-----|
+| Postgres | localhost:5432 |
+| Redis | localhost:6379 |
+| Qdrant | http://localhost:6333 |
+| RustFS (S3) | http://localhost:9000 |
+| Authentik | http://localhost:9002 |
+| Flower | http://localhost:5555 |
+| Prometheus | http://localhost:9090 |
+| Grafana | http://localhost:3001 |

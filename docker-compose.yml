@@ -1,95 +1,194 @@
 # Docker Compose for Local Development
 #
 # Usage:
-#   - Make sure you have Docker installed.
-#   - Create a .env file from .env.example and fill in the values.
-#   - Run `docker-compose up --build` to start all services.
+#   - Copy .env.example to .env and fill in values
+#   - Run `make dev-up` to start infrastructure services
+#   - Run API/worker/frontend locally on host for hot-reload
+#
+# Services: Postgres, Redis, Qdrant, RustFS (S3), Authentik (OIDC), Prometheus, Grafana
 
-version: '3.8'
+version: "3.9"
 
 services:
-  # Backend API (FastAPI)
-  api:
-    build:
-      context: ./services/api
-      dockerfile: Dockerfile
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./services/api:/app
-    env_file:
-      - .env
-    depends_on:
-      - db
-      - redis
-      - qdrant
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-
-  # Background Workers (Celery)
-  worker:
-    build:
-      context: ./services/workers
-      dockerfile: Dockerfile
-    volumes:
-      - ./services/workers:/app
-    env_file:
-      - .env
-    depends_on:
-      - redis
-      - qdrant
-      - db
-    command: celery -A app.tasks.celery worker --loglevel=info
-
-  # Database (PostgreSQL + pgvector)
-  db:
-    image: supabase/postgres:15.1.0.118
+  postgres:
+    image: postgres:15-alpine
+    container_name: lifelog-postgres
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-lifelog}
+      - POSTGRES_USER=${POSTGRES_USER:-lifelog}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-lifelog}
     ports:
       - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-    environment:
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DB=${POSTGRES_DB}
+      - pg_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
-      interval: 5s
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-lifelog}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: valkey/valkey:7-alpine
+    container_name: lifelog-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli ping || redis-cli ping"]
+      interval: 10s
       timeout: 5s
       retries: 5
 
-  # Vector Store (Qdrant)
-  qdrant:
-    image: qdrant/qdrant:v1.7.4
+  authentik-db:
+    image: postgres:15-alpine
+    container_name: lifelog-authentik-db
+    environment:
+      - POSTGRES_DB=${AUTHENTIK_POSTGRES_DB:-authentik}
+      - POSTGRES_USER=${AUTHENTIK_POSTGRES_USER:-authentik}
+      - POSTGRES_PASSWORD=${AUTHENTIK_POSTGRES_PASSWORD:-authentik}
+    volumes:
+      - authentik_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AUTHENTIK_POSTGRES_USER:-authentik}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  authentik-redis:
+    image: redis:7-alpine
+    container_name: lifelog-authentik-redis
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    volumes:
+      - authentik_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  authentik-server:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_IMAGE_TAG:-latest}
+    container_name: lifelog-authentik
+    command: server
+    environment:
+      - AUTHENTIK_SECRET_KEY=${AUTHENTIK_SECRET_KEY:-dev-secret-change-me}
+      - AUTHENTIK_POSTGRESQL__HOST=authentik-db
+      - AUTHENTIK_POSTGRESQL__USER=${AUTHENTIK_POSTGRES_USER:-authentik}
+      - AUTHENTIK_POSTGRESQL__NAME=${AUTHENTIK_POSTGRES_DB:-authentik}
+      - AUTHENTIK_POSTGRESQL__PASSWORD=${AUTHENTIK_POSTGRES_PASSWORD:-authentik}
+      - AUTHENTIK_REDIS__HOST=authentik-redis
+      - AUTHENTIK_ERROR_REPORTING__ENABLED=false
+      - AUTHENTIK_BOOTSTRAP_PASSWORD=${AUTHENTIK_BOOTSTRAP_PASSWORD:-}
+      - AUTHENTIK_BOOTSTRAP_EMAIL=${AUTHENTIK_BOOTSTRAP_EMAIL:-}
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      - "9002:9000"
+      - "9443:9443"
+    volumes:
+      - authentik_media:/media
+      - authentik_templates:/templates
+    depends_on:
+      - authentik-db
+      - authentik-redis
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_IMAGE_TAG:-latest}
+    container_name: lifelog-authentik-worker
+    command: worker
+    environment:
+      - AUTHENTIK_SECRET_KEY=${AUTHENTIK_SECRET_KEY:-dev-secret-change-me}
+      - AUTHENTIK_POSTGRESQL__HOST=authentik-db
+      - AUTHENTIK_POSTGRESQL__USER=${AUTHENTIK_POSTGRES_USER:-authentik}
+      - AUTHENTIK_POSTGRESQL__NAME=${AUTHENTIK_POSTGRES_DB:-authentik}
+      - AUTHENTIK_POSTGRESQL__PASSWORD=${AUTHENTIK_POSTGRES_PASSWORD:-authentik}
+      - AUTHENTIK_REDIS__HOST=authentik-redis
+      - AUTHENTIK_ERROR_REPORTING__ENABLED=false
+    volumes:
+      - authentik_media:/media
+      - authentik_templates:/templates
+    depends_on:
+      - authentik-db
+      - authentik-redis
+
+  rustfs:
+    image: ${RUSTFS_IMAGE:-rustfs/rustfs:latest}
+    container_name: lifelog-rustfs
+    ports:
+      - "9000:9000"   # S3-compatible API
+      - "9001:9001"   # optional console (if enabled by the image)
+    environment:
+      - RUSTFS_ACCESS_KEY=${S3_ACCESS_KEY_ID:-rustfs}
+      - RUSTFS_SECRET_KEY=${S3_SECRET_ACCESS_KEY:-rustfs123}
+    volumes:
+      - rustfs_data:/data
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: lifelog-qdrant
+    ports:
+      - "6333:6333"   # HTTP API + /metrics
     volumes:
       - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:6333/collections"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
 
-  # Task Broker (Redis)
-  redis:
-    image: valkey/valkey:7-alpine
+  flower:
+    image: mher/flower:latest
+    container_name: lifelog-flower
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
     ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
+      - "5555:5555"
+    depends_on:
+      - redis
 
-  # Web Frontend (Next.js) - Run this locally for better hot-reloading
-  # To run the web app, navigate to `apps/web` and run `pnpm dev`
-  # This service is commented out as it's often better to run the Node server on the host.
-  # web:
-  #   build:
-  #     context: ./apps/web
-  #     dockerfile: Dockerfile
-  #   ports:
-  - "3000:3000"
-  #   volumes:
-  #     - ./apps/web:/app
-  #     - /app/node_modules # Prevent host node_modules from overwriting container
-  #   env_file:
-  #     - .env
+  celery-exporter:
+    image: danihodovic/celery-exporter:latest
+    container_name: lifelog-celery-exporter
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+    command: ["--broker-url=redis://redis:6379/0"]
+    ports:
+      - "9808:9808"   # /metrics
+    depends_on:
+      - redis
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: lifelog-prometheus
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ./orchestration/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - celery-exporter
+      - qdrant
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: lifelog-grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
 
 volumes:
-  postgres_data:
+  pg_data:
   qdrant_data:
-  redis_data:
+  rustfs_data:
+  prometheus_data:
+  grafana_data:
+  authentik_db_data:
+  authentik_redis_data:
+  authentik_media:
+  authentik_templates:

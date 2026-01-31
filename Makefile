@@ -1,4 +1,4 @@
-COMPOSE := orchestration/docker-compose.dev.yml
+COMPOSE := docker-compose.yml
 ENV_FILE := $(if $(wildcard .env),--env-file .env,)
 NODE_PREFIX := $(shell brew --prefix node@20 2>/dev/null || brew --prefix node 2>/dev/null || true)
 NODE_BIN := $(if $(NODE_PREFIX),$(NODE_PREFIX)/bin,)

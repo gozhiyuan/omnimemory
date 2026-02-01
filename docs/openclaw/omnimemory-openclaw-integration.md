@@ -1,7 +1,7 @@
 # OmniMemory + OpenClaw Integration Guide
 
 > **Status:** Implementation in progress - Phase 1 & 3 completed
-> **Last Updated:** 2026-01-30
+> **Last Updated:** 2026-01-31
 
 ---
 
@@ -1345,13 +1345,30 @@ async def ingest_from_chat(
 3. [ ] Add OpenClaw-specific settings endpoints (`GET/PATCH /settings/openclaw`)
 4. [ ] Store API token securely
 
-### Phase 3: Memory Sync (Pending)
+### Phase 3: Memory Sync ✅ COMPLETED
 
-1. [ ] Implement `OpenClawMemorySync` class in `services/api/app/integrations/openclaw_sync.py`
-2. [ ] Hook into daily summary generation pipeline
-3. [ ] Add Celery task for background sync
-4. [ ] Add sync toggle to settings
+1. [x] Implement `OpenClawMemorySync` class in `services/api/app/integrations/openclaw_sync.py`
+2. [x] Hook into daily summary generation pipeline (`tasks/episodes.py:_update_daily_summary`)
+3. [x] Sync runs inline (no separate Celery task needed - file writes are fast)
+4. [ ] Add sync toggle to settings UI
 5. [ ] Test memory files are created at `~/.openclaw/memory/*.md`
+
+**Implementation Details:**
+- Created `services/api/app/integrations/openclaw_sync.py` with `OpenClawMemorySync` class
+- Added sync hook to `_update_daily_summary()` after embeddings upsert
+- Handles both auto-generated and user-edited summaries
+- Deletes OpenClaw memory files when no episodes exist for a day
+- Reads config from user settings: `settings.openclaw.sync_memory`
+
+**To enable sync, update user settings:**
+```json
+{
+  "openclaw": {
+    "sync_memory": true,
+    "workspace": "~/.openclaw"
+  }
+}
+```
 
 ### Phase 4: Chat UI Updates (Pending)
 

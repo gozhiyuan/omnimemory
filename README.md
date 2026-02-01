@@ -2,6 +2,72 @@
 
 This repository houses the Lifelog AI MVP: a FastAPI + Celery backend (Postgres, Redis, Qdrant), optional Supabase storage for uploads, and a React + Vite frontend with Dashboard, Timeline, Chat, and Ingest views.
 
+## Quick Start
+
+The easiest way to get started is using the OmniMemory CLI.
+
+### Prerequisites
+
+- **Docker Desktop** (or Docker Engine with Compose plugin)
+- **Node.js 20+**
+
+### Setup
+
+```bash
+# Install the CLI
+cd apps/cli && npm install && npm run build && npm link
+cd ../..
+
+# Run interactive setup (configures Gemini API key, storage, auth options)
+omni setup
+
+# Start all services
+omni start
+```
+
+The setup wizard will prompt you for:
+- **Gemini API Key** (required) - for AI features
+- **Storage Provider** - Local (RustFS) or Cloud (Supabase)
+- **Google Photos sync** (optional)
+- **Google Cloud APIs** (optional) - Vision OCR, Maps
+- **Authentication** (optional) - Authentik OIDC for multi-user support
+
+### What Gets Started
+
+| Auth Disabled | Auth Enabled |
+|---------------|--------------|
+| Postgres, Redis, Qdrant | All core services |
+| RustFS (S3 storage) | + Authentik (OIDC provider) |
+| API, Celery worker | + User creation prompt |
+| Monitoring (Prometheus, Grafana, Flower) | |
+| Web app (localhost:3000) | |
+
+### Other Commands
+
+```bash
+omni status              # Check service health
+omni stop                # Stop all services
+omni stop --volumes      # Stop and remove all data (fresh start)
+```
+
+### Clean Reinstall
+
+To start completely fresh:
+
+```bash
+omni stop --volumes
+rm -f .env apps/web/.env.local
+docker volume prune -f
+omni setup
+omni start
+```
+
+---
+
+## Manual Setup (Advanced)
+
+If you prefer manual control or need to customize the setup, follow the instructions below.
+
 ### Project Structure (current focus)
 
 - `services/api/` – FastAPI service + Celery processing pipeline (upload/ingest, timeline, dashboard, search, seed script).
@@ -11,15 +77,14 @@ This repository houses the Lifelog AI MVP: a FastAPI + Celery backend (Postgres,
 - `lifelog-mvp-dev-plan.md` – Development roadmap.
 - `docs/minecontext/lifelog_ingestion_rag_design.md` – Detailed ingestion + RAG design (draft).
 
-### Tooling Prerequisites
+### Tooling Prerequisites (Manual Setup)
 
-- Docker Desktop (or Docker Engine) with Compose plugin.
-- Python 3.11+
-  - [uv](https://github.com/astral-sh/uv) for dependency management (`pip install uv` or via homebrew: `brew install uv`).
+- Docker Desktop (or Docker Engine) with Compose plugin
+- Python 3.11+ with [uv](https://github.com/astral-sh/uv) (`pip install uv` or `brew install uv`)
 - Node.js 20+
-- Optional: `just` or `make` (Makefile provided).
+- Optional: `make` (Makefile provided)
 
-### Local Environment Setup
+### Local Environment Setup (Manual)
 
 1. Copy `.env.example` → `.env` at the repo root. This single file configures both Docker Compose and API/Celery.
    - Set `AUTHENTIK_SECRET_KEY` and a valid `AUTHENTIK_IMAGE_TAG` if you plan to use local OIDC.

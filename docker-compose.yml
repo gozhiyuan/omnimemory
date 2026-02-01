@@ -7,8 +7,6 @@
 #
 # Services: Postgres, Redis, Qdrant, RustFS (S3), Authentik (OIDC), Prometheus, Grafana
 
-version: "3.9"
-
 services:
   postgres:
     image: postgres:15-alpine
@@ -88,6 +86,12 @@ services:
     depends_on:
       - authentik-db
       - authentik-redis
+    healthcheck:
+      test: ["CMD", "ak", "healthcheck"]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
 
   authentik-worker:
     image: ghcr.io/goauthentik/server:${AUTHENTIK_IMAGE_TAG:-latest}
@@ -181,6 +185,87 @@ services:
       - grafana_data:/var/lib/grafana
     depends_on:
       - prometheus
+
+  # API Server (runs migrations on startup)
+  api:
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile
+    container_name: lifelog-api
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-lifelog}
+      - POSTGRES_USER=${POSTGRES_USER:-lifelog}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-lifelog}
+      - REDIS_URL=redis://redis:6379/0
+      - QDRANT_URL=http://qdrant:6333
+      - QDRANT_COLLECTION=${QDRANT_COLLECTION:-lifelog-items}
+      - S3_ENDPOINT_URL=http://rustfs:9000
+      - S3_PUBLIC_URL=http://localhost:9000
+      - S3_ACCESS_KEY_ID=${S3_ACCESS_KEY_ID:-rustfs}
+      - S3_SECRET_ACCESS_KEY=${S3_SECRET_ACCESS_KEY:-rustfs123}
+      - S3_REGION=${S3_REGION:-us-east-1}
+      - S3_FORCE_PATH_STYLE=true
+      - STORAGE_PROVIDER=${STORAGE_PROVIDER:-s3}
+      - BUCKET_ORIGINALS=${BUCKET_ORIGINALS:-originals}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash-lite}
+      - AUTH_ENABLED=${AUTH_ENABLED:-false}
+      - OIDC_ISSUER_URL=${OIDC_ISSUER_URL:-}
+      - OIDC_JWKS_URL=${OIDC_JWKS_URL:-}
+      - OIDC_AUDIENCE=${OIDC_AUDIENCE:-}
+      - OIDC_USER_ID_CLAIM=${OIDC_USER_ID_CLAIM:-}
+      - OIDC_EMAIL_CLAIM=${OIDC_EMAIL_CLAIM:-}
+      - OIDC_NAME_CLAIM=${OIDC_NAME_CLAIM:-}
+      - GOOGLE_PHOTOS_CLIENT_ID=${GOOGLE_PHOTOS_CLIENT_ID:-}
+      - GOOGLE_PHOTOS_CLIENT_SECRET=${GOOGLE_PHOTOS_CLIENT_SECRET:-}
+      - GOOGLE_PHOTOS_REDIRECT_URI=${GOOGLE_PHOTOS_REDIRECT_URI:-}
+      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-gemini}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-gemini-embedding-001}
+      - EMBEDDING_DIMENSION=${EMBEDDING_DIMENSION:-3072}
+      - VLM_PROVIDER=${VLM_PROVIDER:-gemini}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Celery Worker
+  celery-worker:
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile
+    container_name: lifelog-celery-worker
+    command: ["uv", "run", "celery", "-A", "app.celery_app.celery_app", "worker", "--loglevel=info"]
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-lifelog}
+      - POSTGRES_USER=${POSTGRES_USER:-lifelog}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-lifelog}
+      - REDIS_URL=redis://redis:6379/0
+      - QDRANT_URL=http://qdrant:6333
+      - QDRANT_COLLECTION=${QDRANT_COLLECTION:-lifelog-items}
+      - S3_ENDPOINT_URL=http://rustfs:9000
+      - S3_PUBLIC_URL=http://localhost:9000
+      - S3_ACCESS_KEY_ID=${S3_ACCESS_KEY_ID:-rustfs}
+      - S3_SECRET_ACCESS_KEY=${S3_SECRET_ACCESS_KEY:-rustfs123}
+      - S3_REGION=${S3_REGION:-us-east-1}
+      - S3_FORCE_PATH_STYLE=true
+      - STORAGE_PROVIDER=${STORAGE_PROVIDER:-s3}
+      - BUCKET_ORIGINALS=${BUCKET_ORIGINALS:-originals}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash-lite}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   pg_data:

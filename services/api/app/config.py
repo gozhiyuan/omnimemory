@@ -54,6 +54,7 @@ class Settings(BaseSettings):
 
     # S3-compatible storage (RustFS/MinIO/AWS)
     s3_endpoint_url: Optional[AnyUrl] = Field(default=None)
+    s3_public_url: Optional[AnyUrl] = Field(default=None)  # Public URL for presigned URLs (browser-accessible)
     s3_access_key_id: Optional[str] = None
     s3_secret_access_key: Optional[str] = None
     s3_region: str = "us-east-1"
@@ -200,6 +201,11 @@ class Settings(BaseSettings):
         ge=0,
         alias="DEDUPE_NEAR_HAMMING_THRESHOLD",
     )
+
+    # OpenClaw integration
+    openclaw_enabled: bool = False
+    openclaw_gateway_url: Optional[str] = None
+    openclaw_sync_memory: bool = False
 
     @model_validator(mode="before")
     @classmethod

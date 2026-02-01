@@ -261,9 +261,9 @@ def search_contexts(
     client = get_qdrant_client()
     vector = embed_text(query, user_id=user_id, step_name="search_embedding")
     ensure_collection(len(vector))
-    results = client.search(
+    results = client.query_points(
         collection_name=settings.qdrant_collection,
-        query_vector=vector,
+        query=vector,
         limit=limit,
         with_payload=True,
         query_filter=_build_filter(
@@ -280,7 +280,7 @@ def search_contexts(
             "score": point.score,
             "payload": point.payload,
         }
-        for point in results
+        for point in results.points
     ]
 
 

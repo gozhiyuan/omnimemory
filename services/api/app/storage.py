@@ -101,13 +101,22 @@ class S3StorageProvider(StorageProvider):
     def _bucket(self) -> str:
         return self.settings.bucket_originals
 
+    def _public_url(self, url: str) -> str:
+        """Replace internal endpoint URL with public URL for browser access."""
+        if self.settings.s3_public_url and self.settings.s3_endpoint_url:
+            internal = str(self.settings.s3_endpoint_url).rstrip("/")
+            public = str(self.settings.s3_public_url).rstrip("/")
+            if url.startswith(internal):
+                return public + url[len(internal):]
+        return url
+
     def get_presigned_upload(self, key: str, content_type: str, expires_s: int) -> Dict[str, str]:
         url = self.client.generate_presigned_url(
             "put_object",
             Params={"Bucket": self._bucket(), "Key": key, "ContentType": content_type},
             ExpiresIn=expires_s,
         )
-        return {"key": key, "url": url, "headers": {"Content-Type": content_type}}
+        return {"key": key, "url": self._public_url(url), "headers": {"Content-Type": content_type}}
 
     def get_presigned_download(self, key: str, expires_s: int) -> Dict[str, str]:
         url = self.client.generate_presigned_url(
@@ -115,7 +124,7 @@ class S3StorageProvider(StorageProvider):
             Params={"Bucket": self._bucket(), "Key": key},
             ExpiresIn=expires_s,
         )
-        return {"key": key, "url": url}
+        return {"key": key, "url": self._public_url(url)}
 
     def delete(self, key: str) -> None:
         try:

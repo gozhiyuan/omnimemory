@@ -464,6 +464,34 @@ class ChatAttachment(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("NOW()"), nullable=False
     )
+class ApiKey(Base):
+    """API keys for external integrations (OpenClaw, etc.)."""
+
+    __tablename__ = "api_keys"
+    __table_args__ = (
+        Index("api_keys_user_idx", "user_id"),
+        Index("api_keys_key_hash_idx", "key_hash"),
+        Index("api_keys_prefix_idx", "key_prefix"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"))
+    key_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    key_prefix: Mapped[str] = mapped_column(String(20), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    scopes: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[\"read\", \"write\"]'::jsonb"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("NOW()"), nullable=False
+    )
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    user: Mapped[User] = relationship()
+
+
 class AiUsageEvent(Base):
     __tablename__ = "ai_usage_events"
     __table_args__ = (
@@ -504,6 +532,7 @@ __all__ = [
     "ProcessedContext",
     "DailySummary",
     "UserSettings",
+    "ApiKey",
     "AiUsageEvent",
     "DEFAULT_TEST_USER_ID",
 ]

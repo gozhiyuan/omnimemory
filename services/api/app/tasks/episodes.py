@@ -30,6 +30,7 @@ from ..db.session import isolated_session
 from ..pipeline.utils import build_vector_text, ensure_tz_aware, extract_keywords, parse_iso_datetime
 from ..user_settings import fetch_user_settings, resolve_language_code, resolve_language_label
 from ..vectorstore import delete_context_embeddings, search_contexts, upsert_context_embeddings
+from ..integrations.openclaw_sync import get_openclaw_sync
 
 
 def _tokenize(value: str) -> set[str]:
@@ -474,6 +475,14 @@ async def _update_daily_summary(
                     DailySummary.summary_date == target_date,
                 )
             )
+        # Sync deletion to OpenClaw if enabled
+        try:
+            user_settings = await fetch_user_settings(session, user_id)
+            openclaw_sync = get_openclaw_sync(user_settings)
+            for target_date in delete_dates:
+                openclaw_sync.delete_daily_summary(target_date)
+        except Exception as exc:
+            logger.warning("OpenClaw sync delete failed: {}", exc)
         return
     summary_source_items: list[UUID] = []
     for episode in episodes:
@@ -525,6 +534,30 @@ async def _update_daily_summary(
                         DailySummary.summary_date == existing_summary_date,
                     )
                 )
+            # Sync to OpenClaw if enabled (user-edited summary)
+            try:
+                user_settings = await fetch_user_settings(session, user_id)
+                openclaw_sync = get_openclaw_sync(user_settings)
+                if openclaw_sync.enabled:
+                    episode_dicts = [
+                        {
+                            "title": ep.title,
+                            "summary": ep.summary,
+                            "start_time": ep.start_time_utc.isoformat() if ep.start_time_utc else None,
+                            "end_time": ep.end_time_utc.isoformat() if ep.end_time_utc else None,
+                        }
+                        for ep in episodes
+                    ]
+                    highlights = [ep.title for ep in episodes if ep.title][:5]
+                    openclaw_sync.sync_daily_summary(
+                        user_id=str(user_id),
+                        summary_date=summary_date,
+                        summary=summary_context.summary,
+                        episodes=episode_dicts,
+                        highlights=highlights,
+                    )
+            except Exception as exc:
+                logger.warning("OpenClaw sync failed: {}", exc)
             return
 
     title, summary, keywords = _build_daily_summary(episodes, summary_date)
@@ -596,6 +629,31 @@ async def _update_daily_summary(
 
     await session.flush()
     upsert_context_embeddings([summary_context])
+
+    # Sync to OpenClaw if enabled
+    try:
+        user_settings = await fetch_user_settings(session, user_id)
+        openclaw_sync = get_openclaw_sync(user_settings)
+        if openclaw_sync.enabled:
+            episode_dicts = [
+                {
+                    "title": ep.title,
+                    "summary": ep.summary,
+                    "start_time": ep.start_time_utc.isoformat() if ep.start_time_utc else None,
+                    "end_time": ep.end_time_utc.isoformat() if ep.end_time_utc else None,
+                }
+                for ep in episodes
+            ]
+            highlights = [ep.title for ep in episodes if ep.title][:5]
+            openclaw_sync.sync_daily_summary(
+                user_id=str(user_id),
+                summary_date=summary_date,
+                summary=summary,
+                episodes=episode_dicts,
+                highlights=highlights,
+            )
+    except Exception as exc:
+        logger.warning("OpenClaw sync failed: {}", exc)
 
 
 async def _update_episode_for_item(item_id: str) -> dict[str, Any]:

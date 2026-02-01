@@ -39,6 +39,10 @@ export type SettingsState = {
     experimentalFeatures: boolean;
     debugTelemetry: boolean;
   };
+  openclaw: {
+    syncMemory: boolean;
+    workspace: string;
+  };
 };
 
 export const SETTINGS_STORAGE_KEY = 'lifelog.settings';
@@ -50,9 +54,11 @@ const resolveLocalTimezone = () => {
   return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 };
 
+const LEGACY_DEMO_DISPLAY_NAME = 'Demo User';
+
 export const getDefaultSettings = (): SettingsState => ({
   profile: {
-    displayName: 'Demo User',
+    displayName: '',
     language: 'en',
     photoKey: null,
   },
@@ -86,6 +92,10 @@ export const getDefaultSettings = (): SettingsState => ({
     experimentalFeatures: false,
     debugTelemetry: false,
   },
+  openclaw: {
+    syncMemory: false,
+    workspace: '~/.openclaw',
+  },
 });
 
 export const coerceSettings = (
@@ -95,11 +105,15 @@ export const coerceSettings = (
   if (!raw) {
     return defaults;
   }
+  const rawProfile = { ...(raw.profile ?? {}) };
+  if (rawProfile.displayName === LEGACY_DEMO_DISPLAY_NAME) {
+    rawProfile.displayName = '';
+  }
   const provider = raw.ingest?.defaultProvider;
   const resolvedProvider =
     provider === 'google_photos' || provider === 'local' ? provider : defaults.ingest.defaultProvider;
   return {
-    profile: { ...defaults.profile, ...(raw.profile ?? {}) },
+    profile: { ...defaults.profile, ...rawProfile },
     preferences: { ...defaults.preferences, ...(raw.preferences ?? {}) },
     appearance: { ...defaults.appearance, ...(raw.appearance ?? {}) },
     timeline: { ...defaults.timeline, ...(raw.timeline ?? {}) },
@@ -110,5 +124,6 @@ export const coerceSettings = (
     },
     privacy: { ...defaults.privacy, ...(raw.privacy ?? {}) },
     advanced: { ...defaults.advanced, ...(raw.advanced ?? {}) },
+    openclaw: { ...defaults.openclaw, ...(raw.openclaw ?? {}) },
   };
 };

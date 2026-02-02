@@ -50,6 +50,17 @@ omni stop                # Stop all services
 omni stop --volumes      # Stop and remove all data (fresh start)
 ```
 
+### Alembic (optional, autogenerate)
+
+If you want autogenerate support for new migrations, Alembic is wired under `services/api/`.
+Use the Makefile target to pass through Alembic commands:
+
+```bash
+make alembic ARGS="stamp head"
+make alembic ARGS="revision --autogenerate -m 'add indexes'"
+make alembic ARGS="upgrade head"
+```
+
 ### Clean Reinstall
 
 To start completely fresh:

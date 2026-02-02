@@ -126,6 +126,33 @@ uv run python -m app.db.migrator
 You can confirm the schema exists by opening `psql` via Docker and running `\dt` or checking
 `SELECT * FROM schema_migrations;`.
 
+### Alembic (autogenerate, optional)
+
+Alembic is configured for autogenerating migrations from SQLAlchemy models. It is intended for
+new migrations only; the existing SQL migrations remain the source of truth for the current
+schema.
+
+One-time setup on an existing database (marks the current schema as the Alembic baseline):
+
+```bash
+uv run alembic stamp head
+```
+
+Then generate new migrations as needed:
+
+```bash
+uv run alembic revision --autogenerate -m "describe change"
+uv run alembic upgrade head
+```
+
+You can also use the root Makefile wrapper:
+
+```bash
+make alembic ARGS="stamp head"
+make alembic ARGS="revision --autogenerate -m 'describe change'"
+make alembic ARGS="upgrade head"
+```
+
 ### Vector store helper (`app/vectorstore.py`)
 
 The Qdrant wrapper exposes `ensure_collection()` for bootstrapping the collection schema and

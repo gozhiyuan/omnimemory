@@ -28,7 +28,12 @@ from ..db.models import (
 )
 from ..db.session import isolated_session
 from ..pipeline.utils import build_vector_text, ensure_tz_aware, extract_keywords, parse_iso_datetime
-from ..user_settings import fetch_user_settings, resolve_language_code, resolve_language_label
+from ..user_settings import (
+    build_preference_guidance,
+    fetch_user_settings,
+    resolve_language_code,
+    resolve_language_label,
+)
 from ..vectorstore import delete_context_embeddings, search_contexts, upsert_context_embeddings
 from ..integrations.openclaw_sync import get_openclaw_sync
 
@@ -168,6 +173,7 @@ async def _generate_episode_summary(
     user_id: UUID,
     language: str | None = None,
     tz_name: str | None = None,
+    preference_guidance: str | None = None,
 ) -> Optional[dict[str, Any]]:
     if settings.video_understanding_provider != "gemini":
         return None
@@ -190,6 +196,7 @@ async def _generate_episode_summary(
         time_range=time_range,
         omitted_count=omitted_count,
         language=language,
+        extra_guidance=preference_guidance,
     )
     response = await summarize_text_with_gemini(
         prompt=prompt,
@@ -672,6 +679,7 @@ async def _update_episode_for_item(item_id: str) -> dict[str, Any]:
             preferences = user_settings.get("preferences")
             if isinstance(preferences, dict):
                 tz_name = preferences.get("timezone")
+        preference_guidance = build_preference_guidance(user_settings)
 
         context_stmt = select(ProcessedContext).where(
             ProcessedContext.user_id == item.user_id,
@@ -903,6 +911,7 @@ async def _update_episode_for_item(item_id: str) -> dict[str, Any]:
                     user_id=item.user_id,
                     language=language,
                     tz_name=tz_name,
+                    preference_guidance=preference_guidance,
                 )
 
         episode_records = _build_episode_context_records(

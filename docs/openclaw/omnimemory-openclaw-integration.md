@@ -307,7 +307,8 @@ Use when the user wants to add a photo/video/audio via chat.`,
       },
       body: JSON.stringify({
         filename: params.content.split("/").pop() || "upload",
-        content_type: "application/octet-stream",
+        // Use the real content type to enable thumbnails in chat.
+        content_type: "image/jpeg",
         prefix: "openclaw"
       })
     });
@@ -357,9 +358,35 @@ async function getOmniMemoryToken(userId: string): Promise<string | null> {
 }
 ```
 
-**Shell wrapper scripts (implemented at `~/.openclaw/skills/omnimemory/`):**
+**Shell wrapper scripts**
+
+Templates live in the repo at `docs/openclaw/skills/omnimemory/`.
+`omni setup` copies them into the OpenClaw workspace (default: `~/.openclaw/skills/omnimemory/`).
 
 Requires `jq` for JSON parsing. Scripts support OIDC authentication via `OMNIMEMORY_API_TOKEN`.
+
+Also included:
+- `omnimemory_preferences.sh` for updating analysis preferences and default annotations (without prompt overrides).
+
+### Preferences (no prompt override)
+
+Preferences live in user settings (`settings.preferences`) and allow OpenClaw to bias analysis without changing prompts.
+
+Example:
+```bash
+./omnimemory_preferences.sh focus --tags "food,people"
+./omnimemory_preferences.sh defaults --tags "food" --people "Alice" --description "Focus on meals"
+```
+
+These preferences:
+- add guidance to image/video/audio analysis and episode summaries
+- provide default tags/people/description when ingest omits them
+- auto-sync browser timezone into preferences when missing (UI refresh)
+
+### Workspace defaults
+
+`OPENCLAW_WORKSPACE` sets the default workspace path used by settings (and by `omni setup` when installing skills).
+Users can override it later in Settings → OpenClaw workspace.
 
 ```bash
 #!/usr/bin/env bash
@@ -445,7 +472,7 @@ AUTH_HEADER=""
 UPLOAD_RESPONSE=$(curl -sS -X POST "$API_URL/storage/upload-url" \
   -H "Content-Type: application/json" \
   ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
-  -d "{\"filename\":\"$(basename "$FILE")\",\"content_type\":\"application/octet-stream\",\"prefix\":\"openclaw\"}")
+  -d "{\"filename\":\"$(basename "$FILE")\",\"content_type\":\"image/jpeg\",\"prefix\":\"openclaw\"}")
 
 UPLOAD_URL=$(echo "$UPLOAD_RESPONSE" | jq -r '.url')
 STORAGE_KEY=$(echo "$UPLOAD_RESPONSE" | jq -r '.key')
@@ -518,6 +545,52 @@ When returning search results:
 2. **Not the right abstraction:** Nodes are designed for **device capabilities** (camera, screen, location, local file access) that must run on a specific device. OmniMemory is a **service** with an HTTP API—tools are the right abstraction.
 
 3. **No benefit over tools:** Everything a node could do, tools can do via HTTP calls, but simpler.
+
+---
+
+# Future use cases to add to skills
+
+These are documented for future skill expansion.
+
+1) Find memories by people
+   - "Show me everything with Alice last month."
+   - Tool: `omnimemory_search` with `query="Alice"` and date range.
+
+2) Location recall
+   - "Memories near Golden Gate in January."
+   - Tool: `omnimemory_search` with `query="Golden Gate"` + date range.
+
+3) Food log recall
+   - "What did I eat last week?"
+   - Tool: `omnimemory_search` with `query="food meal dinner"` + date range.
+
+4) Audio journal retrieval
+   - "Find voice notes about product strategy."
+   - Tool: `omnimemory_search` with `query="product strategy"` and optional `context_types`.
+
+5) Meeting recap from audio
+   - "List audio entries that mention roadmap."
+   - Tool: `omnimemory_search` with `query="roadmap"`.
+
+6) Prompt tuning workflow
+   - Update `image_analysis`, re-ingest a photo, verify tags improved.
+   - Tools: `omnimemory_prompt`, `omnimemory_ingest`.
+
+7) Annotation preservation
+   - Add description/tags, reprocess item, confirm annotation remains.
+   - Tools: `omnimemory_ingest`, `omnimemory_search`.
+
+8) Chat source verification
+   - Ask chat a question, confirm results include thumbnail URLs.
+   - Tools: chat UI + `omnimemory_search` for validation.
+
+9) Daily summary verification
+   - Confirm daily summary exists for yesterday and appears in timeline.
+   - Tool: `omnimemory_timeline`.
+
+10) Sync on schedule
+   - Enable `openclaw.syncMemory`, run Celery beat, verify daily file updates.
+   - Tools: `omnimemory_settings`, filesystem check.
 
 4. **Maintenance burden:** Would need to maintain WebSocket reconnection logic, handle gateway restarts, manage node pairing flow.
 

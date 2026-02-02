@@ -365,14 +365,18 @@ def get_openclaw_sync(user_settings: dict[str, Any]) -> OpenClawMemorySync:
     Returns:
         Configured OpenClawMemorySync instance
     """
+    from ..config import get_settings
+
     openclaw_config = user_settings.get("openclaw", {})
+    settings = get_settings()
 
     # Check both user settings and env var
     sync_enabled = openclaw_config.get("syncMemory", False)
     if not sync_enabled:
         sync_enabled = os.getenv("OPENCLAW_SYNC_MEMORY", "").lower() == "true"
 
+    workspace = openclaw_config.get("workspace") if isinstance(openclaw_config, dict) else None
     return OpenClawMemorySync(
-        openclaw_workspace=openclaw_config.get("workspace", "~/.openclaw"),
+        openclaw_workspace=workspace or settings.openclaw_workspace,
         enabled=sync_enabled,
     )

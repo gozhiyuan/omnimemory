@@ -6,6 +6,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 # Install system dependencies for Pillow/image processing
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
     libheif-dev \
     && rm -rf /var/lib/apt/lists/*
 

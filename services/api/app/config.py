@@ -206,6 +206,27 @@ class Settings(BaseSettings):
     openclaw_enabled: bool = False
     openclaw_gateway_url: Optional[str] = None
     openclaw_sync_memory: bool = False
+    openclaw_workspace: str = "~/.openclaw"
+
+    # Prompt management
+    omnimemory_prompts_dir: str = Field(
+        default="~/.omnimemory",
+        description="Base path for prompts (appends /users/{user_id}/prompts)",
+    )
+    prompt_max_size_bytes: int = Field(
+        default=32768,
+        ge=1024,
+        description="Global max size for prompt templates",
+    )
+    prompt_hot_reload: bool = Field(
+        default=False,
+        description="Enable hot-reload of prompts (disable in prod)",
+    )
+    prompt_cache_ttl_seconds: int = Field(
+        default=300,
+        ge=0,
+        description="TTL cache for prompts when hot reload disabled",
+    )
 
     @model_validator(mode="before")
     @classmethod

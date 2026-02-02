@@ -46,6 +46,26 @@ router = APIRouter()
 
 
 WEB_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+_IMAGE_EXT_TO_TYPE = {
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "webp": "image/webp",
+    "gif": "image/gif",
+}
+
+
+def _infer_image_content_type(item: SourceItem) -> Optional[str]:
+    """Infer image content type from filename or storage key."""
+    candidates = [item.original_filename or "", item.storage_key or ""]
+    for value in candidates:
+        if not value or "." not in value:
+            continue
+        ext = value.rsplit(".", 1)[-1].lower()
+        inferred = _IMAGE_EXT_TO_TYPE.get(ext)
+        if inferred:
+            return inferred
+    return None
 
 
 class ChatSource(BaseModel):
@@ -596,6 +616,10 @@ async def _build_thumbnail_urls(
         thumbnail_url: Optional[str] = None
         if item.item_type == "photo":
             content_type = (item.content_type or "").lower()
+            if content_type not in WEB_IMAGE_TYPES:
+                inferred = _infer_image_content_type(item)
+                if inferred:
+                    content_type = inferred
             if content_type in WEB_IMAGE_TYPES:
                 thumbnail_url = await download_url_for(item, None)
             else:

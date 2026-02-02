@@ -11,6 +11,15 @@ export type SettingsState = {
   };
   preferences: {
     timezone: string;
+    focus_tags?: string[];
+    focus_people?: string[];
+    focus_places?: string[];
+    focus_topics?: string[];
+    annotation_defaults?: {
+      tags?: string[];
+      people?: string[];
+      description_prefix?: string;
+    };
   };
   appearance: {
     reduceMotion: boolean;
@@ -64,6 +73,15 @@ export const getDefaultSettings = (): SettingsState => ({
   },
   preferences: {
     timezone: resolveLocalTimezone(),
+    focus_tags: [],
+    focus_people: [],
+    focus_places: [],
+    focus_topics: [],
+    annotation_defaults: {
+      tags: [],
+      people: [],
+      description_prefix: '',
+    },
   },
   appearance: {
     reduceMotion: false,

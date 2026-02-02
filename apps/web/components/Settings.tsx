@@ -257,6 +257,27 @@ export const Settings: React.FC = () => {
   ) => {
     setDraft((prev) => ({ ...prev, preferences: { ...prev.preferences, [key]: value } }));
   };
+  const updateAnnotationDefaults = <K extends keyof NonNullable<SettingsState['preferences']['annotation_defaults']>>(
+    key: K,
+    value: NonNullable<SettingsState['preferences']['annotation_defaults']>[K]
+  ) => {
+    setDraft((prev) => ({
+      ...prev,
+      preferences: {
+        ...prev.preferences,
+        annotation_defaults: {
+          ...(prev.preferences.annotation_defaults ?? {}),
+          [key]: value,
+        },
+      },
+    }));
+  };
+
+  const parseCommaList = (value: string) =>
+    value
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter(Boolean);
 
   const updateTimeline = <K extends keyof SettingsState['timeline']>(
     key: K,
@@ -622,37 +643,101 @@ export const Settings: React.FC = () => {
               'Defaulted to your device timezone. Change it if your memories should follow a different location.'
             )}
           </p>
+          <div className="mt-4 grid gap-3 rounded-xl border border-slate-100 bg-white/70 p-4 shadow-sm dark:border-slate-800 dark:bg-slate-950/40">
+            <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+              {t('Analysis focus')}
+            </p>
+            <label className="text-xs text-slate-500 dark:text-slate-400">
+              {t('Focus tags (comma-separated)')}
+              <input
+                value={(draft.preferences.focus_tags ?? []).join(', ')}
+                onChange={(event) =>
+                  updatePreferences('focus_tags', parseCommaList(event.target.value))
+                }
+                className={inputClass}
+                placeholder={t('food, people')}
+              />
+            </label>
+            <label className="text-xs text-slate-500 dark:text-slate-400">
+              {t('Focus people (comma-separated)')}
+              <input
+                value={(draft.preferences.focus_people ?? []).join(', ')}
+                onChange={(event) =>
+                  updatePreferences('focus_people', parseCommaList(event.target.value))
+                }
+                className={inputClass}
+                placeholder={t('Alice, Bob')}
+              />
+            </label>
+            <label className="text-xs text-slate-500 dark:text-slate-400">
+              {t('Focus places (comma-separated)')}
+              <input
+                value={(draft.preferences.focus_places ?? []).join(', ')}
+                onChange={(event) =>
+                  updatePreferences('focus_places', parseCommaList(event.target.value))
+                }
+                className={inputClass}
+                placeholder={t('Blue Bottle, Golden Gate')}
+              />
+            </label>
+            <label className="text-xs text-slate-500 dark:text-slate-400">
+              {t('Focus topics (comma-separated)')}
+              <input
+                value={(draft.preferences.focus_topics ?? []).join(', ')}
+                onChange={(event) =>
+                  updatePreferences('focus_topics', parseCommaList(event.target.value))
+                }
+                className={inputClass}
+                placeholder={t('meetings, meals')}
+              />
+            </label>
+          </div>
+          <div className="mt-4 grid gap-3 rounded-xl border border-slate-100 bg-white/70 p-4 shadow-sm dark:border-slate-800 dark:bg-slate-950/40">
+            <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+              {t('Annotation defaults')}
+            </p>
+            <label className="text-xs text-slate-500 dark:text-slate-400">
+              {t('Default tags (comma-separated)')}
+              <input
+                value={(draft.preferences.annotation_defaults?.tags ?? []).join(', ')}
+                onChange={(event) =>
+                  updateAnnotationDefaults('tags', parseCommaList(event.target.value))
+                }
+                className={inputClass}
+                placeholder={t('food, coffee')}
+              />
+            </label>
+            <label className="text-xs text-slate-500 dark:text-slate-400">
+              {t('Default people (comma-separated)')}
+              <input
+                value={(draft.preferences.annotation_defaults?.people ?? []).join(', ')}
+                onChange={(event) =>
+                  updateAnnotationDefaults('people', parseCommaList(event.target.value))
+                }
+                className={inputClass}
+                placeholder={t('Alice')}
+              />
+            </label>
+            <label className="text-xs text-slate-500 dark:text-slate-400">
+              {t('Default description prefix')}
+              <input
+                value={draft.preferences.annotation_defaults?.description_prefix ?? ''}
+                onChange={(event) =>
+                  updateAnnotationDefaults('description_prefix', event.target.value)
+                }
+                className={inputClass}
+                placeholder={t('Focus on meals and people')}
+              />
+            </label>
+          </div>
         </SectionCard>
 
         <SectionCard
           title={t('Appearance')}
-          description={t('Tune the interface to match your preferences.')}
+          description={t('Motion preferences for the interface.')}
           icon={<Sliders size={18} />}
-          action={
-            <span className="rounded-full bg-slate-100 px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-slate-500 dark:bg-slate-800 dark:text-slate-300">
-              {t('Coming soon')}
-            </span>
-          }
+          className="xl:col-span-2"
         >
-          <div className="rounded-lg border border-dashed border-slate-200 bg-white/70 px-4 py-3 text-xs text-slate-500 dark:border-slate-800 dark:bg-slate-950/40 dark:text-slate-400">
-            {t('Theme is managed from the sidebar toggle for now.')}
-            <div className="mt-2 text-[11px] text-slate-400 dark:text-slate-500">
-              {t('Font size scaling is coming soon.')}
-            </div>
-          </div>
-          <label className="text-xs text-slate-500 dark:text-slate-400">
-            {t('Font size')}
-            <select
-              value={draft.appearance.fontScale}
-              onChange={(event) => updateAppearance('fontScale', event.target.value as FontScale)}
-              className={inputDisabledClass}
-              disabled
-            >
-              <option value="sm">{t('Small')}</option>
-              <option value="md">{t('Default')}</option>
-              <option value="lg">{t('Large')}</option>
-            </select>
-          </label>
           <ToggleRow
             label={t('Reduce motion')}
             description={t('Minimize animations for a calmer experience.')}

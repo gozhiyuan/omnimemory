@@ -3,6 +3,9 @@ import ora from "ora";
 import { confirm, input, password, select } from "@inquirer/prompts";
 import { execa } from "execa";
 import { existsSync } from "fs";
+import { chmod, cp, mkdir, readdir } from "fs/promises";
+import path from "path";
+import os from "os";
 
 import {
   envFileExists,
@@ -248,9 +251,21 @@ async function promptEnvValues(existing: EnvConfig): Promise<EnvConfig> {
       default: true,
     });
 
+    const openclawWorkspace = await input({
+      message: "OpenClaw workspace path:",
+      default: values.OPENCLAW_WORKSPACE || "~/.openclaw",
+    });
+
     values.OPENCLAW_GATEWAY_URL = openclawUrl;
     values.OPENCLAW_ENABLED = "true";
     values.OPENCLAW_SYNC_MEMORY = syncMemory ? "true" : "false";
+    values.OPENCLAW_WORKSPACE = openclawWorkspace;
+
+    await installOpenClawSkills(openclawWorkspace);
+  } else {
+    // Make the disabled state explicit in the env output.
+    values.OPENCLAW_ENABLED = "false";
+    values.OPENCLAW_SYNC_MEMORY = "false";
   }
 
   console.log();
@@ -316,6 +331,53 @@ async function promptEnvValues(existing: EnvConfig): Promise<EnvConfig> {
   console.log();
 
   return values;
+}
+
+function expandTilde(inputPath: string): string {
+  if (!inputPath.startsWith("~")) {
+    return inputPath;
+  }
+  return path.join(os.homedir(), inputPath.slice(1));
+}
+
+async function installOpenClawSkills(workspacePath: string): Promise<void> {
+  try {
+    const repoRoot = getRepoRoot();
+    const sourceDir = path.join(repoRoot, "docs", "openclaw", "skills", "omnimemory");
+    if (!existsSync(sourceDir)) {
+      console.log(chalk.yellow("! OpenClaw skill templates not found in repo."));
+      return;
+    }
+
+    const expanded = expandTilde(workspacePath);
+    const skillsDir = path.join(expanded, "skills");
+    const targetDir = path.join(skillsDir, "omnimemory");
+
+    if (existsSync(targetDir)) {
+      const overwrite = await confirm({
+        message: `OpenClaw skills already exist at ${targetDir}. Overwrite?`,
+        default: false,
+      });
+      if (!overwrite) {
+        console.log(chalk.dim("  Skipped OpenClaw skill install."));
+        return;
+      }
+    }
+
+    await mkdir(skillsDir, { recursive: true });
+    await cp(sourceDir, targetDir, { recursive: true, force: true });
+
+    const entries = await readdir(targetDir, { withFileTypes: true });
+    await Promise.all(
+      entries
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".sh"))
+        .map((entry) => chmod(path.join(targetDir, entry.name), 0o755))
+    );
+
+    console.log(chalk.green("✓") + ` Installed OpenClaw skills to ${targetDir}`);
+  } catch (error) {
+    console.log(chalk.yellow("! Failed to install OpenClaw skills:"), error);
+  }
 }
 
 async function createEnvFile(values: EnvConfig): Promise<boolean> {

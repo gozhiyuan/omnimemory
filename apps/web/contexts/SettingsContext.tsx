@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { apiGet, apiPut } from '../services/api';
 import { translateFromStorage } from '../i18n/core';
 import { SettingsState, SETTINGS_STORAGE_KEY, coerceSettings, getDefaultSettings } from '../settings';
@@ -50,6 +50,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const [settings, setSettings] = useState<SettingsState>(() => loadCachedSettings(defaults));
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const autoSyncedTimezoneRef = useRef(false);
 
   const refreshSettings = useCallback(async () => {
     setLoading(true);
@@ -59,6 +60,16 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       const merged = coerceSettings(response.settings ?? null, defaults);
       setSettings(merged);
       storeCachedSettings(merged);
+      const storedTimezone = response.settings?.preferences?.timezone;
+      if (!storedTimezone && merged.preferences.timezone && !autoSyncedTimezoneRef.current) {
+        autoSyncedTimezoneRef.current = true;
+        try {
+          await apiPut('/settings', { settings: merged });
+          storeCachedSettings(merged);
+        } catch {
+          // Ignore background sync failures; user can save manually.
+        }
+      }
     } catch (err) {
       setError(
         err instanceof Error ? err.message : translateFromStorage('Unable to load settings.')

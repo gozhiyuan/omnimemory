@@ -4,7 +4,7 @@ NODE_PREFIX := $(shell brew --prefix node@20 2>/dev/null || brew --prefix node 2
 NODE_BIN := $(if $(NODE_PREFIX),$(NODE_PREFIX)/bin,)
 NODE_PATH := $(if $(NODE_BIN),$(NODE_BIN):,)
 
-.PHONY: dev-up dev-down dev-restart dev-logs dev-ps dev-pull dev-clean authentik-up observability observability-check observability-down verify cli-build cli-setup cli-start cli-status
+.PHONY: dev-up dev-down dev-restart dev-logs dev-ps dev-pull dev-clean authentik-up observability observability-check observability-down verify cli-build cli-setup cli-start cli-status alembic
 
 dev-up:
 	docker compose $(ENV_FILE) -f $(COMPOSE) up -d --remove-orphans
@@ -73,3 +73,6 @@ cli-start: cli-build
 
 cli-status:
 	@node apps/cli/dist/index.js status 2>/dev/null || echo "Run 'make cli-build' first"
+
+alembic:
+	cd services/api && uv run alembic $(ARGS)

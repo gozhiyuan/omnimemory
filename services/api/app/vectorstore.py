@@ -202,6 +202,9 @@ def upsert_context_embeddings(contexts: Iterable[Any]) -> None:
             "event_time_utc": getattr(context, "event_time_utc", None).isoformat()
             if getattr(context, "event_time_utc", None)
             else None,
+            "event_time_unix": getattr(context, "event_time_utc", None).timestamp()
+            if getattr(context, "event_time_utc", None)
+            else None,
             "source_item_ids": [str(value) for value in getattr(context, "source_item_ids", [])],
             "entities": getattr(context, "entities", []),
         }
@@ -226,6 +229,23 @@ def _build_filter(
     start_time: Optional[datetime | str] = None,
     end_time: Optional[datetime | str] = None,
 ) -> Optional[qmodels.Filter]:
+    def _to_iso(value: datetime | str) -> Optional[str]:
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, str):
+            return value
+        return None
+
+    def _to_timestamp(value: datetime | str) -> Optional[float]:
+        if isinstance(value, datetime):
+            return value.timestamp()
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return None
+        return None
+
     must: list[qmodels.FieldCondition] = []
     if user_id:
         must.append(qmodels.FieldCondition(key="user_id", match=qmodels.MatchValue(value=user_id)))
@@ -236,10 +256,30 @@ def _build_filter(
     if start_time or end_time:
         range_kwargs: dict[str, Any] = {}
         if start_time:
-            range_kwargs["gte"] = start_time.isoformat() if isinstance(start_time, datetime) else start_time
+            iso_value = _to_iso(start_time)
+            if iso_value:
+                range_kwargs["gte"] = iso_value
         if end_time:
-            range_kwargs["lt"] = end_time.isoformat() if isinstance(end_time, datetime) else end_time
-        must.append(qmodels.FieldCondition(key="event_time_utc", range=qmodels.Range(**range_kwargs)))
+            iso_value = _to_iso(end_time)
+            if iso_value:
+                range_kwargs["lt"] = iso_value
+
+        ts_kwargs: dict[str, Any] = {}
+        if start_time:
+            ts_value = _to_timestamp(start_time)
+            if ts_value is not None:
+                ts_kwargs["gte"] = ts_value
+        if end_time:
+            ts_value = _to_timestamp(end_time)
+            if ts_value is not None:
+                ts_kwargs["lt"] = ts_value
+
+        if ts_kwargs:
+            must.append(qmodels.FieldCondition(key="event_time_unix", range=qmodels.Range(**ts_kwargs)))
+        else:
+            datetime_range_cls = getattr(qmodels, "DatetimeRange", None) or getattr(qmodels, "DateTimeRange", None)
+            if datetime_range_cls and range_kwargs:
+                must.append(qmodels.FieldCondition(key="event_time_utc", range=datetime_range_cls(**range_kwargs)))
     if not must:
         return None
     return qmodels.Filter(must=must)

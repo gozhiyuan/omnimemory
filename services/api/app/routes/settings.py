@@ -18,6 +18,7 @@ from ..db.session import get_session
 from ..recaps import resolve_week_window
 from ..tasks.recaps import weekly_recap_for_user
 from ..user_settings import fetch_user_settings
+from ..config import get_settings
 
 
 router = APIRouter()
@@ -50,13 +51,30 @@ async def get_user_settings(
     user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> SettingsResponse:
+    settings = get_settings()
     result = await session.execute(
         select(UserSettings).where(UserSettings.user_id == user_id)
     )
     record = result.scalar_one_or_none()
     if not record:
-        return SettingsResponse(settings={}, updated_at=None)
-    return SettingsResponse(settings=record.settings or {}, updated_at=record.updated_at)
+        default_openclaw = {
+            "openclaw": {
+                "syncMemory": bool(settings.openclaw_sync_memory),
+                "workspace": settings.openclaw_workspace,
+            }
+        }
+        return SettingsResponse(settings=default_openclaw, updated_at=None)
+    stored = record.settings or {}
+    openclaw = stored.get("openclaw")
+    if not isinstance(openclaw, dict):
+        openclaw = {}
+    if "syncMemory" not in openclaw:
+        openclaw = {**openclaw, "syncMemory": bool(settings.openclaw_sync_memory)}
+    if "workspace" not in openclaw:
+        openclaw = {**openclaw, "workspace": settings.openclaw_workspace}
+    if openclaw:
+        stored = {**stored, "openclaw": openclaw}
+    return SettingsResponse(settings=stored, updated_at=record.updated_at)
 
 
 @router.put("/settings", response_model=SettingsResponse)

@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.auth import get_current_user_id
 from app.db.session import get_session
+from app.config import get_settings
 from app.routes import settings as settings_module
 
 from tests.helpers import FakeResult, FakeSession, override_get_session, override_current_user_id
@@ -23,7 +24,7 @@ TEST_USER_ID = UUID("12345678-1234-5678-1234-567812345678")
 
 
 def test_get_settings_empty(monkeypatch):
-    """Get settings when none exist returns empty dict."""
+    """Get settings when none exist returns defaults."""
     fake_session = FakeSession([FakeResult(scalar=None)])
 
     app.dependency_overrides[get_session] = override_get_session(fake_session)
@@ -34,7 +35,9 @@ def test_get_settings_empty(monkeypatch):
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["settings"] == {}
+    settings = get_settings()
+    assert payload["settings"]["openclaw"]["syncMemory"] == bool(settings.openclaw_sync_memory)
+    assert payload["settings"]["openclaw"]["workspace"] == settings.openclaw_workspace
     assert payload["updated_at"] is None
 
 

@@ -154,15 +154,33 @@ export const getUserProfile = (tokens?: StoredAuthTokens | null) => {
   };
 };
 
+const fetchWithTimeout = async (
+  input: RequestInfo | URL,
+  init: RequestInit,
+  timeoutMs: number
+) => {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    window.clearTimeout(timer);
+  }
+};
+
 const exchangeToken = async (body: URLSearchParams, tokenEndpoint?: string) => {
   if (!tokenEndpoint) {
     throw new Error('Missing token endpoint.');
   }
-  const response = await fetch(tokenEndpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body,
-  });
+  const response = await fetchWithTimeout(
+    tokenEndpoint,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body,
+    },
+    8000
+  );
   if (!response.ok) {
     const detail = await response.text();
     throw new Error(detail || 'Token exchange failed.');
@@ -223,6 +241,36 @@ export const getAccessToken = async (): Promise<string | null> => {
     return refreshed?.accessToken || null;
   }
   return tokens.accessToken;
+};
+
+const hasSubjectOrEmail = (payload: Record<string, unknown> | null) => {
+  if (!payload) return false;
+  return Boolean(payload.sub || payload.email || payload.preferred_username);
+};
+
+export const getBearerToken = async (): Promise<string | null> => {
+  const config = getAuthConfig();
+  if (!config.enabled) {
+    return null;
+  }
+  const tokens = getStoredTokens();
+  if (!tokens) {
+    return null;
+  }
+
+  const accessToken = await getAccessToken();
+  const accessPayload = parseJwtPayload(accessToken ?? undefined);
+  if (accessToken && hasSubjectOrEmail(accessPayload)) {
+    return accessToken;
+  }
+
+  const idToken = tokens.idToken;
+  const idPayload = parseJwtPayload(idToken);
+  if (idToken && hasSubjectOrEmail(idPayload)) {
+    return idToken;
+  }
+
+  return accessToken || idToken || null;
 };
 
 export const startLogin = async (): Promise<void> => {

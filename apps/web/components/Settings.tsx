@@ -1,9 +1,17 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Bell, Calendar, Cloud, Lock, Sliders, UploadCloud, UserCircle } from 'lucide-react';
+import { Bell, Calendar, Cloud, Cpu, KeyRound, Lock, Sliders, UploadCloud, UserCircle } from 'lucide-react';
 import { PageMotion } from './PageMotion';
-import { apiGet, apiPost } from '../services/api';
+import { apiDelete, apiGet, apiPost } from '../services/api';
 import { toast } from '../services/toast';
-import { DashboardStatsResponse, GooglePhotosAuthUrlResponse, GooglePhotosStatus, UploadUrlResponse } from '../types';
+import {
+  ApiKeyCreateResponse,
+  ApiKeyInfo,
+  ApiKeyListResponse,
+  DashboardStatsResponse,
+  GooglePhotosAuthUrlResponse,
+  GooglePhotosStatus,
+  UploadUrlResponse,
+} from '../types';
 import { useSettings } from '../contexts/SettingsContext';
 import { useAuth } from '../contexts/AuthContext';
 import { useI18n } from '../i18n/useI18n';
@@ -88,6 +96,7 @@ export const Settings: React.FC = () => {
   const { settings, loading: settingsLoading, error: settingsError, saveSettings } = useSettings();
   const { user: authUser } = useAuth();
   const { t } = useI18n();
+  const apiBase = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
   const [draft, setDraft] = useState<SettingsState>(settings);
   const [saving, setSaving] = useState(false);
   const [googleStatus, setGoogleStatus] = useState<GooglePhotosStatus | null>(null);
@@ -96,6 +105,13 @@ export const Settings: React.FC = () => {
   const [photoUrl, setPhotoUrl] = useState<string | null>(null);
   const [photoUploading, setPhotoUploading] = useState(false);
   const [photoError, setPhotoError] = useState<string | null>(null);
+  const [apiKeys, setApiKeys] = useState<ApiKeyInfo[]>([]);
+  const [apiKeysLoading, setApiKeysLoading] = useState(false);
+  const [apiKeysError, setApiKeysError] = useState<string | null>(null);
+  const [creatingKey, setCreatingKey] = useState(false);
+  const [createKeyName, setCreateKeyName] = useState('OpenClaw');
+  const [createKeyExpiry, setCreateKeyExpiry] = useState('0');
+  const [createdKey, setCreatedKey] = useState<ApiKeyCreateResponse | null>(null);
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -117,6 +133,30 @@ export const Settings: React.FC = () => {
       return t('Unknown');
     }
     return parsed.toLocaleString();
+  };
+
+  const copyToClipboard = async (value: string, label: string) => {
+    if (!value) {
+      return;
+    }
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+      } else {
+        const area = document.createElement('textarea');
+        area.value = value;
+        area.style.position = 'fixed';
+        area.style.opacity = '0';
+        document.body.appendChild(area);
+        area.focus();
+        area.select();
+        document.execCommand('copy');
+        document.body.removeChild(area);
+      }
+      toast.success(t('Copied'), t('{label} copied to clipboard.', { label }));
+    } catch (err) {
+      toast.error(t('Copy failed'), err instanceof Error ? err.message : t('Try again.'));
+    }
   };
 
   useEffect(() => {
@@ -168,6 +208,23 @@ export const Settings: React.FC = () => {
     void fetchStatus();
   }, [fetchStatus]);
 
+  const fetchApiKeys = useCallback(async () => {
+    setApiKeysLoading(true);
+    setApiKeysError(null);
+    try {
+      const response = await apiGet<ApiKeyListResponse>('/settings/api-keys');
+      setApiKeys(response.keys ?? []);
+    } catch (err) {
+      setApiKeysError(err instanceof Error ? err.message : t('Unable to load API keys.'));
+    } finally {
+      setApiKeysLoading(false);
+    }
+  }, [t]);
+
+  useEffect(() => {
+    void fetchApiKeys();
+  }, [fetchApiKeys]);
+
   const handleSave = async () => {
     setSaving(true);
     try {
@@ -200,6 +257,27 @@ export const Settings: React.FC = () => {
   ) => {
     setDraft((prev) => ({ ...prev, preferences: { ...prev.preferences, [key]: value } }));
   };
+  const updateAnnotationDefaults = <K extends keyof NonNullable<SettingsState['preferences']['annotation_defaults']>>(
+    key: K,
+    value: NonNullable<SettingsState['preferences']['annotation_defaults']>[K]
+  ) => {
+    setDraft((prev) => ({
+      ...prev,
+      preferences: {
+        ...prev.preferences,
+        annotation_defaults: {
+          ...(prev.preferences.annotation_defaults ?? {}),
+          [key]: value,
+        },
+      },
+    }));
+  };
+
+  const parseCommaList = (value: string) =>
+    value
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter(Boolean);
 
   const updateTimeline = <K extends keyof SettingsState['timeline']>(
     key: K,
@@ -236,6 +314,13 @@ export const Settings: React.FC = () => {
     setDraft((prev) => ({ ...prev, advanced: { ...prev.advanced, [key]: value } }));
   };
 
+  const updateOpenClaw = <K extends keyof SettingsState['openclaw']>(
+    key: K,
+    value: SettingsState['openclaw'][K]
+  ) => {
+    setDraft((prev) => ({ ...prev, openclaw: { ...prev.openclaw, [key]: value } }));
+  };
+
   const handleConnect = async () => {
     try {
       const response = await apiGet<GooglePhotosAuthUrlResponse>('/integrations/google/photos/auth-url');
@@ -258,6 +343,43 @@ export const Settings: React.FC = () => {
         t('Unable to disconnect'),
         err instanceof Error ? err.message : t('Try again later.')
       );
+    }
+  };
+
+  const handleCreateKey = async () => {
+    const name = createKeyName.trim();
+    if (!name) {
+      toast.error(t('Invalid name'), t('Please provide a name for the key.'));
+      return;
+    }
+    setCreatingKey(true);
+    try {
+      const expiresInDays = Number(createKeyExpiry);
+      const payload =
+        Number.isFinite(expiresInDays) && expiresInDays > 0
+          ? { name, expires_in_days: expiresInDays }
+          : { name };
+      const response = await apiPost<ApiKeyCreateResponse>('/settings/api-keys', payload);
+      setCreatedKey(response);
+      toast.success(t('API key created'), t('Copy the key now — it will only be shown once.'));
+      void fetchApiKeys();
+    } catch (err) {
+      toast.error(t('Unable to create key'), err instanceof Error ? err.message : t('Try again.'));
+    } finally {
+      setCreatingKey(false);
+    }
+  };
+
+  const handleRevokeKey = async (key: ApiKeyInfo) => {
+    if (!window.confirm(t('Revoke API key "{name}"?', { name: key.name }))) {
+      return;
+    }
+    try {
+      await apiDelete(`/settings/api-keys/${key.id}`);
+      toast.success(t('API key revoked'), t('Key "{name}" has been revoked.', { name: key.name }));
+      void fetchApiKeys();
+    } catch (err) {
+      toast.error(t('Unable to revoke key'), err instanceof Error ? err.message : t('Try again.'));
     }
   };
 
@@ -521,37 +643,101 @@ export const Settings: React.FC = () => {
               'Defaulted to your device timezone. Change it if your memories should follow a different location.'
             )}
           </p>
+          <div className="mt-4 grid gap-3 rounded-xl border border-slate-100 bg-white/70 p-4 shadow-sm dark:border-slate-800 dark:bg-slate-950/40">
+            <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+              {t('Analysis focus')}
+            </p>
+            <label className="text-xs text-slate-500 dark:text-slate-400">
+              {t('Focus tags (comma-separated)')}
+              <input
+                value={(draft.preferences.focus_tags ?? []).join(', ')}
+                onChange={(event) =>
+                  updatePreferences('focus_tags', parseCommaList(event.target.value))
+                }
+                className={inputClass}
+                placeholder={t('food, people')}
+              />
+            </label>
+            <label className="text-xs text-slate-500 dark:text-slate-400">
+              {t('Focus people (comma-separated)')}
+              <input
+                value={(draft.preferences.focus_people ?? []).join(', ')}
+                onChange={(event) =>
+                  updatePreferences('focus_people', parseCommaList(event.target.value))
+                }
+                className={inputClass}
+                placeholder={t('Alice, Bob')}
+              />
+            </label>
+            <label className="text-xs text-slate-500 dark:text-slate-400">
+              {t('Focus places (comma-separated)')}
+              <input
+                value={(draft.preferences.focus_places ?? []).join(', ')}
+                onChange={(event) =>
+                  updatePreferences('focus_places', parseCommaList(event.target.value))
+                }
+                className={inputClass}
+                placeholder={t('Blue Bottle, Golden Gate')}
+              />
+            </label>
+            <label className="text-xs text-slate-500 dark:text-slate-400">
+              {t('Focus topics (comma-separated)')}
+              <input
+                value={(draft.preferences.focus_topics ?? []).join(', ')}
+                onChange={(event) =>
+                  updatePreferences('focus_topics', parseCommaList(event.target.value))
+                }
+                className={inputClass}
+                placeholder={t('meetings, meals')}
+              />
+            </label>
+          </div>
+          <div className="mt-4 grid gap-3 rounded-xl border border-slate-100 bg-white/70 p-4 shadow-sm dark:border-slate-800 dark:bg-slate-950/40">
+            <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+              {t('Annotation defaults')}
+            </p>
+            <label className="text-xs text-slate-500 dark:text-slate-400">
+              {t('Default tags (comma-separated)')}
+              <input
+                value={(draft.preferences.annotation_defaults?.tags ?? []).join(', ')}
+                onChange={(event) =>
+                  updateAnnotationDefaults('tags', parseCommaList(event.target.value))
+                }
+                className={inputClass}
+                placeholder={t('food, coffee')}
+              />
+            </label>
+            <label className="text-xs text-slate-500 dark:text-slate-400">
+              {t('Default people (comma-separated)')}
+              <input
+                value={(draft.preferences.annotation_defaults?.people ?? []).join(', ')}
+                onChange={(event) =>
+                  updateAnnotationDefaults('people', parseCommaList(event.target.value))
+                }
+                className={inputClass}
+                placeholder={t('Alice')}
+              />
+            </label>
+            <label className="text-xs text-slate-500 dark:text-slate-400">
+              {t('Default description prefix')}
+              <input
+                value={draft.preferences.annotation_defaults?.description_prefix ?? ''}
+                onChange={(event) =>
+                  updateAnnotationDefaults('description_prefix', event.target.value)
+                }
+                className={inputClass}
+                placeholder={t('Focus on meals and people')}
+              />
+            </label>
+          </div>
         </SectionCard>
 
         <SectionCard
           title={t('Appearance')}
-          description={t('Tune the interface to match your preferences.')}
+          description={t('Motion preferences for the interface.')}
           icon={<Sliders size={18} />}
-          action={
-            <span className="rounded-full bg-slate-100 px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-slate-500 dark:bg-slate-800 dark:text-slate-300">
-              {t('Coming soon')}
-            </span>
-          }
+          className="xl:col-span-2"
         >
-          <div className="rounded-lg border border-dashed border-slate-200 bg-white/70 px-4 py-3 text-xs text-slate-500 dark:border-slate-800 dark:bg-slate-950/40 dark:text-slate-400">
-            {t('Theme is managed from the sidebar toggle for now.')}
-            <div className="mt-2 text-[11px] text-slate-400 dark:text-slate-500">
-              {t('Font size scaling is coming soon.')}
-            </div>
-          </div>
-          <label className="text-xs text-slate-500 dark:text-slate-400">
-            {t('Font size')}
-            <select
-              value={draft.appearance.fontScale}
-              onChange={(event) => updateAppearance('fontScale', event.target.value as FontScale)}
-              className={inputDisabledClass}
-              disabled
-            >
-              <option value="sm">{t('Small')}</option>
-              <option value="md">{t('Default')}</option>
-              <option value="lg">{t('Large')}</option>
-            </select>
-          </label>
           <ToggleRow
             label={t('Reduce motion')}
             description={t('Minimize animations for a calmer experience.')}
@@ -718,6 +904,193 @@ export const Settings: React.FC = () => {
               </div>
             </div>
           </div>
+        </SectionCard>
+
+        <SectionCard
+          title={t('API Keys')}
+          description={t('Generate tokens for OpenClaw or other integrations.')}
+          icon={<KeyRound size={18} />}
+        >
+          <div className="rounded-xl border border-slate-100 bg-white/70 p-4 text-xs text-slate-500 shadow-sm dark:border-slate-800 dark:bg-slate-950/40 dark:text-slate-400">
+            {t('Keys are shown only once. Store them securely.')}
+          </div>
+
+          <div className="grid gap-3 sm:grid-cols-[1.2fr_0.8fr_auto]">
+            <label className="text-xs text-slate-500 dark:text-slate-400">
+              {t('Key name')}
+              <input
+                value={createKeyName}
+                onChange={(event) => setCreateKeyName(event.target.value)}
+                className={inputClass}
+              />
+            </label>
+            <label className="text-xs text-slate-500 dark:text-slate-400">
+              {t('Expires')}
+              <select
+                value={createKeyExpiry}
+                onChange={(event) => setCreateKeyExpiry(event.target.value)}
+                className={inputClass}
+              >
+                <option value="0">{t('Never')}</option>
+                <option value="30">{t('30 days')}</option>
+                <option value="90">{t('90 days')}</option>
+                <option value="365">{t('1 year')}</option>
+              </select>
+            </label>
+            <div className="flex items-end">
+              <button
+                type="button"
+                onClick={handleCreateKey}
+                className="h-10 rounded-full bg-slate-900 px-4 text-xs font-semibold text-white hover:bg-slate-800"
+                disabled={creatingKey}
+              >
+                {creatingKey ? t('Creating...') : t('Create key')}
+              </button>
+            </div>
+          </div>
+
+          {createdKey && (
+            <div className="rounded-xl border border-emerald-100 bg-emerald-50/60 p-4 text-xs text-emerald-800 shadow-sm dark:border-emerald-900/40 dark:bg-emerald-950/40 dark:text-emerald-200">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold">{t('New key created')}</p>
+                  <p className="mt-1 text-xs text-emerald-700 dark:text-emerald-300">
+                    {t('Copy it now — it will not be shown again.')}
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => copyToClipboard(createdKey.key, t('API key'))}
+                    className="rounded-full bg-emerald-600 px-3 py-1 text-[11px] font-semibold text-white hover:bg-emerald-500"
+                  >
+                    {t('Copy key')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      copyToClipboard(
+                        `export OMNIMEMORY_API_URL=\"${apiBase}\"\nexport OMNIMEMORY_API_TOKEN=\"${createdKey.key}\"`,
+                        t('OpenClaw env')
+                      )
+                    }
+                    className="rounded-full border border-emerald-300 px-3 py-1 text-[11px] font-semibold text-emerald-700 hover:bg-emerald-100 dark:border-emerald-700 dark:text-emerald-200"
+                  >
+                    {t('Copy OpenClaw env')}
+                  </button>
+                </div>
+              </div>
+              <div className="mt-3 break-all rounded-lg border border-emerald-100 bg-white/70 p-3 font-mono text-[11px] text-emerald-900 dark:border-emerald-900/40 dark:bg-emerald-950/30 dark:text-emerald-100">
+                {createdKey.key}
+              </div>
+            </div>
+          )}
+
+          <div className="rounded-xl border border-slate-100 bg-white/80 p-4 shadow-sm dark:border-slate-800 dark:bg-slate-950/40">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                  {t('Active keys')}
+                </p>
+                <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                  {apiKeysLoading
+                    ? t('Loading keys...')
+                    : apiKeys.length === 0
+                    ? t('No keys created yet.')
+                    : t('{count} active keys', { count: apiKeys.length })}
+                </p>
+                {apiKeysError && (
+                  <p className="mt-1 text-xs text-red-600">
+                    {t('Key error: {message}', { message: apiKeysError })}
+                  </p>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={fetchApiKeys}
+                className="rounded-full border border-slate-200 px-3 py-1 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
+                disabled={apiKeysLoading}
+              >
+                {t('Refresh')}
+              </button>
+            </div>
+            <div className="mt-3 space-y-2">
+              {apiKeys.map((key) => (
+                <div
+                  key={key.id}
+                  className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-100 bg-white/90 px-4 py-3 text-xs text-slate-600 shadow-sm dark:border-slate-800 dark:bg-slate-950/40 dark:text-slate-300"
+                >
+                  <div>
+                    <p className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                      {key.name}
+                    </p>
+                    <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+                      {t('Prefix')} {key.key_prefix} · {t('Created')} {formatLocalTime(key.created_at)}
+                      {key.last_used_at
+                        ? ` · ${t('Last used')} ${formatLocalTime(key.last_used_at)}`
+                        : ''}
+                      {key.expires_at ? ` · ${t('Expires')} ${formatLocalTime(key.expires_at)}` : ''}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        copyToClipboard(key.key_prefix, t('Prefix'))
+                      }
+                      className="rounded-full border border-slate-200 px-3 py-1 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
+                    >
+                      {t('Copy prefix')}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleRevokeKey(key)}
+                      className="rounded-full border border-rose-200 px-3 py-1 text-[11px] font-semibold text-rose-600 hover:bg-rose-50"
+                    >
+                      {t('Revoke')}
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </SectionCard>
+
+        <SectionCard
+          title={t('OpenClaw')}
+          description={t('Connect OmniMemory with your OpenClaw AI assistant.')}
+          icon={<Cpu size={18} />}
+        >
+          <div className="rounded-xl border border-slate-100 bg-white/70 p-4 shadow-sm dark:border-slate-800 dark:bg-slate-950/40">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                  {t('Memory sync')}
+                </p>
+                <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                  {t('Sync daily summaries to OpenClaw memory files (~/.openclaw/workspace/memory/).')}
+                </p>
+              </div>
+            </div>
+          </div>
+          <ToggleRow
+            label={t('Sync daily summaries')}
+            description={t('Write daily summaries and episodes to OpenClaw memory for reference.')}
+            checked={draft.openclaw.syncMemory}
+            onChange={(value) => updateOpenClaw('syncMemory', value)}
+          />
+          <label className="text-xs text-slate-500 dark:text-slate-400">
+            {t('OpenClaw workspace')}
+            <input
+              value={draft.openclaw.workspace}
+              onChange={(event) => updateOpenClaw('workspace', event.target.value)}
+              className={inputClass}
+              placeholder="~/.openclaw"
+            />
+          </label>
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            {t('Create an API key above to connect OpenClaw to OmniMemory.')}
+          </p>
         </SectionCard>
 
         <SectionCard

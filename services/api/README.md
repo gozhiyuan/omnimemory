@@ -12,7 +12,7 @@ This service handles synchronous requests (uploads, storage signing, timeline/da
    ```
 
    You can inspect the DB with
-   `docker compose -f orchestration/docker-compose.dev.yml exec postgres psql -U lifelog -d lifelog`
+   `docker compose exec postgres psql -U lifelog -d lifelog`
    or watch Flower at http://localhost:5555 to ensure Celery can reach Redis.
 
 2. In `services/api/`, create the virtual environment and install dependencies:
@@ -47,7 +47,7 @@ This service handles synchronous requests (uploads, storage signing, timeline/da
    uv run python -m app.db.migrator
    ```
 
-   Environment variables set in your shell override values from `.env.dev`/`.env`. The Supabase
+   Environment variables set in your shell override values from `.env`. The Supabase
    database password is available in the Supabase dashboard under Project Settings → Database.
    If your network only resolves the pooler hostname (common on some IPv4-only Wi‑Fi/DNS setups),
    use the connection pooling host/port and the pooler username from Supabase:
@@ -125,6 +125,33 @@ uv run python -m app.db.migrator
 
 You can confirm the schema exists by opening `psql` via Docker and running `\dt` or checking
 `SELECT * FROM schema_migrations;`.
+
+### Alembic (autogenerate, optional)
+
+Alembic is configured for autogenerating migrations from SQLAlchemy models. It is intended for
+new migrations only; the existing SQL migrations remain the source of truth for the current
+schema.
+
+One-time setup on an existing database (marks the current schema as the Alembic baseline):
+
+```bash
+uv run alembic stamp head
+```
+
+Then generate new migrations as needed:
+
+```bash
+uv run alembic revision --autogenerate -m "describe change"
+uv run alembic upgrade head
+```
+
+You can also use the root Makefile wrapper:
+
+```bash
+make alembic ARGS="stamp head"
+make alembic ARGS="revision --autogenerate -m 'describe change'"
+make alembic ARGS="upgrade head"
+```
 
 ### Vector store helper (`app/vectorstore.py`)
 

@@ -1,22 +1,30 @@
-"""OIDC authentication helpers for API requests."""
+"""OIDC and API key authentication helpers for API requests."""
 
 from __future__ import annotations
 
+import hashlib
+import secrets
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Optional
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5, NAMESPACE_URL
 
 import jwt
 from jwt import InvalidTokenError, PyJWKClient
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
 
 from .config import get_settings
-from .db.models import DEFAULT_TEST_USER_ID, User
+from .db.models import ApiKey, DEFAULT_TEST_USER_ID, User
 from .db.session import get_session
+
+
+# API Key prefix for OmniMemory
+API_KEY_PREFIX = "omni_sk_"
 
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -80,12 +88,17 @@ def get_oidc_verifier() -> OIDCVerifier:
 
 
 def _parse_uuid(value: Optional[str]) -> Optional[UUID]:
-    if not value:
-        return None
-    try:
-        return UUID(value)
-    except (TypeError, ValueError):
-        return None
+  if not value:
+    return None
+  try:
+    return UUID(value)
+  except (TypeError, ValueError):
+    return None
+
+
+def _subject_to_uuid(subject: str, issuer: Optional[str]) -> UUID:
+    namespace = f"{issuer or ''}:{subject}"
+    return uuid5(NAMESPACE_URL, namespace)
 
 
 async def _ensure_user_by_id(
@@ -106,7 +119,15 @@ async def _ensure_user_by_id(
         if display_name and user.display_name != display_name:
             user.display_name = display_name
     if created or session.is_modified(user):
-        await session.commit()
+        try:
+            await session.commit()
+        except IntegrityError:
+            # Another request likely created the same user concurrently.
+            await session.rollback()
+            existing = await session.get(User, user_id)
+            if existing is not None:
+                return existing
+            raise
     return user
 
 
@@ -120,12 +141,103 @@ async def _ensure_user_by_email(
     if user is None:
         user = User(id=uuid4(), email=email, display_name=display_name)
         session.add(user)
-        await session.commit()
+        try:
+            await session.commit()
+        except IntegrityError:
+            # Handle concurrent logins creating the same email.
+            await session.rollback()
+            result = await session.execute(select(User).where(User.email == email))
+            existing = result.scalar_one_or_none()
+            if existing is not None:
+                return existing
+            raise
         return user
     if display_name and user.display_name != display_name:
         user.display_name = display_name
         await session.commit()
     return user
+
+
+def generate_api_key() -> tuple[str, str]:
+    """Generate a new API key and its hash.
+
+    Returns:
+        tuple: (full_key, key_hash) where full_key is shown to user once
+    """
+    random_bytes = secrets.token_bytes(32)
+    key_suffix = secrets.token_urlsafe(32)
+    full_key = f"{API_KEY_PREFIX}{key_suffix}"
+    key_hash = hashlib.sha256(full_key.encode()).hexdigest()
+    return full_key, key_hash
+
+
+def hash_api_key(key: str) -> str:
+    """Hash an API key for storage/lookup."""
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def get_api_key_prefix(key: str) -> str:
+    """Get the display prefix for an API key (e.g., 'omni_sk_a3f8...')."""
+    if key.startswith(API_KEY_PREFIX):
+        suffix_start = len(API_KEY_PREFIX)
+        return key[:suffix_start + 4] + "..."
+    return key[:12] + "..."
+
+
+async def _validate_api_key(
+    token: str,
+    session: AsyncSession,
+) -> AuthUser:
+    """Validate an API key and return the associated user."""
+    key_hash = hash_api_key(token)
+
+    result = await session.execute(
+        select(ApiKey).where(
+            ApiKey.key_hash == key_hash,
+            ApiKey.revoked_at.is_(None),
+        )
+    )
+    api_key = result.scalar_one_or_none()
+
+    if api_key is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Check expiration
+    if api_key.expires_at and api_key.expires_at < datetime.now(timezone.utc):
+        raise HTTPException(
+            status_code=401,
+            detail="API key has expired.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Update last_used_at (fire and forget, don't block the request)
+    await session.execute(
+        update(ApiKey)
+        .where(ApiKey.id == api_key.id)
+        .values(last_used_at=datetime.now(timezone.utc))
+    )
+    await session.commit()
+
+    # Get user
+    user = await session.get(User, api_key.user_id)
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="API key user not found.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return AuthUser(
+        id=user.id,
+        subject=f"api_key:{api_key.id}",
+        email=user.email,
+        display_name=user.display_name,
+        claims={"api_key_id": str(api_key.id), "scopes": api_key.scopes},
+    )
 
 
 async def get_current_user(
@@ -144,6 +256,12 @@ async def get_current_user(
         )
 
     token = credentials.credentials
+
+    # Check if this is an API key (starts with omni_sk_)
+    if token.startswith(API_KEY_PREFIX):
+        return await _validate_api_key(token, session)
+
+    # Otherwise, validate as OIDC JWT token
     try:
         payload = get_oidc_verifier().decode(token)
     except InvalidTokenError as exc:
@@ -183,6 +301,19 @@ async def get_current_user(
             claims=payload,
         )
 
+    if subject:
+        issuer = payload.get("iss")
+        stable_id = _subject_to_uuid(subject, issuer)
+        display = display_name or subject
+        user = await _ensure_user_by_id(session, stable_id, email, display)
+        return AuthUser(
+            id=user.id,
+            subject=subject,
+            email=user.email,
+            display_name=user.display_name,
+            claims=payload,
+        )
+
     raise HTTPException(
         status_code=401,
         detail="Token is missing subject or email claim.",
@@ -192,4 +323,3 @@ async def get_current_user(
 
 async def get_current_user_id(user: AuthUser = Depends(get_current_user)) -> UUID:
     return user.id
-

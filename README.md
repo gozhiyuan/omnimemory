@@ -2,6 +2,83 @@
 
 This repository houses the Lifelog AI MVP: a FastAPI + Celery backend (Postgres, Redis, Qdrant), optional Supabase storage for uploads, and a React + Vite frontend with Dashboard, Timeline, Chat, and Ingest views.
 
+## Quick Start
+
+The easiest way to get started is using the OmniMemory CLI.
+
+### Prerequisites
+
+- **Docker Desktop** (or Docker Engine with Compose plugin)
+- **Node.js 20+**
+
+### Setup
+
+```bash
+# Install the CLI
+cd apps/cli && npm install && npm run build && npm link
+cd ../..
+
+# Run interactive setup (configures Gemini API key, storage, auth options)
+omni setup
+
+# Start all services
+omni start
+```
+
+The setup wizard will prompt you for:
+- **Gemini API Key** (required) - for AI features
+- **Storage Provider** - Local (RustFS) or Cloud (Supabase)
+- **Google Photos sync** (optional)
+- **Google Cloud APIs** (optional) - Vision OCR, Maps
+- **Authentication** (optional) - Authentik OIDC for multi-user support
+
+### What Gets Started
+
+| Auth Disabled | Auth Enabled |
+|---------------|--------------|
+| Postgres, Redis, Qdrant | All core services |
+| RustFS (S3 storage) | + Authentik (OIDC provider) |
+| API, Celery worker | + User creation prompt |
+| Monitoring (Prometheus, Grafana, Flower) | |
+| Web app (localhost:3000) | |
+
+### Other Commands
+
+```bash
+omni status              # Check service health
+omni stop                # Stop all services
+omni stop --volumes      # Stop and remove all data (fresh start)
+```
+
+### Alembic (optional, autogenerate)
+
+If you want autogenerate support for new migrations, Alembic is wired under `services/api/`.
+Use the Makefile target to pass through Alembic commands:
+
+```bash
+make alembic ARGS="stamp head"
+make alembic ARGS="revision --autogenerate -m 'add indexes'"
+make alembic ARGS="upgrade head"
+```
+
+### Clean Reinstall
+
+To start completely fresh:
+
+```bash
+omni stop --volumes
+rm -f .env apps/web/.env.local
+docker volume prune -f
+omni setup
+omni start
+```
+
+---
+
+## Manual Setup (Advanced)
+
+If you prefer manual control or need to customize the setup, follow the instructions below.
+
 ### Project Structure (current focus)
 
 - `services/api/` – FastAPI service + Celery processing pipeline (upload/ingest, timeline, dashboard, search, seed script).
@@ -11,19 +88,17 @@ This repository houses the Lifelog AI MVP: a FastAPI + Celery backend (Postgres,
 - `lifelog-mvp-dev-plan.md` – Development roadmap.
 - `docs/minecontext/lifelog_ingestion_rag_design.md` – Detailed ingestion + RAG design (draft).
 
-### Tooling Prerequisites
+### Tooling Prerequisites (Manual Setup)
 
-- Docker Desktop (or Docker Engine) with Compose plugin.
-- Python 3.11+
-  - [uv](https://github.com/astral-sh/uv) for dependency management (`pip install uv` or via homebrew: `brew install uv`).
+- Docker Desktop (or Docker Engine) with Compose plugin
+- Python 3.11+ with [uv](https://github.com/astral-sh/uv) (`pip install uv` or `brew install uv`)
 - Node.js 20+
-- Optional: `just` or `make` (Makefile provided).
+- Optional: `make` (Makefile provided)
 
-### Local Environment Setup
+### Local Environment Setup (Manual)
 
-1. Copy `.env.example` → `.env` at the repo root for Docker Compose (Postgres/RustFS/Qdrant/Authentik).
+1. Copy `.env.example` → `.env` at the repo root. This single file configures both Docker Compose and API/Celery.
    - Set `AUTHENTIK_SECRET_KEY` and a valid `AUTHENTIK_IMAGE_TAG` if you plan to use local OIDC.
-2. Copy `.env.dev.example` → `.env.dev` at the repo root for the FastAPI/Celery runtime.
    - If you want uploads to work from the web UI or seed script, keep `STORAGE_PROVIDER=s3` with the RustFS defaults or switch to Supabase.
    - If the frontend cannot reach the API due to CORS, set `CORS_ALLOW_ORIGINS=http://localhost:3000` (comma-separated for multiple origins).
 3. Start supporting services:
@@ -85,7 +160,7 @@ The API validates bearer tokens against OIDC JWKS when auth is enabled. For loca
    - Add redirect URI: `http://localhost:3000/`.
    - Save the provider.
    - Create an **Application** that uses the provider and set its slug to `omnimemory`.
-3. Configure API auth in `.env.dev`:
+3. Configure API auth in `.env`:
    ```
    AUTH_ENABLED=true
    OIDC_ISSUER_URL=http://localhost:9002/application/o/omnimemory/
@@ -130,7 +205,7 @@ uv run python -m app.scripts.migrate_user_id --new-email you@example.com --delet
 
 ### Docker Compose Notes
 
-- `orchestration/docker-compose.dev.yml` is source of truth for local infra; `make dev-up` uses it.
+- `docker-compose.yml` at repo root is the source of truth for local infra; `make dev-up` uses it.
 - API/worker/beat services run locally for now and are not wired into Compose.
 - `make authentik-up` starts the local OIDC provider. `make observability` starts Prometheus/Grafana/celery-exporter.
 - Prometheus scrape config lives in `orchestration/prometheus.yml` (uncomment API job when `/metrics` is active in Docker).

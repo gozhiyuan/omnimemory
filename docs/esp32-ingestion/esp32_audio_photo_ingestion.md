@@ -81,7 +81,7 @@ All device endpoints use `X-Device-Token`.
 
 ### VAD settings
 
-Set in environment (see `.env.dev.example`):
+Set in environment (see `.env.example`):
 
 ```
 AUDIO_VAD_ENABLED=true

@@ -12,6 +12,20 @@ OmniMemory/Lifelog MVP is a personal memory AI system with:
 
 ## Common Commands
 
+### OmniMemory CLI (recommended)
+```bash
+cd apps/cli && npm install && npm run build  # First time only
+node apps/cli/dist/index.js setup            # Interactive setup wizard
+node apps/cli/dist/index.js start            # Start all services
+node apps/cli/dist/index.js stop             # Stop all services
+node apps/cli/dist/index.js status           # Check service health
+
+# Or install globally: cd apps/cli && npm link
+omni setup                                   # Interactive setup wizard
+omni start                                   # Start all services (foreground)
+omni status                                  # Check service health
+```
+
 ### Infrastructure (from repo root)
 ```bash
 make dev-up          # Start Postgres, Redis, Qdrant, Flower, Prometheus, Grafana
@@ -86,9 +100,8 @@ Upload → /storage/upload-url (presigned) → Object Storage → /upload/ingest
 
 ## Environment Configuration
 
-- `.env` - Docker Compose variables
-- `.env.dev` - API/Celery runtime (copy from `.env.dev.example`)
-- `apps/web/.env.local` - Frontend (copy from `.env.local.example`)
+- `.env` - All backend config (copy from `.env.example`). Used by Docker Compose and API/Celery.
+- `apps/web/.env.local` - Frontend only (copy from `.env.local.example`). Required for Vite `VITE_` prefix.
 
 Key settings:
 - `STORAGE_PROVIDER=s3|supabase` - Upload storage backend

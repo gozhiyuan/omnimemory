@@ -43,3 +43,42 @@ def resolve_ocr_language_hints(
             if tag not in hints:
                 hints.append(tag)
     return hints
+
+
+def resolve_preferences(settings: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not settings:
+        return {}
+    prefs = settings.get("preferences")
+    return prefs if isinstance(prefs, dict) else {}
+
+
+def build_preference_guidance(settings: Mapping[str, Any] | None) -> str:
+    prefs = resolve_preferences(settings)
+    if not prefs:
+        return ""
+
+    focus_tags = prefs.get("focus_tags") if isinstance(prefs.get("focus_tags"), list) else []
+    focus_people = prefs.get("focus_people") if isinstance(prefs.get("focus_people"), list) else []
+    focus_places = prefs.get("focus_places") if isinstance(prefs.get("focus_places"), list) else []
+    focus_topics = prefs.get("focus_topics") if isinstance(prefs.get("focus_topics"), list) else []
+
+    lines: list[str] = []
+    if focus_tags:
+        lines.append(f"- Emphasize tags: {', '.join(str(t) for t in focus_tags)}.")
+    if focus_people:
+        lines.append(f"- Emphasize people: {', '.join(str(p) for p in focus_people)}.")
+    if focus_places:
+        lines.append(f"- Emphasize places: {', '.join(str(p) for p in focus_places)}.")
+    if focus_topics:
+        lines.append(f"- Emphasize topics: {', '.join(str(t) for t in focus_topics)}.")
+
+    if not lines:
+        return ""
+
+    return "\n\nUser focus preferences:\n" + "\n".join(lines) + "\n"
+
+
+def resolve_annotation_defaults(settings: Mapping[str, Any] | None) -> dict[str, Any]:
+    prefs = resolve_preferences(settings)
+    defaults = prefs.get("annotation_defaults")
+    return defaults if isinstance(defaults, dict) else {}

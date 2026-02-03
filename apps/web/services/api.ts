@@ -1,5 +1,5 @@
 import { translateFromStorage } from '../i18n/core';
-import { getAccessToken } from './auth';
+import { getBearerToken } from './auth';
 import { toast } from './toast';
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
@@ -30,9 +30,9 @@ export const apiRequest = async <T>(path: string, options: ApiOptions = {}): Pro
     requestHeaders['Content-Type'] = 'application/json';
     body = JSON.stringify(json);
   }
-  const accessToken = await getAccessToken();
-  if (accessToken) {
-    requestHeaders['Authorization'] = `Bearer ${accessToken}`;
+  const bearerToken = await getBearerToken();
+  if (bearerToken) {
+    requestHeaders['Authorization'] = `Bearer ${bearerToken}`;
   }
 
   const notifyFailure = (message: string, status?: number) => {

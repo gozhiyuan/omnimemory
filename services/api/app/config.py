@@ -12,14 +12,14 @@ class Settings(BaseSettings):
     """Central configuration for the API service."""
 
     _env_paths = [
-        ".env.dev",
         ".env",
-        "../.env.dev",
+        ".env.dev",  # Legacy fallback
         "../.env",
-        "../../.env.dev",
+        "../.env.dev",
         "../../.env",
-        "../../../.env.dev",
+        "../../.env.dev",
         "../../../.env",
+        "../../../.env.dev",
     ]
 
     model_config = SettingsConfigDict(
@@ -54,6 +54,7 @@ class Settings(BaseSettings):
 
     # S3-compatible storage (RustFS/MinIO/AWS)
     s3_endpoint_url: Optional[AnyUrl] = Field(default=None)
+    s3_public_url: Optional[AnyUrl] = Field(default=None)  # Public URL for presigned URLs (browser-accessible)
     s3_access_key_id: Optional[str] = None
     s3_secret_access_key: Optional[str] = None
     s3_region: str = "us-east-1"
@@ -199,6 +200,32 @@ class Settings(BaseSettings):
         default=5,
         ge=0,
         alias="DEDUPE_NEAR_HAMMING_THRESHOLD",
+    )
+
+    # OpenClaw integration
+    openclaw_enabled: bool = False
+    openclaw_gateway_url: Optional[str] = None
+    openclaw_sync_memory: bool = False
+    openclaw_workspace: str = "~/.openclaw"
+
+    # Prompt management
+    omnimemory_prompts_dir: str = Field(
+        default="~/.omnimemory",
+        description="Base path for prompts (appends /users/{user_id}/prompts)",
+    )
+    prompt_max_size_bytes: int = Field(
+        default=32768,
+        ge=1024,
+        description="Global max size for prompt templates",
+    )
+    prompt_hot_reload: bool = Field(
+        default=False,
+        description="Enable hot-reload of prompts (disable in prod)",
+    )
+    prompt_cache_ttl_seconds: int = Field(
+        default=300,
+        ge=0,
+        description="TTL cache for prompts when hot reload disabled",
     )
 
     @model_validator(mode="before")

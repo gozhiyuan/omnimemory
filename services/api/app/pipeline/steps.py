@@ -30,7 +30,12 @@ from ..ai.prompts import (
 )
 from ..db.models import DataConnection, ProcessedContent, ProcessedContext, SourceItem
 from ..google_photos import get_valid_access_token
-from ..user_settings import resolve_language_code, resolve_language_label, resolve_ocr_language_hints
+from ..user_settings import (
+    build_preference_guidance,
+    resolve_language_code,
+    resolve_language_label,
+    resolve_ocr_language_hints,
+)
 from ..vectorstore import upsert_context_embeddings
 from .media_utils import (
     MediaToolError,
@@ -1119,6 +1124,7 @@ class VlmStep:
         provider = config.settings.vlm_provider
         model = config.settings.gemini_model
         language_code, language_label = _resolve_language(config)
+        preference_guidance = build_preference_guidance(config.user_settings)
         fingerprint = hash_parts([content_hash, ocr_text, provider, model, self.version, language_code])
         existing = await artifacts.store.get("vlm_observations", provider, model, fingerprint)
         if existing:
@@ -1127,7 +1133,11 @@ class VlmStep:
             return
 
         blob = artifacts.get("blob") or b""
-        prompt = build_lifelog_image_prompt(ocr_text, language=language_label)
+        prompt = build_lifelog_image_prompt(
+            ocr_text,
+            language=language_label,
+            extra_guidance=preference_guidance,
+        )
         try:
             response = await analyze_image_with_vlm(
                 blob,
@@ -1246,8 +1256,10 @@ class MediaChunkUnderstandingStep:
             return
         blob = artifacts.get("blob")
         if not blob:
+            logger.info("media_chunk_understanding skipped: no blob for item {}", item.id)
             return
         if not ffmpeg_available():
+            logger.info("media_chunk_understanding skipped: ffmpeg missing for item {}", item.id)
             payload = {"status": "skipped", "reason": "missing_ffmpeg"}
             await artifacts.store.upsert(
                 artifact_type="media_chunk_analysis",
@@ -1269,14 +1281,22 @@ class MediaChunkUnderstandingStep:
                 config.settings.video_understanding_max_duration_sec,
             )
             if duration_sec > max_duration:
-                raise ValueError(
-                    f"Video duration {duration_sec:.1f}s exceeds {max_duration}s"
+                logger.info(
+                    "media_chunk_understanding skipped: video duration {}s exceeds {}s for item {}",
+                    f"{duration_sec:.1f}",
+                    max_duration,
+                    item.id,
                 )
+                return
         if item.item_type == "audio" and isinstance(duration_sec, (int, float)):
             if duration_sec > config.settings.audio_max_duration_sec:
-                raise ValueError(
-                    f"Audio duration {duration_sec:.1f}s exceeds {config.settings.audio_max_duration_sec}s"
+                logger.info(
+                    "media_chunk_understanding skipped: audio duration {}s exceeds {}s for item {}",
+                    f"{duration_sec:.1f}",
+                    config.settings.audio_max_duration_sec,
+                    item.id,
                 )
+                return
 
         provider = (
             config.settings.video_understanding_provider
@@ -1290,6 +1310,7 @@ class MediaChunkUnderstandingStep:
         )
         language_code, language_label = _resolve_language(config)
         if provider == "none":
+            logger.info("media_chunk_understanding skipped: provider disabled for item {}", item.id)
             payload = {"status": "disabled", "reason": "provider_disabled"}
             await artifacts.store.upsert(
                 artifact_type="media_chunk_analysis",
@@ -1358,7 +1379,10 @@ class MediaChunkUnderstandingStep:
                         chunk_duration_sec=chunk_duration,
                         output_ext=suffix or ".mp4",
                     )
-                    prompt = build_lifelog_video_chunk_prompt(language=language_label)
+                    prompt = build_lifelog_video_chunk_prompt(
+                        language=language_label,
+                        extra_guidance=build_preference_guidance(config.user_settings),
+                    )
                     max_bytes = config.settings.video_understanding_max_bytes
                     content_type = item.content_type or "video/mp4"
                 else:
@@ -1375,7 +1399,10 @@ class MediaChunkUnderstandingStep:
                         vad_min_segment_sec=config.settings.audio_vad_min_segment_sec,
                         duration_sec=duration_sec if isinstance(duration_sec, (int, float)) else None,
                     )
-                    prompt = build_lifelog_audio_chunk_prompt(language=language_label)
+                    prompt = build_lifelog_audio_chunk_prompt(
+                        language=language_label,
+                        extra_guidance=build_preference_guidance(config.user_settings),
+                    )
                     max_bytes = config.settings.audio_understanding_max_bytes
                     content_type = "audio/wav"
 
@@ -1572,6 +1599,7 @@ class KeyframeExtractionStep:
         if item.item_type != "video":
             return
         if not config.settings.video_keyframes_always:
+            logger.info("keyframes skipped: video_keyframes_always disabled for item {}", item.id)
             return
 
         content_hash = artifacts.get("content_hash")
@@ -1592,6 +1620,7 @@ class KeyframeExtractionStep:
             return
 
         if not ffmpeg_available():
+            logger.info("keyframes skipped: ffmpeg missing for item {}", item.id)
             payload = {"status": "skipped", "reason": "missing_ffmpeg"}
             await artifacts.store.upsert(
                 artifact_type="keyframes",
@@ -1605,6 +1634,7 @@ class KeyframeExtractionStep:
 
         blob = artifacts.get("blob") or b""
         if not blob:
+            logger.info("keyframes skipped: no blob for item {}", item.id)
             return
         suffix = Path(item.original_filename or "").suffix or ".mp4"
         try:
@@ -1939,6 +1969,121 @@ class TranscriptContextStep:
         artifacts.set("contexts", contexts)
 
 
+class UserAnnotationStep:
+    """Create user_annotation context from OpenClaw-provided metadata.
+
+    This step creates a ProcessedContext with context_type="user_annotation"
+    from user-provided description, tags, people, and location data.
+    These annotations are preserved across reprocessing.
+    """
+
+    name = "user_annotation"
+    version = "v1"
+    is_expensive = False
+
+    async def run(self, item: SourceItem, artifacts: PipelineArtifacts, config: PipelineConfig) -> None:
+        openclaw_context = config.payload.get("openclaw_context")
+        if not openclaw_context:
+            return
+
+        description = openclaw_context.get("description")
+        tags = openclaw_context.get("tags") or []
+        people = openclaw_context.get("people") or []
+        location_data = openclaw_context.get("location") or {}
+
+        # Skip if no meaningful content
+        if not description and not tags and not people:
+            return
+
+        # Check if user_annotation already exists for this item (avoid duplicates)
+        existing_stmt = select(ProcessedContext).where(
+            ProcessedContext.user_id == item.user_id,
+            ProcessedContext.context_type == "user_annotation",
+            ProcessedContext.source_item_ids.contains([item.id]),
+        )
+        result = await config.session.execute(existing_stmt)
+        existing = result.scalar_one_or_none()
+
+        # Build entities list from people and location
+        entities: list[dict] = []
+        for person in people:
+            entities.append({
+                "type": "person",
+                "name": person,
+                "confidence": 1.0,
+            })
+        if location_data.get("name"):
+            entities.append({
+                "type": "place",
+                "name": location_data["name"],
+                "confidence": 1.0,
+            })
+
+        # Build location dict
+        location: dict = {}
+        if location_data:
+            if location_data.get("lat") is not None:
+                location["lat"] = location_data["lat"]
+            if location_data.get("lng") is not None:
+                location["lng"] = location_data["lng"]
+            if location_data.get("name"):
+                location["name"] = location_data["name"]
+            if location_data.get("address"):
+                location["formatted_address"] = location_data["address"]
+
+        # Build title and summary
+        title = (description[:100] if description else "User annotation").strip()
+        summary = description or ""
+
+        # Build vector text for embeddings
+        vector_text = build_vector_text(title, summary, tags)
+
+        # Build processor_versions
+        processor_versions = {
+            "source": "user",
+            "openclaw": True,
+            "action": "annotate",
+            "prompt_name": "user_annotation",  # Sentinel, not a real prompt
+        }
+
+        event_time = item.event_time_utc or item.captured_at or item.created_at or config.now
+        event_time = ensure_tz_aware(event_time)
+
+        if existing:
+            # Update existing annotation
+            existing.title = title
+            existing.summary = summary
+            existing.keywords = tags
+            existing.entities = entities
+            existing.location = location if location else {}
+            existing.vector_text = vector_text
+            existing.processor_versions = processor_versions
+            await config.session.flush()
+            logger.info("Updated user_annotation context {} for item {}", existing.id, item.id)
+        else:
+            # Create new annotation
+            record = ProcessedContext(
+                user_id=item.user_id,
+                context_type="user_annotation",
+                title=title,
+                summary=summary,
+                keywords=tags,
+                entities=entities,
+                location=location if location else {},
+                event_time_utc=event_time,
+                start_time_utc=None,
+                end_time_utc=None,
+                is_episode=False,
+                source_item_ids=[item.id],
+                merged_from_context_ids=[],
+                vector_text=vector_text,
+                processor_versions=processor_versions,
+            )
+            config.session.add(record)
+            await config.session.flush()
+            logger.info("Created user_annotation context {} for item {}", record.id, item.id)
+
+
 class ContextPersistStep:
     name = "contexts"
     version = "v1"
@@ -2025,11 +2170,14 @@ class ContextPersistStep:
             artifacts.set("context_ids", context_ids)
             return
 
+        # Delete existing non-episode contexts, but preserve user_annotation contexts
+        # (user-provided annotations from OpenClaw/API should survive reprocessing)
         await config.session.execute(
             delete(ProcessedContext).where(
                 ProcessedContext.user_id == item.user_id,
                 ProcessedContext.is_episode.is_(False),
                 ProcessedContext.source_item_ids.contains([item.id]),
+                ProcessedContext.context_type != "user_annotation",
             )
         )
 
@@ -2161,6 +2309,7 @@ COMMON_STEPS: list[PipelineStep] = [
 IMAGE_STEPS: list[PipelineStep] = [
     OcrStep(),
     VlmStep(),
+    UserAnnotationStep(),
     ContextPersistStep(),
     EmbeddingStep(),
     MemoryGraphEnqueueStep(),
@@ -2174,6 +2323,7 @@ VIDEO_STEPS: list[PipelineStep] = [
     MediaSummaryContextStep(),
     TranscriptContextStep(),
     GenericContextStep(),
+    UserAnnotationStep(),
     ContextPersistStep(),
     EmbeddingStep(),
     MemoryGraphEnqueueStep(),
@@ -2185,6 +2335,7 @@ AUDIO_STEPS: list[PipelineStep] = [
     MediaSummaryContextStep(),
     TranscriptContextStep(),
     GenericContextStep(),
+    UserAnnotationStep(),
     ContextPersistStep(),
     EmbeddingStep(),
     MemoryGraphEnqueueStep(),
@@ -2193,6 +2344,7 @@ AUDIO_STEPS: list[PipelineStep] = [
 
 GENERIC_STEPS: list[PipelineStep] = [
     GenericContextStep(),
+    UserAnnotationStep(),
     ContextPersistStep(),
     EmbeddingStep(),
     MemoryGraphEnqueueStep(),

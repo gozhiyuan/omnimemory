@@ -248,6 +248,30 @@ export interface UploadUrlResponse {
   headers?: Record<string, string>;
 }
 
+export interface ApiKeyInfo {
+  id: string;
+  name: string;
+  key_prefix: string;
+  scopes: string[];
+  created_at: string;
+  last_used_at?: string | null;
+  expires_at?: string | null;
+}
+
+export interface ApiKeyListResponse {
+  keys: ApiKeyInfo[];
+}
+
+export interface ApiKeyCreateResponse {
+  id: string;
+  name: string;
+  key: string;
+  key_prefix: string;
+  scopes: string[];
+  created_at: string;
+  expires_at?: string | null;
+}
+
 export interface IngestResponse {
   item_id: string;
   task_id: string;

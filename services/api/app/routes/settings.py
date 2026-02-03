@@ -1,4 +1,4 @@
-"""User settings endpoints."""
+"""User settings and API key management endpoints."""
 
 from __future__ import annotations
 
@@ -12,12 +12,13 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..auth import get_current_user_id
-from ..db.models import UserSettings
+from ..auth import generate_api_key, get_api_key_prefix, get_current_user_id, API_KEY_PREFIX
+from ..db.models import ApiKey, UserSettings
 from ..db.session import get_session
 from ..recaps import resolve_week_window
 from ..tasks.recaps import weekly_recap_for_user
 from ..user_settings import fetch_user_settings
+from ..config import get_settings
 
 
 router = APIRouter()
@@ -50,13 +51,30 @@ async def get_user_settings(
     user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> SettingsResponse:
+    settings = get_settings()
     result = await session.execute(
         select(UserSettings).where(UserSettings.user_id == user_id)
     )
     record = result.scalar_one_or_none()
     if not record:
-        return SettingsResponse(settings={}, updated_at=None)
-    return SettingsResponse(settings=record.settings or {}, updated_at=record.updated_at)
+        default_openclaw = {
+            "openclaw": {
+                "syncMemory": bool(settings.openclaw_sync_memory),
+                "workspace": settings.openclaw_workspace,
+            }
+        }
+        return SettingsResponse(settings=default_openclaw, updated_at=None)
+    stored = record.settings or {}
+    openclaw = stored.get("openclaw")
+    if not isinstance(openclaw, dict):
+        openclaw = {}
+    if "syncMemory" not in openclaw:
+        openclaw = {**openclaw, "syncMemory": bool(settings.openclaw_sync_memory)}
+    if "workspace" not in openclaw:
+        openclaw = {**openclaw, "workspace": settings.openclaw_workspace}
+    if openclaw:
+        stored = {**stored, "openclaw": openclaw}
+    return SettingsResponse(settings=stored, updated_at=record.updated_at)
 
 
 @router.put("/settings", response_model=SettingsResponse)
@@ -117,3 +135,159 @@ async def trigger_weekly_recap(
         start_date=window.start_date,
         end_date=window.end_date,
     )
+
+
+# ---------------------------------------------------------------------------
+# API Key Management
+# ---------------------------------------------------------------------------
+
+
+class ApiKeyCreateRequest(BaseModel):
+    """Request to create a new API key."""
+
+    name: str
+    scopes: Optional[list[str]] = None  # Default: ["read", "write"]
+    expires_in_days: Optional[int] = None  # None = never expires
+
+
+class ApiKeyCreateResponse(BaseModel):
+    """Response after creating an API key. Full key shown only once."""
+
+    id: str
+    name: str
+    key: str  # Full key - shown only once!
+    key_prefix: str
+    scopes: list[str]
+    created_at: datetime
+    expires_at: Optional[datetime]
+
+
+class ApiKeyInfo(BaseModel):
+    """API key info (without the full key)."""
+
+    id: str
+    name: str
+    key_prefix: str
+    scopes: list[str]
+    created_at: datetime
+    last_used_at: Optional[datetime]
+    expires_at: Optional[datetime]
+
+
+class ApiKeyListResponse(BaseModel):
+    """List of API keys."""
+
+    keys: list[ApiKeyInfo]
+
+
+@router.post("/settings/api-keys", response_model=ApiKeyCreateResponse)
+async def create_api_key(
+    payload: ApiKeyCreateRequest,
+    user_id: UUID = Depends(get_current_user_id),
+    session: AsyncSession = Depends(get_session),
+) -> ApiKeyCreateResponse:
+    """Create a new API key for external integrations.
+
+    The full key is returned only once in this response.
+    Store it securely - it cannot be retrieved again.
+    """
+    # Validate name
+    if not payload.name or len(payload.name) > 255:
+        raise HTTPException(status_code=400, detail="Name is required and must be 255 characters or less.")
+
+    # Generate key
+    full_key, key_hash = generate_api_key()
+    key_prefix = get_api_key_prefix(full_key)
+
+    # Calculate expiration
+    expires_at = None
+    if payload.expires_in_days:
+        from datetime import timedelta
+
+        expires_at = datetime.now(timezone.utc) + timedelta(days=payload.expires_in_days)
+
+    # Default scopes
+    scopes = payload.scopes or ["read", "write"]
+
+    now = datetime.now(timezone.utc)
+    api_key = ApiKey(
+        user_id=user_id,
+        key_hash=key_hash,
+        key_prefix=key_prefix,
+        name=payload.name,
+        scopes=scopes,
+        created_at=now,
+        expires_at=expires_at,
+    )
+    session.add(api_key)
+    await session.commit()
+    await session.refresh(api_key)
+
+    return ApiKeyCreateResponse(
+        id=str(api_key.id),
+        name=api_key.name,
+        key=full_key,  # Only time the full key is returned!
+        key_prefix=key_prefix,
+        scopes=scopes,
+        created_at=api_key.created_at,
+        expires_at=api_key.expires_at,
+    )
+
+
+@router.get("/settings/api-keys", response_model=ApiKeyListResponse)
+async def list_api_keys(
+    user_id: UUID = Depends(get_current_user_id),
+    session: AsyncSession = Depends(get_session),
+) -> ApiKeyListResponse:
+    """List all API keys for the current user (without revealing the full keys)."""
+    result = await session.execute(
+        select(ApiKey)
+        .where(ApiKey.user_id == user_id, ApiKey.revoked_at.is_(None))
+        .order_by(ApiKey.created_at.desc())
+    )
+    keys = result.scalars().all()
+
+    return ApiKeyListResponse(
+        keys=[
+            ApiKeyInfo(
+                id=str(key.id),
+                name=key.name,
+                key_prefix=key.key_prefix,
+                scopes=key.scopes or [],
+                created_at=key.created_at,
+                last_used_at=key.last_used_at,
+                expires_at=key.expires_at,
+            )
+            for key in keys
+        ]
+    )
+
+
+@router.delete("/settings/api-keys/{key_id}")
+async def revoke_api_key(
+    key_id: str,
+    user_id: UUID = Depends(get_current_user_id),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Revoke (delete) an API key."""
+    try:
+        key_uuid = UUID(key_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid key ID.")
+
+    result = await session.execute(
+        select(ApiKey).where(
+            ApiKey.id == key_uuid,
+            ApiKey.user_id == user_id,
+            ApiKey.revoked_at.is_(None),
+        )
+    )
+    api_key = result.scalar_one_or_none()
+
+    if api_key is None:
+        raise HTTPException(status_code=404, detail="API key not found.")
+
+    api_key.revoked_at = datetime.now(timezone.utc)
+    await session.commit()
+
+    return {"success": True, "message": "API key revoked."}

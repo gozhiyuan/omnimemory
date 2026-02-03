@@ -4,7 +4,13 @@ This folder contains supporting config files for the Docker Compose stack.
 
 ## Files
 
-- `prometheus.yml` - Prometheus scrape configuration
+- `prometheus.yml` - Prometheus scrape configuration mounted by `docker-compose.yml`
+- `setup-authentik-oauth.sh` - Helper script to configure Authentik OAuth (invoked by `omni start`)
+
+## How these files are used
+
+- `prometheus.yml` is mounted into the Prometheus container via `docker-compose.yml` at `/etc/prometheus/prometheus.yml`.
+- `setup-authentik-oauth.sh` is called by the CLI (`apps/cli/src/commands/start.ts`) after bringing up Authentik, or can be run manually.
 
 ## Usage
 

@@ -1328,22 +1328,24 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
       setEpisodeDetail(null);
       return;
     }
-    if (!episodeCards.length) {
-      setSelectedItemId(null);
-      setDetail(null);
-      setSelectedEpisodeId(null);
-      setEpisodeDetail(null);
-      return;
-    }
+    // If there's a pending selection being processed, don't auto-select
     if (pendingSelection) {
       return;
     }
+    // If an item is already selected (e.g., from chat navigation), keep it selected
+    // even if episodeCards hasn't loaded yet - the detail will load via API
+    if (selectedItemId) {
+      return;
+    }
+    // If an episode is already selected and still valid, keep it
     if (selectedEpisodeId && sortedDayEpisodes.some((episode) => episode.episode_id === selectedEpisodeId)) {
       return;
     }
-    if (selectedItemId && dayItems.some((item) => item.id === selectedItemId)) {
+    // No data loaded yet - don't clear selections, just wait
+    if (!episodeCards.length) {
       return;
     }
+    // Auto-select the first card
     const nextCard = episodeCards[0];
     if (nextCard?.isSynthetic && nextCard.syntheticItemId) {
       setSelectedItemId(nextCard.syntheticItemId);
@@ -1354,7 +1356,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
       setSelectedEpisodeId(nextCard.episode_id);
       setSelectedItemId(null);
     }
-  }, [episodeCards, sortedDayEpisodes, dayItems, viewMode, selectedItemId, selectedEpisodeId]);
+  }, [episodeCards, sortedDayEpisodes, dayItems, viewMode, selectedItemId, selectedEpisodeId, pendingSelection]);
 
   useEffect(() => {
     if (!selectedItemId) {

@@ -376,6 +376,32 @@ _NO_INFO_HINTS = (
     "unable to find enough information",
 )
 
+_TERMINAL_PUNCTUATION = (".", "!", "?", "\"", "'", "”", "’", ")", "]", "}", "…")
+
+
+def _looks_truncated(text: str) -> bool:
+    if not text:
+        return False
+    stripped = text.strip()
+    if len(stripped) < 120:
+        return False
+    if stripped.endswith(_TERMINAL_PUNCTUATION):
+        return False
+    if stripped.endswith("..."):
+        return True
+    if stripped[-1] in ",;:-":
+        return True
+    return stripped[-1].isalnum()
+
+
+def _build_continuation_prompt(text: str) -> str:
+    return (
+        "The following assistant response was cut off mid-sentence. "
+        "Continue from where it ended and finish the thought. "
+        "Do not repeat any earlier text. Return only the continuation.\n\n"
+        f"Response:\n{text}\n\nContinuation:"
+    )
+
 
 def _response_lacks_info(text: str) -> bool:
     if not text:
@@ -1442,8 +1468,8 @@ async def _build_sources(
         if context.context_type != "daily_summary"
     ]
     if not filtered_entries:
-        logger.debug("_build_sources: all entries are daily_summary, returning empty")
-        return []
+        logger.debug("_build_sources: all entries are daily_summary, including summaries as sources")
+        filtered_entries = list(entries)
 
     scored_entries: list[tuple[ProcessedContext, dict, float]] = []
     for context, hit in filtered_entries:
@@ -1703,6 +1729,7 @@ async def _run_chat(
 
     sources = await _build_sources(session, ordered_entries, limit=5)
 
+    continuation_used = False
     telemetry_payload = {
         "query_plan": plan_to_dict(plan),
         "intent": intent,
@@ -1713,6 +1740,7 @@ async def _run_chat(
         "prompt_tokens": prompt_tokens,
         "include_summary": include_summary,
         "fallback_used": fallback_used,
+        "continuation_used": continuation_used,
         "retrieval_config": {
             "limit": retrieval_config.limit,
             "context_types": sorted(retrieval_config.context_types or []),
@@ -1732,6 +1760,25 @@ async def _run_chat(
         )
         if not verification.is_grounded and verification.suggested_followup:
             assistant_message = verification.suggested_followup
+
+    if not fallback_used and _looks_truncated(assistant_message):
+        continuation_prompt = _build_continuation_prompt(assistant_message)
+        continuation = await summarize_text_with_gemini(
+            prompt=continuation_prompt,
+            settings=settings,
+            model=settings.chat_model,
+            temperature=max(0.2, settings.chat_temperature - 0.2),
+            max_output_tokens=min(256, settings.chat_max_output_tokens),
+            timeout_seconds=settings.chat_timeout_seconds,
+            step_name="chat_response_continuation",
+            user_id=user_id,
+        )
+        continuation_text = (continuation.get("raw_text") or "").strip()
+        if continuation_text:
+            joiner = "" if assistant_message.rstrip().endswith(("\n", " ")) else " "
+            assistant_message = f"{assistant_message.rstrip()}{joiner}{continuation_text}"
+            continuation_used = True
+            telemetry_payload["continuation_used"] = True
 
     now = datetime.now(timezone.utc)
     session_record.updated_at = now

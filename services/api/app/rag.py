@@ -90,6 +90,44 @@ _RELATIVE_DATE_PATTERNS = (
     ("this year", "this_year"),
 )
 
+_WEEKDAY_ALIASES: dict[str, int] = {
+    "mon": 0,
+    "monday": 0,
+    "tue": 1,
+    "tues": 1,
+    "tuesday": 1,
+    "wed": 2,
+    "weds": 2,
+    "wednesday": 2,
+    "thu": 3,
+    "thur": 3,
+    "thurs": 3,
+    "thursday": 3,
+    "fri": 4,
+    "friday": 4,
+    "sat": 5,
+    "saturday": 5,
+    "sun": 6,
+    "sunday": 6,
+}
+
+_WEEKDAY_PATTERN = (
+    r"(monday|mon|tuesday|tue|tues|wednesday|wed|weds|thursday|thu|thur|thurs|friday|fri|saturday|sat|sunday|sun)"
+)
+_RELATIVE_WEEKDAY_PATTERN = re.compile(
+    rf"\b(last|previous|this|next|coming|upcoming)\s+{_WEEKDAY_PATTERN}(?:'s)?\b"
+)
+_WEEKDAY_META_PATTERN = re.compile(
+    rf"\b(what\s+(?:date|day)\s+(?:is|was)|when\s+(?:is|was)|date\s+for|date\s+of|which\s+date)\b.*\b{_WEEKDAY_PATTERN}\b"
+)
+
+
+def _weekday_from_token(token: str | None) -> Optional[int]:
+    if not token:
+        return None
+    cleaned = re.sub(r"[^a-z]", "", token.lower())
+    return _WEEKDAY_ALIASES.get(cleaned)
+
 def _extract_json(text: str) -> Optional[dict]:
     cleaned = (text or "").strip()
     if not cleaned:
@@ -209,6 +247,36 @@ def _extract_date_range_heuristic(
             end_date,
         )
         return _local_dates_to_utc_range(start_date, end_date, offset)
+
+    weekday_match = _RELATIVE_WEEKDAY_PATTERN.search(q)
+    if weekday_match:
+        mode = weekday_match.group(1)
+        weekday_token = weekday_match.group(2)
+        weekday = _weekday_from_token(weekday_token)
+        if weekday is not None:
+            if mode in ("last", "previous"):
+                delta = (local_today.weekday() - weekday) % 7
+                if delta == 0:
+                    delta = 7
+                target_date = local_today - timedelta(days=delta)
+            elif mode in ("next", "coming", "upcoming"):
+                delta = (weekday - local_today.weekday()) % 7
+                if delta == 0:
+                    delta = 7
+                target_date = local_today + timedelta(days=delta)
+            else:  # "this"
+                start_of_week = local_today - timedelta(days=local_today.weekday())
+                target_date = start_of_week + timedelta(days=weekday)
+            start_date = target_date
+            end_date = target_date + timedelta(days=1)
+            logger.info(
+                "Heuristic date range: phrase='%s %s' start=%s end=%s",
+                mode,
+                weekday_token,
+                start_date,
+                end_date,
+            )
+            return _local_dates_to_utc_range(start_date, end_date, offset)
 
     match = re.search(r"\b(?:last|past)\s+(\d{1,3})\s+days?\b", q)
     if match:
@@ -356,6 +424,8 @@ def _heuristic_intent(query: str) -> Optional[QueryIntent]:
         "todays date",
     )
     if any(pattern in q for pattern in meta_patterns):
+        return "meta_question"
+    if _WEEKDAY_META_PATTERN.search(q):
         return "meta_question"
     return None
 

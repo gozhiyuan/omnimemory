@@ -70,7 +70,7 @@ capture life. OmniMemory is built to organize those daily captures.
 - Weekly recaps: see patterns and themes across a week.
 - Generate summary images. (GIF placeholder)
 - Agent workflows: let OpenClaw query and summarize your memory stream. (GIF placeholder)
-- Agent mode chat: multi-step retrieval and tool orchestration. (GIF placeholder)
+- Agent mode chat (Recommended Always On): multi-step retrieval and tool orchestration. (GIF placeholder)
 - Advanced settings. (GIF placeholder)
 
 ## Hardware Capture and Integrations (Ongoing)
@@ -129,8 +129,32 @@ The setup wizard will prompt you for:
 - OpenClaw integration (optional)
 
 ### Integrate with OpenClaw
-OmniMemory can integrate with OpenClaw. TODO: update integration guidance on setting the JSON env for authentication.
-`omni start` also copies the skill files to OpenClaw.
+OmniMemory can integrate with OpenClaw. You can enable openclaw during `omni setup`, and then
+`omni start` can copy the skill files under `docs/openclaw/skills` to OpenClaw skills folder.  
+
+You will also need to enable the skills in `openclaw.json` and restart openclaw if need. If you have enable the authentication, you'll also need to get the omnimemory token first in the Settings page, and copy it there.
+```
+"skills": {
+    "install": {
+      "nodeManager": "npm"
+    },
+    "entries": {
+      "bird": {
+        "enabled": false
+      },
+      "nano-banana-pro": {
+        "apiKey": ""
+      },
+      "omnimemory": {
+        "enabled": true,
+        "env": {
+          "OMNIMEMORY_API_URL": "http://localhost:8000",
+          "OMNIMEMORY_API_TOKEN": "omni_sk_xxx"
+        }
+      }
+    }
+  },
+```
 
 ### What Gets Started
 

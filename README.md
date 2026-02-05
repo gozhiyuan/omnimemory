@@ -37,6 +37,8 @@ better over time.
 I believe there will be more embodied intelligence hardware like AI glasses, pendants, and robotics with cameras to
 capture life. OmniMemory is built to organize those daily captures.
 
+![feature.gif](demo_media/demo-gif.gif)
+
 ## Project Updates
 
 - 2025-02: OpenClaw integration released for agent workflows and memory sync. OmniMemory extends OpenClaw by syncing daily image, video, and audio memories.

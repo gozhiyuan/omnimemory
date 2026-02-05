@@ -34,6 +34,8 @@ def test_dashboard_stats_returns_activity_and_recent_items(monkeypatch):
 
     fake_session = FakeSession(
         [
+            FakeResult(scalar=None),  # fetch_user_settings for offset_now
+            FakeResult(scalar=None),  # fetch_user_settings for offset_minutes
             FakeResult(scalar=4),
             FakeResult(scalar=2),
             FakeResult(scalar=1),
@@ -93,6 +95,8 @@ def test_dashboard_handles_signing_failures(monkeypatch):
 
     fake_session = FakeSession(
         [
+            FakeResult(scalar=None),  # fetch_user_settings for offset_now
+            FakeResult(scalar=None),  # fetch_user_settings for offset_minutes
             FakeResult(scalar=1),
             FakeResult(scalar=1),
             FakeResult(scalar=0),
@@ -153,12 +157,21 @@ def test_dashboard_stats_uses_cache(monkeypatch):
         "usage_daily": [],
     }
 
-    class FailingSession:
-        async def execute(self, _stmt):
+    class CacheTestSession:
+        """Session that allows user settings queries but fails for stats queries."""
+
+        def __init__(self):
+            self._allowed_queries = 0
+
+        async def execute(self, stmt):
+            # Allow 2 queries for resolve_user_tz_offset_minutes (offset_now + offset_minutes)
+            if self._allowed_queries < 2:
+                self._allowed_queries += 1
+                return FakeResult(scalar=None)
             raise AssertionError("DB queries should not run on cache hit.")
 
     async def override_get_session_failing():
-        yield FailingSession()
+        yield CacheTestSession()
 
     async def fake_cache_get(_key: str):
         return cached_payload

@@ -31,6 +31,7 @@ def test_timeline_groups_items_and_signs_urls(monkeypatch):
 
     fake_session = FakeSession(
         [
+            FakeResult(scalar=None),  # fetch_user_settings for _resolve_request_tz_offset
             FakeResult(scalars=[item]),
             FakeResult(scalars=[]),
             FakeResult(rows=[caption_row]),

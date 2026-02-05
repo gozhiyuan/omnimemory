@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # omnimemory_search.sh - Search OmniMemory for memories
-# Usage: ./omnimemory_search.sh "query" [limit] [date_from] [date_to] [context_types]
+# Usage: ./omnimemory_search.sh "query" [limit] [date_from] [date_to] [context_types] [tz_offset_minutes]
 set -euo pipefail
 
 # Configuration: env vars take precedence, fallback to openclaw.json
@@ -38,6 +38,7 @@ LIMIT="${2:-10}"
 DATE_FROM="${3:-}"
 DATE_TO="${4:-}"
 CONTEXT_TYPES="${5:-}"
+TZ_OFFSET="${6:-}"
 
 if ! [[ "$LIMIT" =~ ^[0-9]+$ ]]; then
   echo '{"success": false, "error": "limit must be a number"}' >&2
@@ -51,15 +52,17 @@ JSON_PAYLOAD=$(jq -n \
   --arg date_from "$DATE_FROM" \
   --arg date_to "$DATE_TO" \
   --arg context_types "$CONTEXT_TYPES" \
+  --arg tz_offset "$TZ_OFFSET" \
   '{
     query: $query,
     limit: $limit
   } + (if $date_from != "" then {date_from: $date_from} else {} end)
     + (if $date_to != "" then {date_to: $date_to} else {} end)
-    + (if $context_types != "" then {context_types: ($context_types | split(",") | map(gsub("^\\s+|\\s+$"; "")))} else {} end)')
+    + (if $context_types != "" then {context_types: ($context_types | split(",") | map(gsub("^\\s+|\\s+$"; "")))} else {} end)
+    + (if $tz_offset != "" then {tz_offset_minutes: ($tz_offset | tonumber)} else {} end)')
 
 # Build curl command
-CURL_OPTS=(-sS -X POST "$API_URL/api/openclaw/search" -H "Content-Type: application/json")
+CURL_OPTS=(-sS -X POST "$API_URL/api/openclaw/search-advanced" -H "Content-Type: application/json")
 
 if [ -n "$TOKEN" ]; then
   CURL_OPTS+=(-H "Authorization: Bearer $TOKEN")

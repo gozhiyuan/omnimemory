@@ -34,10 +34,13 @@ else
 fi
 
 DATE="${1:?Error: date required. Usage: $0 \"YYYY-MM-DD\" [tz_offset_minutes]}"
-TZ_OFFSET="${2:-0}"
+TZ_OFFSET="${2:-}"
 
-# Build URL with query params
-URL="$API_URL/api/openclaw/timeline/$DATE?tz_offset_minutes=$TZ_OFFSET"
+# Build URL with optional tz_offset_minutes
+URL="$API_URL/api/openclaw/timeline/$DATE"
+if [ -n "$TZ_OFFSET" ]; then
+  URL="${URL}?tz_offset_minutes=${TZ_OFFSET}"
+fi
 
 # Build curl command
 CURL_OPTS=(-sS -X GET "$URL")

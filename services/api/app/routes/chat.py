@@ -10,19 +10,23 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from loguru import logger
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..ai import analyze_image_with_vlm, generate_image_with_gemini, summarize_text_with_gemini
 from ..ai.prompts import (
     build_lifelog_cartoon_agent_prompt,
-    build_lifelog_chat_system_prompt,
     build_lifelog_day_insights_agent_prompt,
     build_lifelog_image_prompt,
     build_lifelog_session_title_prompt,
 )
 from ..auth import get_current_user_id
+from ..chat import build_query_plan_with_parsed, plan_retrieval
+from ..chat.evidence_builder import build_evidence_hits
+from ..chat.query_understanding import plan_to_dict
+from ..chat.response_generator import ChatPromptInputs, build_chat_prompt
+from ..chat.verifier import verify_response
 from ..config import get_settings
 from ..db.models import (
     ChatAttachment,
@@ -40,6 +44,7 @@ from ..google_photos import get_valid_access_token
 from ..pipeline.utils import ensure_tz_aware
 from ..rag import retrieve_context_hits
 from ..storage import get_storage_provider
+from ..user_settings import resolve_user_tz_offset_minutes
 
 
 router = APIRouter()
@@ -69,13 +74,18 @@ def _infer_image_content_type(item: SourceItem) -> Optional[str]:
 
 
 class ChatSource(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     context_id: str
     source_item_id: Optional[str] = None
+    context_type: Optional[str] = None
+    is_episode: Optional[bool] = None
+    episode_id: Optional[str] = None
     thumbnail_url: Optional[str] = None
     timestamp: Optional[str] = None
     snippet: Optional[str] = None
     score: Optional[float] = None
     title: Optional[str] = None
+    source_index: Optional[int] = None
 
 
 class ChatAttachmentOut(BaseModel):
@@ -90,12 +100,15 @@ class ChatRequest(BaseModel):
     session_id: Optional[UUID] = None
     tz_offset_minutes: Optional[int] = None
     attachment_ids: Optional[list[UUID]] = None
+    debug: bool = False
 
 
 class ChatResponse(BaseModel):
     message: str
     session_id: UUID
     sources: list[ChatSource]
+    query_plan: Optional[dict] = None
+    debug: Optional[dict] = None
 
 
 class ChatAttachmentResponse(BaseModel):
@@ -143,6 +156,7 @@ class ChatMessageOut(BaseModel):
     sources: list[ChatSource] = []
     attachments: list[ChatAttachmentOut] = []
     created_at: datetime
+    telemetry: Optional[dict] = None
 
 
 class ChatSessionDetail(BaseModel):
@@ -175,6 +189,23 @@ def _truncate_text(value: str, limit: int = 1200) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[:limit].rstrip() + "..."
+
+
+def _format_resolved_time_range(
+    time_range: Optional["TimeRange"],
+    tz_offset_minutes: Optional[int],
+) -> Optional[str]:
+    if not time_range:
+        return None
+    offset = timedelta(minutes=tz_offset_minutes or 0)
+    start_local = (ensure_tz_aware(time_range.start) - offset).date()
+    end_local = (ensure_tz_aware(time_range.end) - offset).date()
+    if end_local <= start_local:
+        return start_local.isoformat()
+    inclusive_end = end_local - timedelta(days=1)
+    if inclusive_end <= start_local:
+        return start_local.isoformat()
+    return f"{start_local.isoformat()} to {inclusive_end.isoformat()}"
 
 
 DEFAULT_CARTOON_AGENT_INSTRUCTION = (
@@ -294,6 +325,64 @@ def _format_context_block(entries: list[tuple[ProcessedContext, dict]]) -> str:
     return "\n\n".join(lines)
 
 
+_NO_INFO_HINTS = (
+    "do not have enough information",
+    "don't have enough information",
+    "dont have enough information",
+    "do not have sufficient information",
+    "don't have sufficient information",
+    "i do not have enough information",
+    "i don't have enough information",
+    "i do not have any information",
+    "i don't have any information",
+    "i do not have the information",
+    "i don't have the information",
+    "i do not have any memories",
+    "i don't have any memories",
+    "no memories",
+    "not enough information",
+    "cannot find enough information",
+    "can't find enough information",
+    "unable to find enough information",
+)
+
+
+def _response_lacks_info(text: str) -> bool:
+    if not text:
+        return True
+    lowered = " ".join(text.lower().split())
+    return any(hint in lowered for hint in _NO_INFO_HINTS)
+
+
+def _format_local_timestamp(value: Optional[datetime], tz_offset_minutes: Optional[int]) -> str:
+    if not value:
+        return "Unknown time"
+    offset = timedelta(minutes=tz_offset_minutes or 0)
+    local_dt = ensure_tz_aware(value) - offset
+    return local_dt.strftime("%b %d, %Y %I:%M %p")
+
+
+def _fallback_memory_answer(
+    entries: list[tuple[ProcessedContext, dict]],
+    tz_offset_minutes: Optional[int],
+    resolved_time_range: Optional[str],
+    max_items: int = 8,
+) -> str:
+    if resolved_time_range:
+        header = f"Based on your memories for {resolved_time_range}, here is what I found:"
+    else:
+        header = "Based on your memories, here is what I found:"
+    lines: list[str] = []
+    for idx, (context, _hit) in enumerate(entries, start=1):
+        timestamp = _format_local_timestamp(context.event_time_utc, tz_offset_minutes)
+        summary = (context.summary or context.title or "Memory").strip()
+        summary = _truncate_text(summary, 180)
+        lines.append(f"- {timestamp}: {summary} [{idx}]")
+        if len(lines) >= max_items:
+            break
+    return "\n".join([header, *lines]) if lines else header
+
+
 def _format_history_block(history: list[ChatMessage]) -> str:
     lines: list[str] = []
     for msg in history:
@@ -302,6 +391,114 @@ def _format_history_block(history: list[ChatMessage]) -> str:
         if content:
             lines.append(f"{role}: {content}")
     return "\n".join(lines)
+
+
+def _estimate_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
+
+
+def _trim_block_lines(block: str, max_lines: int) -> str:
+    if not block:
+        return ""
+    lines = [line for line in block.splitlines() if line.strip()]
+    if len(lines) <= max_lines:
+        return block
+    return "\n".join(lines[:max_lines])
+
+
+def _trim_context_block(block: str, max_items: int) -> str:
+    if not block:
+        return ""
+    entries = [entry for entry in block.split("\n\n") if entry.strip()]
+    if len(entries) <= max_items:
+        return block
+    return "\n\n".join(entries[:max_items])
+
+
+def _is_followup_query(message: str) -> bool:
+    if not message:
+        return False
+    q = " ".join(message.lower().split())
+    if len(q.split()) <= 6 and q.startswith(
+        ("who", "what about", "how about", "and", "also", "where", "when")
+    ):
+        return True
+    return any(token in q for token in ("that", "those", "there", "them"))
+
+
+def _is_recap_query(message: str) -> bool:
+    if not message:
+        return False
+    q = " ".join(message.lower().split())
+    recap_hints = (
+        "recap",
+        "summary",
+        "summarize",
+        "overview",
+        "highlights",
+        "how was my day",
+        "how was my week",
+        "how was my month",
+        "weekly summary",
+        "daily summary",
+        "monthly summary",
+    )
+    return any(hint in q for hint in recap_hints)
+
+
+def _build_search_query(
+    message: str,
+    history: list[ChatMessage],
+    image_context: Optional[str],
+) -> str:
+    search_query = message or ""
+    if _is_followup_query(message):
+        last_user = next((msg for msg in reversed(history) if msg.role == "user"), None)
+        if last_user and last_user.content:
+            search_query = f"{last_user.content}\nFollow-up: {message}".strip()
+    if image_context:
+        search_query = f"{search_query}\nImage description: {image_context}".strip()
+    return search_query
+
+
+async def _compact_history_block(
+    history: list[ChatMessage],
+    settings,
+) -> str:
+    if not history:
+        return ""
+    keep_last = min(4, len(history))
+    if len(history) <= keep_last:
+        return _format_history_block(history)
+    older = history[:-keep_last]
+    recent = history[-keep_last:]
+    older_block = _format_history_block(older)
+    if not older_block:
+        return _format_history_block(history)
+
+    prompt = (
+        "Summarize the following chat history into 5-8 concise bullet points. "
+        "Preserve dates, names, places, and unresolved questions. Do not invent details.\n\n"
+        f"{older_block}"
+    )
+    response = await summarize_text_with_gemini(
+        prompt=prompt,
+        settings=settings,
+        model=settings.chat_model,
+        temperature=0.2,
+        max_output_tokens=settings.chat_history_compact_target_tokens,
+        timeout_seconds=settings.chat_timeout_seconds,
+        step_name="chat_history_compact",
+    )
+    summary = (response.get("raw_text") or "").strip()
+    if not summary:
+        return _format_history_block(recent)
+    recent_block = _format_history_block(recent)
+    if recent_block:
+        return f"Conversation summary:\n{summary}\n\nRecent turns:\n{recent_block}"
+    return f"Conversation summary:\n{summary}"
 
 
 def _resolve_agent_date(
@@ -326,6 +523,21 @@ def _resolve_agent_date_range(
     if end < start:
         return end, start
     return start, end
+
+
+async def _resolve_request_tz_offset(
+    *,
+    session: AsyncSession,
+    user_id: UUID,
+    tz_offset_minutes: Optional[int],
+    local_date: Optional[date] = None,
+) -> int:
+    return await resolve_user_tz_offset_minutes(
+        session,
+        user_id,
+        tz_offset_minutes=tz_offset_minutes,
+        local_date=local_date,
+    )
 
 
 async def _load_agent_day_context(
@@ -419,7 +631,7 @@ def _build_agent_range_memory_context(
     sections: list[str] = []
     if summaries:
         summary_lines = [
-            f"{ensure_tz_aware(summary.start_time_utc).date().isoformat()}: {summary.summary.strip()}"
+            f"{(summary.processor_versions or {}).get('daily_summary_date') or ensure_tz_aware(summary.start_time_utc).date().isoformat()}: {summary.summary.strip()}"
             for summary in summaries
             if summary.summary and summary.start_time_utc
         ]
@@ -506,16 +718,25 @@ async def _load_daily_summaries(
     user_id: UUID,
     days: int = 7,
     tz_offset_minutes: Optional[int] = None,
+    date_range: Optional[tuple[datetime, datetime]] = None,
 ) -> list[DailySummary]:
     offset_delta = timedelta(minutes=tz_offset_minutes or 0)
-    since = date_today = (datetime.now(timezone.utc) - offset_delta).date()
-    start_date = date_today - timedelta(days=days - 1)
+    if date_range:
+        start_dt, end_dt = date_range
+        start_date = (start_dt - offset_delta).date()
+        end_date = (end_dt - offset_delta).date()
+        if end_date <= start_date:
+            end_date = start_date + timedelta(days=1)
+    else:
+        since = date_today = (datetime.now(timezone.utc) - offset_delta).date()
+        start_date = date_today - timedelta(days=days - 1)
+        end_date = since + timedelta(days=1)
     stmt = (
         select(DailySummary)
         .where(
             DailySummary.user_id == user_id,
             DailySummary.summary_date >= start_date,
-            DailySummary.summary_date <= since,
+            DailySummary.summary_date < end_date,
         )
         .order_by(DailySummary.summary_date.desc())
     )
@@ -642,6 +863,41 @@ def _serialize_sources_for_storage(sources: list[ChatSource]) -> list[dict]:
     return payloads
 
 
+_TELEMETRY_CONTEXT_ID = "__telemetry__"
+_TELEMETRY_CONTEXT_TYPE = "__telemetry__"
+
+
+def _attach_telemetry_payload(
+    sources_payload: list[dict],
+    telemetry: Optional[dict],
+) -> list[dict]:
+    if not telemetry:
+        return sources_payload
+    payload = dict(telemetry)
+    telemetry_entry = {
+        "context_id": _TELEMETRY_CONTEXT_ID,
+        "context_type": _TELEMETRY_CONTEXT_TYPE,
+        "title": "telemetry",
+        "telemetry": payload,
+    }
+    return [*sources_payload, telemetry_entry]
+
+
+def _split_sources_payload(
+    sources_payload: list,
+) -> tuple[list[dict], Optional[dict]]:
+    cleaned: list[dict] = []
+    telemetry: Optional[dict] = None
+    for entry in sources_payload or []:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("context_type") == _TELEMETRY_CONTEXT_TYPE:
+            telemetry = entry.get("telemetry")
+            continue
+        cleaned.append(entry)
+    return cleaned, telemetry
+
+
 async def _rehydrate_sources(
     session: AsyncSession,
     sources: list[ChatSource],
@@ -736,15 +992,46 @@ async def _build_sources(
     limit: int = 5,
 ) -> list[ChatSource]:
     if not entries:
+        logger.debug("_build_sources: no entries provided")
         return []
 
+    source_index_by_id = {
+        str(context.id): idx + 1 for idx, (context, _) in enumerate(entries)
+    }
     filtered_entries = [
         (context, hit)
         for context, hit in entries
         if context.context_type != "daily_summary"
     ]
     if not filtered_entries:
+        logger.debug("_build_sources: all entries are daily_summary, returning empty")
         return []
+
+    scored_entries: list[tuple[ProcessedContext, dict, float]] = []
+    for context, hit in filtered_entries:
+        score = float(hit.get("score") or 0.0)
+        scored_entries.append((context, hit, score))
+
+    max_score = max((score for _, _, score in scored_entries), default=0.0)
+    threshold = max(0.2, max_score * 0.6)
+    logger.debug(f"_build_sources: {len(scored_entries)} entries, max_score={max_score:.3f}, threshold={threshold:.3f}")
+    filtered_entries = [
+        (context, hit)
+        for context, hit, score in scored_entries
+        if score >= threshold
+    ]
+    if not filtered_entries:
+        filtered_entries = [
+            (context, hit)
+            for context, hit, _ in sorted(scored_entries, key=lambda entry: entry[2], reverse=True)[
+                : min(3, len(scored_entries))
+            ]
+        ]
+        logger.debug(f"_build_sources: below threshold, using top {len(filtered_entries)} entries")
+    scores_by_context_id = {str(context.id): score for context, _, score in scored_entries}
+    filtered_entries.sort(
+        key=lambda entry: scores_by_context_id.get(str(entry[0].id), 0.0), reverse=True
+    )
 
     source_item_ids: list[UUID] = []
     for context, _ in filtered_entries:
@@ -778,15 +1065,21 @@ async def _build_sources(
             item_time = item.event_time_utc or item.captured_at or item.created_at
         timestamp = _format_timestamp(item_time) or _format_timestamp(context.event_time_utc)
         thumbnail_url = thumbnail_urls.get(item_id) if item_id else None
+        # Include episode_id for episodes (the context_id is the episode's context ID)
+        episode_id = str(context.id) if context.is_episode else None
         sources.append(
             ChatSource(
                 context_id=str(context.id),
                 source_item_id=str(item_id) if item_id else None,
+                context_type=context.context_type,
+                is_episode=bool(context.is_episode),
+                episode_id=episode_id,
                 thumbnail_url=thumbnail_url,
                 timestamp=timestamp,
                 snippet=context.summary[:160] if context.summary else None,
-                score=float(hit.get("score") or 0.0),
+                score=scores_by_context_id.get(str(context.id), 0.0),
                 title=context.title,
+                source_index=source_index_by_id.get(str(context.id)),
             )
         )
         if item_id:
@@ -806,12 +1099,12 @@ async def _run_chat(
     image_context: Optional[str] = None,
     attachments: Optional[list[dict]] = None,
     attachment_ids: Optional[list[UUID]] = None,
+    debug: bool = False,
 ) -> ChatResponse:
     settings = get_settings()
     if settings.chat_provider != "gemini" or not settings.gemini_api_key:
         raise HTTPException(status_code=503, detail="Chat model not configured")
 
-    offset_delta = timedelta(minutes=tz_offset_minutes or 0)
     session_record = await _get_or_create_session(session, user_id, session_id, message or "New chat")
 
     history_stmt = (
@@ -823,70 +1116,124 @@ async def _run_chat(
     history_rows = await session.execute(history_stmt)
     history = list(reversed(list(history_rows.scalars().all())))
 
-    search_query = message or ""
-    if image_context:
-        search_query = f"{search_query}\nImage description: {image_context}".strip()
+    search_query = _build_search_query(message or "", history, image_context)
 
-    _, hits = await retrieve_context_hits(
+    plan, parsed_plan = await build_query_plan_with_parsed(
+        message or search_query,
+        history=history,
+        tz_offset_minutes=tz_offset_minutes,
+        settings=settings,
+    )
+    retrieval_config = plan_retrieval(plan)
+
+    # Get intent classification along with hits
+    intent, parsed, hits = await retrieve_context_hits(
         search_query or message,
         user_id=user_id,
-        top_k=settings.chat_context_limit,
+        top_k=retrieval_config.limit or settings.chat_context_limit,
         settings=settings,
         tz_offset_minutes=tz_offset_minutes,
+        session=session,
+        parsed_override=parsed_plan,
+        intent_override=plan.intent,
+        query_type=plan.query_type,
+        context_types=retrieval_config.context_types,
+        allow_rerank=retrieval_config.allow_rerank,
     )
-    context_ids: list[UUID] = []
-    for hit in hits:
-        try:
-            context_ids.append(UUID(str(hit.get("context_id"))))
-        except Exception:
-            continue
 
-    contexts_by_id: dict[UUID, ProcessedContext] = {}
-    if context_ids:
-        context_stmt = select(ProcessedContext).where(ProcessedContext.id.in_(context_ids))
-        context_rows = await session.execute(context_stmt)
-        contexts_by_id = {context.id: context for context in context_rows.scalars().all()}
-
+    # For non-memory intents, skip loading contexts
     ordered_entries: list[tuple[ProcessedContext, dict]] = []
-    for hit in hits:
-        context_id = hit.get("context_id")
-        try:
-            context_uuid = UUID(str(context_id))
-        except Exception:
-            continue
-        context = contexts_by_id.get(context_uuid)
-        if context:
-            ordered_entries.append((context, hit))
+    contexts_by_id: dict[UUID, ProcessedContext] = {}
 
-    daily_summaries = await _load_daily_summaries(
-        session,
-        user_id,
-        days=7,
-        tz_offset_minutes=tz_offset_minutes,
-    )
-    summary_block = ""
-    if daily_summaries:
-        summary_block = "\n".join(
-            f"{_summary_display_date(summary, tz_offset_minutes).isoformat()}: {summary.summary}"
-            for summary in daily_summaries
-            if summary.summary
+    evidence_hits = hits
+    if intent == "memory_query" and hits:
+        evidence_hits = build_evidence_hits(
+            hits,
+            plan,
+            max_sources=min(settings.chat_context_limit, 8),
         )
+
+    if intent == "memory_query" and evidence_hits:
+        context_ids: list[UUID] = []
+        for hit in evidence_hits:
+            try:
+                context_ids.append(UUID(str(hit.get("context_id"))))
+            except Exception:
+                continue
+
+        if context_ids:
+            context_stmt = select(ProcessedContext).where(ProcessedContext.id.in_(context_ids))
+            context_rows = await session.execute(context_stmt)
+            contexts_by_id = {context.id: context for context in context_rows.scalars().all()}
+
+        for hit in evidence_hits:
+            context_id = hit.get("context_id")
+            try:
+                context_uuid = UUID(str(context_id))
+            except Exception:
+                continue
+            context = contexts_by_id.get(context_uuid)
+            if context:
+                ordered_entries.append((context, hit))
+
+    # Load daily summaries for memory queries
+    summary_block = ""
+    if intent == "memory_query":
+        daily_summaries = await _load_daily_summaries(
+            session,
+            user_id,
+            days=7,
+            tz_offset_minutes=tz_offset_minutes,
+            date_range=parsed.date_range if parsed else None,
+        )
+        if daily_summaries:
+            summary_block = "\n".join(
+                f"{_summary_display_date(summary, tz_offset_minutes).isoformat()}: {summary.summary}"
+                for summary in daily_summaries
+                if summary.summary
+            )
 
     context_block = _format_context_block(ordered_entries)
     history_block = _format_history_block(history)
-    system_prompt = build_lifelog_chat_system_prompt()
+    include_summary = (
+        bool(summary_block)
+        and intent == "memory_query"
+        and (_is_recap_query(message) or not context_block)
+    )
+    resolved_time_range = _format_resolved_time_range(plan.time_range, tz_offset_minutes)
 
-    sections = [system_prompt]
-    if summary_block:
-        sections.append(f"Recent daily summaries:\n{summary_block}")
-    if history_block:
-        sections.append(f"Conversation history:\n{history_block}")
-    if image_context:
-        sections.append(f"User uploaded image:\n{image_context}")
-    if context_block:
-        sections.append(f"Relevant memories:\n{context_block}")
-    sections.append(f"User question: {message}")
-    prompt = "\n\n".join(section for section in sections if section.strip())
+    prompt_inputs = ChatPromptInputs(
+        intent=intent,
+        message=message,
+        summary_block=summary_block,
+        history_block=history_block,
+        image_context=image_context,
+        context_block=context_block,
+        tz_offset_minutes=tz_offset_minutes,
+        include_summary=include_summary,
+        resolved_time_range=resolved_time_range,
+    )
+
+    prompt = build_chat_prompt(prompt_inputs)
+    prompt_tokens = _estimate_tokens(prompt)
+    compact_threshold = settings.chat_prompt_budget_tokens * settings.chat_prompt_compact_ratio
+    if (
+        prompt_tokens > compact_threshold
+        and len(history) >= settings.chat_history_compact_min_messages
+    ):
+        history_block = await _compact_history_block(history, settings)
+        prompt_inputs.history_block = history_block
+        prompt = build_chat_prompt(prompt_inputs)
+        prompt_tokens = _estimate_tokens(prompt)
+
+    if prompt_tokens > settings.chat_prompt_budget_tokens:
+        if summary_block:
+            summary_block = _trim_block_lines(summary_block, 3)
+        if context_block:
+            context_block = _trim_context_block(context_block, settings.chat_context_limit)
+        prompt_inputs.summary_block = summary_block
+        prompt_inputs.context_block = context_block
+        prompt = build_chat_prompt(prompt_inputs)
 
     response = await summarize_text_with_gemini(
         prompt=prompt,
@@ -902,7 +1249,46 @@ async def _run_chat(
     if not assistant_message:
         assistant_message = "I do not have enough information to answer that yet."
 
+    fallback_used = False
+    if intent == "memory_query" and ordered_entries and _response_lacks_info(assistant_message):
+        assistant_message = _fallback_memory_answer(
+            ordered_entries,
+            tz_offset_minutes=tz_offset_minutes,
+            resolved_time_range=resolved_time_range,
+        )
+        fallback_used = True
+
     sources = await _build_sources(session, ordered_entries, limit=5)
+
+    telemetry_payload = {
+        "query_plan": plan_to_dict(plan),
+        "intent": intent,
+        "query_type": plan.query_type,
+        "candidate_count": len(hits),
+        "evidence_count": len(evidence_hits),
+        "context_count": len(ordered_entries),
+        "prompt_tokens": prompt_tokens,
+        "include_summary": include_summary,
+        "fallback_used": fallback_used,
+        "retrieval_config": {
+            "limit": retrieval_config.limit,
+            "context_types": sorted(retrieval_config.context_types or []),
+            "allow_rerank": retrieval_config.allow_rerank,
+        },
+    }
+
+    debug_payload = telemetry_payload if debug else None
+    query_plan_payload = telemetry_payload.get("query_plan") if debug else None
+
+    if intent == "memory_query" and settings.chat_verification_enabled:
+        verification = await verify_response(
+            assistant_message,
+            ordered_entries,
+            message,
+            settings=settings,
+        )
+        if not verification.is_grounded and verification.suggested_followup:
+            assistant_message = verification.suggested_followup
 
     now = datetime.now(timezone.utc)
     session_record.updated_at = now
@@ -934,12 +1320,14 @@ async def _run_chat(
     )
     messages_to_add.append(user_msg)
     created_at = created_at + timedelta(milliseconds=1)
+    stored_sources = _serialize_sources_for_storage(sources)
+    stored_sources = _attach_telemetry_payload(stored_sources, telemetry_payload)
     assistant_msg = ChatMessage(
         session_id=session_record.id,
         user_id=user_id,
         role="assistant",
         content=assistant_message,
-        sources=_serialize_sources_for_storage(sources),
+        sources=stored_sources,
         created_at=created_at,
     )
     messages_to_add.append(assistant_msg)
@@ -973,6 +1361,8 @@ async def _run_chat(
         message=assistant_message,
         session_id=session_record.id,
         sources=sources,
+        query_plan=query_plan_payload,
+        debug=debug_payload,
     )
 
 
@@ -982,13 +1372,19 @@ async def chat(
     user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> ChatResponse:
+    resolved_offset = await _resolve_request_tz_offset(
+        session=session,
+        user_id=user_id,
+        tz_offset_minutes=request.tz_offset_minutes,
+    )
     return await _run_chat(
         session=session,
         user_id=user_id,
         message=request.message,
         session_id=request.session_id,
-        tz_offset_minutes=request.tz_offset_minutes,
+        tz_offset_minutes=resolved_offset,
         attachment_ids=request.attachment_ids,
+        debug=request.debug,
     )
 
 
@@ -998,6 +1394,7 @@ async def chat_with_image(
     message: str = Form(""),
     session_id: Optional[UUID] = Form(None),
     tz_offset_minutes: Optional[int] = Form(None),
+    debug: bool = Form(False),
     user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> ChatResponse:
@@ -1022,14 +1419,20 @@ async def chat_with_image(
         content_type=image.content_type,
         original_filename=image.filename,
     )
+    resolved_offset = await _resolve_request_tz_offset(
+        session=session,
+        user_id=user_id,
+        tz_offset_minutes=tz_offset_minutes,
+    )
     return await _run_chat(
         session=session,
         user_id=user_id,
         message=message,
         session_id=session_record.id,
-        tz_offset_minutes=tz_offset_minutes,
+        tz_offset_minutes=resolved_offset,
         image_context=image_context,
         attachments=[attachment_payload],
+        debug=debug,
     )
 
 
@@ -1045,12 +1448,18 @@ async def agent_cartoon_day_summary(
     if settings.agent_image_provider != "gemini" or not settings.gemini_api_key:
         raise HTTPException(status_code=503, detail="Image model not configured")
 
-    local_date = _resolve_agent_date(payload.date, tz_offset_minutes=payload.tz_offset_minutes)
+    resolved_offset = await _resolve_request_tz_offset(
+        session=session,
+        user_id=user_id,
+        tz_offset_minutes=payload.tz_offset_minutes,
+        local_date=date.fromisoformat(payload.date) if payload.date else None,
+    )
+    local_date = _resolve_agent_date(payload.date, tz_offset_minutes=resolved_offset)
     summary_context, contexts = await _load_agent_day_context(
         session,
         user_id,
         local_date,
-        tz_offset_minutes=payload.tz_offset_minutes,
+        tz_offset_minutes=resolved_offset,
     )
     memory_context = _build_agent_memory_context(summary_context, contexts)
     instruction = (payload.prompt or "").strip() or DEFAULT_CARTOON_AGENT_INSTRUCTION
@@ -1112,7 +1521,7 @@ async def agent_cartoon_day_summary(
         sources=[],
         created_at=now,
     )
-    assistant_content = f"{caption}\n\nPrompt:\n{image_prompt}".strip()
+    assistant_content = caption.strip()
     assistant_msg = ChatMessage(
         session_id=session_record.id,
         user_id=user_id,
@@ -1176,17 +1585,23 @@ async def agent_day_insights(
     if not settings.agent_enabled:
         raise HTTPException(status_code=503, detail="Agent features are disabled")
 
+    resolved_offset = await _resolve_request_tz_offset(
+        session=session,
+        user_id=user_id,
+        tz_offset_minutes=payload.tz_offset_minutes,
+        local_date=date.fromisoformat(payload.date) if payload.date else None,
+    )
     start_date, end_date = _resolve_agent_date_range(
         payload.date,
         payload.end_date,
-        tz_offset_minutes=payload.tz_offset_minutes,
+        tz_offset_minutes=resolved_offset,
     )
     summaries, contexts = await _load_agent_range_context(
         session,
         user_id,
         start_date,
         end_date,
-        tz_offset_minutes=payload.tz_offset_minutes,
+        tz_offset_minutes=resolved_offset,
     )
     memory_context = _build_agent_range_memory_context(summaries, contexts)
     instruction = (payload.prompt or "").strip() or DEFAULT_INSIGHTS_AGENT_INSTRUCTION
@@ -1196,7 +1611,7 @@ async def agent_day_insights(
         else f"{start_date.isoformat()} to {end_date.isoformat()}"
     )
 
-    offset = timedelta(minutes=payload.tz_offset_minutes or 0)
+    offset = timedelta(minutes=resolved_offset)
     start = datetime.combine(start_date, time.min, tzinfo=timezone.utc) + offset
     end = datetime.combine(end_date, time.min, tzinfo=timezone.utc) + offset + timedelta(days=1)
     event_time_expr = func.coalesce(SourceItem.event_time_utc, SourceItem.created_at)
@@ -1464,6 +1879,7 @@ async def get_session(
     session_id: UUID,
     user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
+    debug: bool = False,
 ) -> ChatSessionDetail:
     chat_session = await session.get(ChatSession, session_id)
     if not chat_session or chat_session.user_id != user_id:
@@ -1480,7 +1896,8 @@ async def get_session(
     messages = []
     for msg in message_records:
         sources_payload = msg.sources or []
-        sources = [ChatSource(**entry) for entry in sources_payload if isinstance(entry, dict)]
+        cleaned_payload, telemetry = _split_sources_payload(sources_payload)
+        sources = [ChatSource(**entry) for entry in cleaned_payload if isinstance(entry, dict)]
         sources = await _rehydrate_sources(session, sources)
         attachments = attachments_by_message.get(msg.id, [])
         messages.append(
@@ -1491,6 +1908,7 @@ async def get_session(
                 sources=sources,
                 attachments=attachments,
                 created_at=msg.created_at,
+                telemetry=telemetry if debug else None,
             )
         )
     return ChatSessionDetail(

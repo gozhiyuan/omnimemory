@@ -34,15 +34,32 @@ Related tables used by chat:
 
 ## Retrieval flow
 
-1) Parse the user query for date ranges and entity hints.
-2) Embed the query and search Qdrant for `ProcessedContext` matches (top-K with a wider initial pool).
-3) Filter/re-rank hits using:
-   - date window filter
-   - entity match boosts
-   - episode boost
-   - time decay
-4) Fetch full contexts from Postgres by `context_id`.
-5) Build the chat prompt with recent daily summaries, conversation history, and the retrieved context blocks.
+1) **Intent classification** (heuristic + LLM):
+   - `memory_query` → run retrieval
+   - `meta_question` / `greeting` / `clarification` → skip retrieval
+2) **Query understanding**:
+   - Date parsing (heuristic first, LLM fallback)
+   - Entity extraction (optional Gemini-based)
+   - Query type classification (`fact`, `summary`, `browse`, `compare`, `count`)
+3) **Hybrid retrieval**:
+   - Qdrant vector search
+   - Optional Postgres FTS search
+   - Reciprocal Rank Fusion (RRF) to combine lists
+4) **Hard filters + scoring**:
+   - Date window filter (strict)
+   - Optional context_type filter (from retrieval planner)
+   - Entity match boosts, recap boosts, activity context boosts, daily penalties
+5) **LLM rerank (optional)**:
+   - Applied to top N candidates (default for `fact`/`summary`)
+   - Recency queries get a final recency sort
+6) **Evidence selection**:
+   - Dedupe + trim to 6–8 contexts
+7) **Prompt assembly**:
+   - System prompt + daily summaries + history + memory blocks
+8) **Optional verification**:
+   - Grounding check for hallucination detection
+9) **Telemetry**:
+   - Query plan + candidate stats stored with chat messages
 
 ### Query parsing details
 
@@ -52,11 +69,11 @@ Related tables used by chat:
 
 ## Prompt composition
 
-The chat prompt is assembled as:
+The chat prompt is assembled by `response_generator.py` and includes:
 - system instruction
-- recent daily summaries (last 7 days)
+- recent daily summaries (last 7 days, for recap-style queries)
 - conversation history
-- relevant memory blocks
+- relevant memory blocks (timestamp, title, summary, context type)
 - user question
 
 Each memory block includes timestamp, title, summary, and location when available.
@@ -81,6 +98,10 @@ The API response includes:
 
 Thumbnails are resolved from `derived_artifacts` (preview images or keyframes) and signed via the storage provider.
 
+When debug is enabled (`debug=true`), the response also includes:
+- `query_plan`: structured plan (intent, query_type, time_range, entities)
+- `debug`: candidate counts, evidence size, prompt budget, and retrieval config
+
 ## Diagram
 
 ```mermaid
@@ -104,8 +125,17 @@ Common settings that affect RAG behavior:
 - `chat_context_limit`: number of contexts to inject per query.
 - `chat_history_limit`: number of chat turns to include.
 - `chat_entity_extraction_enabled`: toggle query entity extraction.
+- `chat_verification_enabled`: toggle grounding verification.
 - `embedding_provider` / `embedding_model`: used to embed context and query.
 - `qdrant_collection`: collection name for context vectors.
+
+## Memory API (for shared toolset + agents)
+
+These endpoints expose the same retrieval logic for external tools (OpenClaw, ADK agent, etc.):
+- `POST /memory/search`
+- `GET /memory/timeline/{date}`
+- `GET /memory/episode/{episode_id}`
+- `GET /memory/context/{context_id}`
 
 ## Notes and limits
 

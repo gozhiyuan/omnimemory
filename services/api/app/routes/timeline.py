@@ -32,7 +32,12 @@ from ..db.session import get_session
 from ..google_photos import get_valid_access_token
 from ..storage import get_storage_provider
 from ..tasks.episodes import _update_daily_summary as refresh_daily_summary
-from ..user_settings import fetch_user_settings, resolve_language_label, resolve_language_code
+from ..user_settings import (
+    fetch_user_settings,
+    resolve_language_label,
+    resolve_language_code,
+    resolve_user_tz_offset_minutes,
+)
 from ..vectorstore import delete_context_embeddings, upsert_context_embeddings
 from ..pipeline.utils import build_vector_text, ensure_tz_aware, extract_keywords
 
@@ -201,6 +206,38 @@ def _resolve_tz_offset_minutes(
     return 0
 
 
+def _stored_tz_offset_minutes(context: ProcessedContext) -> Optional[int]:
+    versions = context.processor_versions or {}
+    if isinstance(versions, dict):
+        stored = versions.get("tz_offset_minutes")
+        if stored is not None:
+            try:
+                return int(stored)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+async def _resolve_request_tz_offset(
+    *,
+    session: AsyncSession,
+    user_id: UUID,
+    tz_offset_minutes: Optional[int],
+    context: Optional[ProcessedContext] = None,
+    local_date: Optional[date] = None,
+    at: Optional[datetime] = None,
+) -> int:
+    if tz_offset_minutes is not None:
+        return int(tz_offset_minutes)
+    if context is not None:
+        stored = _stored_tz_offset_minutes(context)
+        if stored is not None:
+            return stored
+        if at is None:
+            at = context.start_time_utc or context.event_time_utc or context.created_at
+    return await resolve_user_tz_offset_minutes(session, user_id, at=at, local_date=local_date)
+
+
 def _summary_date_from_context(
     context: ProcessedContext,
     tz_offset_minutes: Optional[int] = None,
@@ -352,6 +389,34 @@ async def _persist_daily_summary_update(
 
 
 WEB_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+_IMAGE_EXT_TO_TYPE = {
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "webp": "image/webp",
+    "gif": "image/gif",
+}
+
+
+def _infer_image_content_type(item: SourceItem) -> Optional[str]:
+    """Infer image content type from filename or storage key."""
+    candidates = [item.original_filename or "", item.storage_key or ""]
+    for value in candidates:
+        if not value or "." not in value:
+            continue
+        ext = value.rsplit(".", 1)[-1].lower()
+        inferred = _IMAGE_EXT_TO_TYPE.get(ext)
+        if inferred:
+            return inferred
+    return None
+
+
+def _is_web_image(item: SourceItem) -> bool:
+    content_type = (item.content_type or "").lower()
+    if content_type in WEB_IMAGE_TYPES:
+        return True
+    inferred = _infer_image_content_type(item)
+    return bool(inferred and inferred in WEB_IMAGE_TYPES)
 
 
 @router.get("/", response_model=list[TimelineDay])
@@ -371,7 +436,12 @@ async def get_timeline(
     for UI rendering while still surfacing recent activity.
     """
 
-    offset_minutes = tz_offset_minutes or 0
+    offset_minutes = await _resolve_request_tz_offset(
+        session=session,
+        user_id=user_id,
+        tz_offset_minutes=tz_offset_minutes,
+        local_date=start_date or end_date,
+    )
     offset = timedelta(minutes=offset_minutes)
 
     stmt = select(SourceItem).where(
@@ -547,8 +617,7 @@ async def get_timeline(
                 download_url_for(
                     item,
                     preview_keys.get(item.id)
-                    if item.item_type == "photo"
-                    and (item.content_type or "").lower() not in WEB_IMAGE_TYPES
+                    if item.item_type == "photo" and not _is_web_image(item)
                     else None,
                 )
                 for item in items
@@ -573,8 +642,7 @@ async def get_timeline(
 
     async def build_thumbnail(item: SourceItem) -> Optional[str]:
         if item.item_type == "photo":
-            content_type = (item.content_type or "").lower()
-            if content_type in WEB_IMAGE_TYPES:
+            if _is_web_image(item):
                 return await download_url_for(item, None)
             preview_key = preview_keys.get(item.id)
             if preview_key:
@@ -789,18 +857,25 @@ async def update_daily_summary(
     session: AsyncSession = Depends(get_session),
 ) -> TimelineDailySummary:
     context = await _load_daily_summary_context(context_id, user_id, session)
+    stored_offset = _stored_tz_offset_minutes(context)
+    resolved_offset = await _resolve_request_tz_offset(
+        session=session,
+        user_id=user_id,
+        tz_offset_minutes=payload.tz_offset_minutes,
+        context=context,
+    )
     if payload.title is None and payload.summary is None and payload.keywords is None:
-        if payload.tz_offset_minutes is not None:
+        if payload.tz_offset_minutes is not None or stored_offset is None:
             return await _persist_daily_summary_update(
                 context=context,
                 user_id=user_id,
                 session=session,
-                tz_offset_minutes=payload.tz_offset_minutes,
+                tz_offset_minutes=resolved_offset,
                 mark_edited=False,
             )
         return TimelineDailySummary(
             context_id=str(context.id),
-            summary_date=_summary_date_from_context(context),
+            summary_date=_summary_date_from_context(context, tz_offset_minutes=resolved_offset),
             title=context.title,
             summary=context.summary,
             keywords=context.keywords or [],
@@ -813,7 +888,7 @@ async def update_daily_summary(
         title=payload.title,
         summary=payload.summary,
         keywords=payload.keywords,
-        tz_offset_minutes=payload.tz_offset_minutes,
+        tz_offset_minutes=resolved_offset,
     )
 
 
@@ -850,12 +925,18 @@ async def update_daily_summary_from_voice(
     if not text:
         raise HTTPException(status_code=422, detail="No transcript returned")
 
+    resolved_offset = await _resolve_request_tz_offset(
+        session=session,
+        user_id=user_id,
+        tz_offset_minutes=tz_offset_minutes,
+        context=context,
+    )
     return await _persist_daily_summary_update(
         context=context,
         user_id=user_id,
         session=session,
         summary=text,
-        tz_offset_minutes=tz_offset_minutes,
+        tz_offset_minutes=resolved_offset,
     )
 
 
@@ -867,7 +948,12 @@ async def reset_daily_summary(
     session: AsyncSession = Depends(get_session),
 ) -> TimelineDailySummary:
     context = await _load_daily_summary_context(context_id, user_id, session)
-    resolved_offset = _resolve_tz_offset_minutes(context, payload.tz_offset_minutes)
+    resolved_offset = await _resolve_request_tz_offset(
+        session=session,
+        user_id=user_id,
+        tz_offset_minutes=payload.tz_offset_minutes,
+        context=context,
+    )
     summary_date = _summary_date_from_context(context, tz_offset_minutes=resolved_offset)
     await refresh_daily_summary(
         session,
@@ -900,7 +986,13 @@ async def set_timeline_highlight(
     if not item or item.user_id != user_id:
         raise HTTPException(status_code=404, detail="Item not found")
 
-    offset_minutes = request.tz_offset_minutes or 0
+    offset_minutes = await _resolve_request_tz_offset(
+        session=session,
+        user_id=user_id,
+        tz_offset_minutes=request.tz_offset_minutes,
+        local_date=request.highlight_date,
+        at=item.event_time_utc or item.captured_at or item.created_at,
+    )
     offset = timedelta(minutes=offset_minutes)
     item_time = ensure_tz_aware(item.event_time_utc or item.captured_at or item.created_at)
     local_date = (item_time - offset).date()
@@ -971,7 +1063,12 @@ async def get_timeline_items(
     provider: Optional[str] = None,
     tz_offset_minutes: Optional[int] = None,
 ) -> TimelineItemsPage:
-    offset_minutes = tz_offset_minutes or 0
+    offset_minutes = await _resolve_request_tz_offset(
+        session=session,
+        user_id=user_id,
+        tz_offset_minutes=tz_offset_minutes,
+        local_date=start_date or end_date,
+    )
     offset_delta = timedelta(minutes=offset_minutes)
 
     event_time_expr = func.coalesce(SourceItem.event_time_utc, SourceItem.created_at)
@@ -1131,8 +1228,7 @@ async def get_timeline_items(
                 download_url_for(
                     item,
                     preview_keys.get(item.id)
-                    if item.item_type == "photo"
-                    and (item.content_type or "").lower() not in WEB_IMAGE_TYPES
+                    if item.item_type == "photo" and not _is_web_image(item)
                     else None,
                 )
                 for item in items
@@ -1220,7 +1316,7 @@ async def get_timeline_item_detail(
     else:
         download_url = await sign_url(storage_key)
 
-    if item.item_type == "photo" and (item.content_type or "").lower() not in WEB_IMAGE_TYPES:
+    if item.item_type == "photo" and not _is_web_image(item):
         preview_stmt = (
             select(DerivedArtifact.payload)
             .where(
@@ -1483,7 +1579,7 @@ async def get_timeline_episode_detail(
                     tokens[conn.id] = token
 
     async def download_url_for(item: SourceItem) -> Optional[str]:
-        if item.item_type == "photo" and (item.content_type or "").lower() not in WEB_IMAGE_TYPES:
+        if item.item_type == "photo" and not _is_web_image(item):
             preview_key = preview_keys.get(item.id)
             if preview_key:
                 preview_url = await sign_url(preview_key)

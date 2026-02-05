@@ -12,21 +12,20 @@ OmniMemory/Lifelog MVP is a personal memory AI system with:
 
 ## Common Commands
 
-### OmniMemory CLI (recommended)
+### OmniMemory CLI (recommended for local dev)
+The CLI handles Docker Compose, API, Celery, and web app startup in one command.
 ```bash
-cd apps/cli && npm install && npm run build  # First time only
-node apps/cli/dist/index.js setup            # Interactive setup wizard
-node apps/cli/dist/index.js start            # Start all services
-node apps/cli/dist/index.js stop             # Stop all services
-node apps/cli/dist/index.js status           # Check service health
+# First time setup
+cd apps/cli && npm install && npm run build && npm link
+cd ../..
 
-# Or install globally: cd apps/cli && npm link
-omni setup                                   # Interactive setup wizard
-omni start                                   # Start all services (foreground)
-omni status                                  # Check service health
+omni setup    # Interactive wizard (configures .env, storage, auth, integrations)
+omni start    # Start all services (Docker + API + Celery + Web)
+omni stop     # Stop all services
+omni status   # Check service health
 ```
 
-### Infrastructure (from repo root)
+### Manual Infrastructure (alternative to CLI)
 ```bash
 make dev-up          # Start Postgres, Redis, Qdrant, Flower, Prometheus, Grafana
 make dev-down        # Stop all containers
@@ -114,3 +113,35 @@ Key settings:
 - **Gemini AI**: VLM for image understanding, chat responses
 - **Qdrant**: Vector similarity search for RAG
 - **Authentik**: Local OIDC provider for auth testing
+
+## Debugging (Docker Commands)
+
+See `docs/debug-best-practices.md` for detailed steps. Quick reference:
+
+### Health & Status
+```bash
+curl -i "http://localhost:8000/health"        # API health
+docker compose ps                              # Container status
+```
+
+### Database Queries (via Docker)
+```bash
+# Query source_items
+docker exec -i lifelog-postgres psql -U lifelog -d lifelog \
+  -c "SELECT id, captured_at, event_time_utc FROM source_items LIMIT 10;"
+
+# Check user settings
+docker exec -i lifelog-postgres psql -U lifelog -d lifelog \
+  -c "SELECT user_id, settings FROM user_settings WHERE user_id='USER_ID';"
+```
+
+### Run Python Scripts in API Container
+```bash
+docker exec -i lifelog-api /app/.venv/bin/python -m app.scripts.fix_demo_event_times --provider demo --all
+```
+
+### Common Gotchas
+- Always pass `tz_offset_minutes` to timeline/search/dashboard calls
+- Demo uploads have no `data_connection`, so `provider=demo` filter may return zero items
+- Check `event_time_utc` vs `captured_at` when items appear on wrong day
+- Use read-only SQL first; only UPDATE/DELETE after identifying root cause

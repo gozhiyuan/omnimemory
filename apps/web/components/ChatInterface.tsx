@@ -22,11 +22,15 @@ import {
   ChatSessionSummary,
   ChatSource,
   TimelineItemDetail,
+  AgentChatResponse,
   AgentImageResponse,
 } from '../types';
+import { toast } from '../services/toast';
 
 const CHAT_SESSION_KEY = 'lifelog.chat.session';
 const CHAT_AGENT_PROMPTS_KEY = 'lifelog.chat.agent_prompts';
+const CHAT_AGENT_SESSION_KEY = 'lifelog.chat.agent.session';
+const CHAT_AGENT_MODE_KEY = 'lifelog.chat.agent.mode';
 
 type AgentSpec = {
   id: string;
@@ -128,6 +132,15 @@ export const ChatInterface: React.FC = () => {
     if (typeof window === 'undefined') return null;
     return localStorage.getItem(CHAT_SESSION_KEY);
   });
+  const [agentSessionId, setAgentSessionId] = useState<string | null>(() => {
+    if (typeof window === 'undefined') return null;
+    return localStorage.getItem(CHAT_AGENT_SESSION_KEY);
+  });
+  const [agentMode, setAgentMode] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return localStorage.getItem(CHAT_AGENT_MODE_KEY) === 'true';
+  });
+  const [debugMode, setDebugMode] = useState(false);
   const [selectedImage, setSelectedImage] = useState<File | null>(null);
   const [selectedImagePreview, setSelectedImagePreview] = useState<string | null>(null);
   const [agentDate, setAgentDate] = useState(() => formatDateKey(new Date(), timeZone));
@@ -191,14 +204,15 @@ export const ChatInterface: React.FC = () => {
       minute: '2-digit',
     }).format(value);
 
-  const scrollToBottom = () => {
+  const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
+  }, []);
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages]);
+  }, [messages, scrollToBottom]);
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- initial hydration only
   useEffect(() => {
     let mounted = true;
     const loadSessions = async () => {
@@ -227,6 +241,7 @@ export const ChatInterface: React.FC = () => {
     };
   }, []);
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- cleanup on unmount only
   useEffect(() => {
     return () => {
       objectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
@@ -243,10 +258,21 @@ export const ChatInterface: React.FC = () => {
     }
   }, [agentPromptOverrides]);
 
-  const loadSession = async (targetId: string) => {
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      localStorage.setItem(CHAT_AGENT_MODE_KEY, agentMode ? 'true' : 'false');
+    } catch (err) {
+      console.error('Failed to persist agent mode', err);
+    }
+  }, [agentMode]);
+
+  const loadSession = useCallback(async (targetId: string) => {
     setLoadingHistory(true);
     try {
-      const detail = await apiGet<ChatSessionDetail>(`/chat/sessions/${targetId}`);
+      const detail = await apiGet<ChatSessionDetail>(
+        `/chat/sessions/${targetId}${debugMode ? '?debug=true' : ''}`
+      );
       const loaded = detail.messages
         .filter((msg) => msg.role !== 'system')
         .map((msg) => ({
@@ -256,6 +282,7 @@ export const ChatInterface: React.FC = () => {
           timestamp: new Date(msg.created_at),
           sources: msg.sources,
           attachments: msg.attachments,
+          telemetry: msg.telemetry,
         }));
       setMessages(loaded.length ? loaded : [buildWelcomeMessage()]);
       setSessionId(detail.session_id);
@@ -265,24 +292,46 @@ export const ChatInterface: React.FC = () => {
     } finally {
       setLoadingHistory(false);
     }
-  };
+  }, [buildWelcomeMessage, debugMode]);
 
-  const refreshSessions = async () => {
+  const refreshSessions = useCallback(async () => {
     try {
       const data = await apiGet<ChatSessionSummary[]>('/chat/sessions');
       setSessions(data);
     } catch (err) {
       console.error(err);
     }
-  };
+  }, []);
 
   const handleNewChat = () => {
     setSessionId(null);
     localStorage.removeItem(CHAT_SESSION_KEY);
+    setAgentSessionId(null);
+    localStorage.removeItem(CHAT_AGENT_SESSION_KEY);
     setMessages([buildWelcomeMessage()]);
     setSelectedImage(null);
     setSelectedImagePreview(null);
   };
+
+  const handleRemoveImage = useCallback(() => {
+    if (selectedImagePreview) {
+      URL.revokeObjectURL(selectedImagePreview);
+    }
+    setSelectedImage(null);
+    setSelectedImagePreview(null);
+  }, [selectedImagePreview]);
+
+  useEffect(() => {
+    if (agentMode && selectedImage) {
+      handleRemoveImage();
+    }
+  }, [agentMode, selectedImage, handleRemoveImage]);
+
+  useEffect(() => {
+    if (sessionId && !agentMode) {
+      void loadSession(sessionId);
+    }
+  }, [agentMode, debugMode, loadSession, sessionId]);
 
   const handleSelectImage = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -299,39 +348,41 @@ export const ChatInterface: React.FC = () => {
     event.target.value = '';
   };
 
-  const handleRemoveImage = () => {
-    if (selectedImagePreview) {
-      URL.revokeObjectURL(selectedImagePreview);
-    }
-    setSelectedImage(null);
-    setSelectedImagePreview(null);
-  };
-
   const handleSourceClick = async (source: ChatSource) => {
-    if (!source.source_item_id) {
-      return;
-    }
     let anchorDate = source.timestamp ?? undefined;
-    if (!anchorDate) {
+    const itemId = source.source_item_id || undefined;
+    if (itemId) {
       try {
-        const detail = await apiGet<TimelineItemDetail>(`/timeline/items/${source.source_item_id}`);
+        const detail = await apiGet<TimelineItemDetail>(`/timeline/items/${itemId}`);
         anchorDate = detail.captured_at || anchorDate;
       } catch (err) {
         console.error('Failed to load memory date for timeline focus', err);
       }
     }
     const focus: {
-      itemId: string;
-      episodeContextId: string;
+      itemId?: string;
+      episodeContextId?: string;
+      episodeId?: string;
       viewMode: 'day';
       anchorDate?: string;
     } = {
-      itemId: source.source_item_id,
-      episodeContextId: source.context_id,
       viewMode: 'day',
     };
+    if (itemId) {
+      focus.itemId = itemId;
+    }
+    if (source.is_episode && source.context_id) {
+      focus.episodeContextId = source.context_id;
+    }
+    // Include episode_id for direct matching (more reliable than context_id)
+    if (source.episode_id) {
+      focus.episodeId = source.episode_id;
+    }
     if (anchorDate) {
       focus.anchorDate = anchorDate;
+    }
+    if (!focus.itemId && !focus.episodeContextId && !focus.episodeId) {
+      return;
     }
     window.dispatchEvent(
       new CustomEvent('lifelog:timeline-focus', {
@@ -393,6 +444,10 @@ export const ChatInterface: React.FC = () => {
     imagePreview?: string | null;
   }) => {
     if ((!messageText.trim() && !imageFile) || loading) return;
+    if (agentMode && imageFile) {
+      toast.error(t('Agent mode does not support images yet.'), t('Disable agent mode to send images.'));
+      return;
+    }
 
     const userMsg: ChatMessage = {
       id: Date.now().toString(),
@@ -423,13 +478,37 @@ export const ChatInterface: React.FC = () => {
           form.append('session_id', sessionId);
         }
         form.append('tz_offset_minutes', getTimeZoneOffsetMinutes(new Date(), timeZone).toString());
+        form.append('debug', debugMode ? 'true' : 'false');
         form.append('image', imageFile);
         response = await apiPostForm<ChatResponse>('/chat/image', form);
+      } else if (agentMode) {
+        const agentResponse = await apiPost<AgentChatResponse>('/agent/chat', {
+          message: messageText,
+          session_id: agentSessionId || undefined,
+          tz_offset_minutes: getTimeZoneOffsetMinutes(new Date(), timeZone),
+          debug: debugMode,
+        });
+        if (!agentSessionId || agentSessionId !== agentResponse.session_id) {
+          setAgentSessionId(agentResponse.session_id);
+          localStorage.setItem(CHAT_AGENT_SESSION_KEY, agentResponse.session_id);
+        }
+        const aiMsg: ChatMessage = {
+          id: (Date.now() + 1).toString(),
+          role: 'assistant',
+          content: agentResponse.message,
+          timestamp: new Date(),
+          sources: agentResponse.sources,
+          telemetry: agentResponse.debug ?? undefined,
+        };
+        setMessages((prev) => [...prev, aiMsg]);
+        setLoading(false);
+        return;
       } else {
         response = await apiPost<ChatResponse>('/chat', {
           message: messageText,
           session_id: sessionId || undefined,
           tz_offset_minutes: getTimeZoneOffsetMinutes(new Date(), timeZone),
+          debug: debugMode,
         });
       }
 
@@ -444,16 +523,21 @@ export const ChatInterface: React.FC = () => {
         content: response.message,
         timestamp: new Date(),
         sources: response.sources,
+        telemetry: response.debug ?? undefined,
       };
 
       setMessages((prev) => [...prev, aiMsg]);
       await refreshSessions();
     } catch (err) {
       console.error(err);
+      const errorMessage =
+        err instanceof Error && err.message ? err.message : t('Please try again.');
       const errorMsg: ChatMessage = {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
-        content: t("I'm having trouble connecting right now. Please try again."),
+        content: debugMode
+          ? t("Request failed: {message}", { message: errorMessage })
+          : t("I'm having trouble connecting right now. Please try again."),
         timestamp: new Date(),
       };
       setMessages((prev) => [...prev, errorMsg]);
@@ -671,9 +755,14 @@ export const ChatInterface: React.FC = () => {
         {/* Header */}
         <div className="px-6 py-4 bg-white border-b border-slate-200 flex justify-between items-center shadow-sm z-10">
           <div>
-            <h2 className="text-lg font-bold text-slate-800 flex items-center">
+            <h2 className="text-lg font-bold text-slate-800 flex items-center gap-2">
               <Sparkles className="w-5 h-5 text-primary-500 mr-2" />
               {activeSession?.title || t('Memory Assistant')}
+              {agentMode && (
+                <span className="rounded-full bg-primary-50 px-2 py-0.5 text-[10px] font-semibold text-primary-700">
+                  {t('Agent mode')}
+                </span>
+              )}
             </h2>
             <p className="text-xs text-slate-500">{t('Powered by Gemini 2.5')}</p>
           </div>
@@ -689,6 +778,12 @@ export const ChatInterface: React.FC = () => {
           )}
           {messages.map((msg) => {
             const uniqueSources = msg.sources ? dedupeSources(msg.sources) : [];
+            const orderedSources = [...uniqueSources].sort((a, b) => {
+              const aIndex = a.source_index ?? Number.POSITIVE_INFINITY;
+              const bIndex = b.source_index ?? Number.POSITIVE_INFINITY;
+              if (aIndex === bIndex) return 0;
+              return aIndex - bIndex;
+            });
             return (
               <div
                 key={msg.id}
@@ -747,13 +842,13 @@ export const ChatInterface: React.FC = () => {
               </div>
               
               {/* Sources (assistant only) */}
-              {msg.role === 'assistant' && uniqueSources.length > 0 && (
+              {msg.role === 'assistant' && orderedSources.length > 0 && (
                 <div className="mt-3 ml-1">
                    <p className="text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">
                      {t('Relevant Memories')}
                    </p>
                    <div className="flex space-x-3 overflow-x-auto pb-2 no-scrollbar max-w-full">
-                     {uniqueSources.map((src) => (
+                     {orderedSources.map((src) => (
                        <div
                          key={src.context_id}
                          onClick={() => handleSourceClick(src)}
@@ -761,7 +856,7 @@ export const ChatInterface: React.FC = () => {
                            src.source_item_id ? 'hover:shadow-md cursor-pointer' : 'cursor-default'
                          }`}
                        >
-                         <div className="h-20 w-full overflow-hidden bg-slate-100 flex items-center justify-center">
+                         <div className="relative h-20 w-full overflow-hidden bg-slate-100 flex items-center justify-center">
                            {src.thumbnail_url ? (
                              <img
                                src={src.thumbnail_url}
@@ -771,6 +866,11 @@ export const ChatInterface: React.FC = () => {
                              />
                            ) : (
                              <ImageIcon size={16} className="text-slate-400" />
+                           )}
+                           {src.source_index != null && (
+                             <span className="absolute top-1 left-1 rounded-full bg-slate-900/80 text-white text-[10px] px-1.5 py-0.5">
+                               #{src.source_index}
+                             </span>
                            )}
                          </div>
                          <div className="p-2 bg-slate-50">
@@ -785,6 +885,33 @@ export const ChatInterface: React.FC = () => {
                      ))}
                    </div>
                 </div>
+              )}
+
+              {debugMode && msg.telemetry && (
+                <details className="mt-2 ml-1 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-[10px] text-slate-600">
+                  <summary className="cursor-pointer font-semibold text-slate-500">
+                    {t('Debug details')}
+                  </summary>
+                  {Array.isArray((msg.telemetry as Record<string, unknown>).events) && (
+                    <div className="mt-2">
+                      <p className="text-[10px] font-semibold text-slate-500">
+                        {t('Agent events')}
+                      </p>
+                      <ol className="mt-1 space-y-1 text-[10px] text-slate-500">
+                        {((msg.telemetry as Record<string, unknown>).events as unknown[]).map(
+                          (event, index) => (
+                            <li key={`${msg.id}-event-${index}`} className="break-words">
+                              {String(event)}
+                            </li>
+                          )
+                        )}
+                      </ol>
+                    </div>
+                  )}
+                  <pre className="mt-2 whitespace-pre-wrap break-words text-[10px] text-slate-600">
+                    {JSON.stringify(msg.telemetry, null, 2)}
+                  </pre>
+                </details>
               )}
               
               <span className="text-[10px] text-slate-400 mt-1 mx-1">
@@ -810,7 +937,36 @@ export const ChatInterface: React.FC = () => {
 
         {/* Input */}
         <div className="bg-white border-t border-slate-200 p-4 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)]">
-              {selectedImagePreview && (
+          <div className="max-w-3xl mx-auto mb-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500">
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setAgentMode((value) => !value)}
+                className={`rounded-full px-3 py-1 text-[11px] font-semibold transition ${
+                  agentMode
+                    ? 'bg-primary-600 text-white'
+                    : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                }`}
+              >
+                {agentMode ? t('Agent Mode: On') : t('Agent Mode: Off')}
+              </button>
+              <button
+                type="button"
+                onClick={() => setDebugMode((value) => !value)}
+                className={`rounded-full px-3 py-1 text-[11px] font-semibold transition ${
+                  debugMode
+                    ? 'bg-slate-900 text-white'
+                    : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                }`}
+              >
+                {debugMode ? t('Debug: On') : t('Debug: Off')}
+              </button>
+            </div>
+            <span className="text-slate-400">
+              {agentMode ? t('Agent mode uses tools for multi-step queries.') : t('Standard chat mode.')}
+            </span>
+          </div>
+          {selectedImagePreview && (
             <div className="max-w-3xl mx-auto mb-3 flex items-center justify-between gap-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
               <div className="flex items-center gap-3">
                 <button
@@ -851,9 +1007,14 @@ export const ChatInterface: React.FC = () => {
           >
             <button
               type="button"
-              className="p-3 text-slate-400 hover:text-primary-600 transition-colors"
+              className={`p-3 transition-colors ${
+                agentMode
+                  ? 'text-slate-300 cursor-not-allowed'
+                  : 'text-slate-400 hover:text-primary-600'
+              }`}
               title={t('Upload image for analysis')}
               onClick={() => fileInputRef.current?.click()}
+              disabled={agentMode}
             >
               <ImageIcon size={20} />
             </button>
@@ -863,13 +1024,18 @@ export const ChatInterface: React.FC = () => {
               accept="image/*"
               onChange={handleSelectImage}
               className="hidden"
+              disabled={agentMode}
             />
             <input
               type="text"
               ref={inputRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder={t("Ask 'When was my trip to Kyoto?'...")}
+              placeholder={
+                agentMode
+                  ? t('Ask a multi-step memory question...')
+                  : t("Ask 'When was my trip to Kyoto?'...")
+              }
               className="flex-1 bg-transparent border-none focus:ring-0 text-slate-800 placeholder-slate-400 text-sm py-3.5"
               disabled={loading}
             />

@@ -199,6 +199,9 @@ def upsert_context_embeddings(contexts: Iterable[Any]) -> None:
             "user_id": str(context.user_id),
             "context_type": getattr(context, "context_type", None),
             "is_episode": bool(getattr(context, "is_episode", False)),
+            "title": getattr(context, "title", None),
+            "summary": getattr(context, "summary", None),
+            "keywords": getattr(context, "keywords", []),
             "event_time_utc": getattr(context, "event_time_utc", None).isoformat()
             if getattr(context, "event_time_utc", None)
             else None,

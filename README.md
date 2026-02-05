@@ -48,8 +48,10 @@ capture life. OmniMemory is built to organize those daily captures.
 - Google Photos Picker API integration.
 - Multimodal understanding for images, audio, and video with Gemini models.
 - Vector search with Qdrant plus RAG retrieval.
+- Memory API endpoints for tool/agent access (`/memory/*`).
 - Daily summaries, timelines, and chat over your memory graph.
 - OpenClaw agent integration for memory sync.
+- Optional agent mode (Google ADK) for multi-step memory retrieval via tools.
 - Easy setup with a guided CLI.
 
 ## Tech Stack
@@ -68,6 +70,7 @@ capture life. OmniMemory is built to organize those daily captures.
 - Weekly recaps: see patterns and themes across a week.
 - Generate summary images. (GIF placeholder)
 - Agent workflows: let OpenClaw query and summarize your memory stream. (GIF placeholder)
+- Agent mode chat: multi-step retrieval and tool orchestration. (GIF placeholder)
 - Advanced settings. (GIF placeholder)
 
 ## Hardware Capture and Integrations (Ongoing)

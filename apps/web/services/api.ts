@@ -1,5 +1,5 @@
 import { translateFromStorage } from '../i18n/core';
-import { getBearerToken } from './auth';
+import { clearStoredTokens, getBearerToken, isAuthEnabled } from './auth';
 import { toast } from './toast';
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
@@ -51,6 +51,9 @@ export const apiRequest = async <T>(path: string, options: ApiOptions = {}): Pro
     throw err;
   }
   if (!response.ok) {
+    if (response.status === 401 && isAuthEnabled()) {
+      clearStoredTokens();
+    }
     const message = await formatError(response);
     notifyFailure(message, response.status);
     throw new Error(message);

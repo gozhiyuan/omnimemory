@@ -211,6 +211,10 @@ services:
       - BUCKET_ORIGINALS=${BUCKET_ORIGINALS:-originals}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash-lite}
+      - CHAT_MAX_OUTPUT_TOKENS=${CHAT_MAX_OUTPUT_TOKENS:-2048}
+      - AGENT_IMAGE_PROVIDER=${AGENT_IMAGE_PROVIDER:-gemini}
+      - AGENT_IMAGE_MODEL=${AGENT_IMAGE_MODEL:-gemini-2.5-flash-image}
+      - AGENT_IMAGE_TIMEOUT_SECONDS=${AGENT_IMAGE_TIMEOUT_SECONDS:-60}
       - AUTH_ENABLED=${AUTH_ENABLED:-false}
       - OIDC_ISSUER_URL=${OIDC_ISSUER_URL:-}
       - OIDC_JWKS_URL=${OIDC_JWKS_URL:-}
@@ -260,6 +264,10 @@ services:
       - BUCKET_ORIGINALS=${BUCKET_ORIGINALS:-originals}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash-lite}
+      - CHAT_MAX_OUTPUT_TOKENS=${CHAT_MAX_OUTPUT_TOKENS:-2048}
+      - AGENT_IMAGE_PROVIDER=${AGENT_IMAGE_PROVIDER:-gemini}
+      - AGENT_IMAGE_MODEL=${AGENT_IMAGE_MODEL:-gemini-2.5-flash-image}
+      - AGENT_IMAGE_TIMEOUT_SECONDS=${AGENT_IMAGE_TIMEOUT_SECONDS:-60}
     depends_on:
       postgres:
         condition: service_healthy

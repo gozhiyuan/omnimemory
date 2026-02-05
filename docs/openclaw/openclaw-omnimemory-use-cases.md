@@ -86,7 +86,22 @@ curl -sS -X POST "$API_URL/api/openclaw/ingest" \
 
 Verify via search:
 ```bash
-curl -sS -X POST "$API_URL/api/openclaw/search" \
+curl -sS -X POST "$API_URL/memory/search" \
+  -H "Content-Type: application/json" \
+  ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
+  -d '{"query":"coffee Alice","limit":5}'
+```
+
+## Use case 1b: Shared toolset search (recommended)
+Purpose: Use the Memory API (shared toolset) for retrieval so OpenClaw and OmniMemory share the same RAG behavior.
+
+```bash
+./omnimemory_search.sh "coffee Alice" 5
+```
+
+Or call the Memory API directly:
+```bash
+curl -sS -X POST "$API_URL/memory/search" \
   -H "Content-Type: application/json" \
   ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
   -d '{"query":"coffee Alice","limit":5}'
@@ -151,7 +166,7 @@ curl -sS -X PATCH "$API_URL/api/openclaw/settings" \
 Purpose: Provide a structured day summary with episodes and highlights for assistant tools.
 
 ```bash
-curl -sS "$API_URL/api/openclaw/timeline/2026-02-02?tz_offset_minutes=-480" \
+curl -sS "$API_URL/memory/timeline/2026-02-02?tz_offset_minutes=-480" \
   ${AUTH_HEADER:+-H "$AUTH_HEADER"}
 ```
 

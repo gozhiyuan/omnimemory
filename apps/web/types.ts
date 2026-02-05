@@ -18,16 +18,21 @@ export interface ChatMessage {
   timestamp: Date;
   sources?: ChatSource[];
   attachments?: ChatAttachment[];
+  telemetry?: Record<string, unknown> | null;
 }
 
 export interface ChatSource {
   context_id: string;
   source_item_id?: string;
+  context_type?: string | null;
+  is_episode?: boolean | null;
+  episode_id?: string | null;
   thumbnail_url?: string | null;
   timestamp?: string | null;
   snippet?: string | null;
   score?: number | null;
   title?: string | null;
+  source_index?: number | null;
 }
 
 export interface ChatAttachment {
@@ -41,6 +46,15 @@ export interface ChatResponse {
   message: string;
   session_id: string;
   sources: ChatSource[];
+  query_plan?: Record<string, unknown> | null;
+  debug?: Record<string, unknown> | null;
+}
+
+export interface AgentChatResponse {
+  message: string;
+  session_id: string;
+  sources?: ChatSource[];
+  debug?: Record<string, unknown> | null;
 }
 
 export interface AgentImageResponse {
@@ -69,6 +83,7 @@ export interface ChatSessionDetail {
     sources?: ChatSource[];
     attachments?: ChatAttachment[];
     created_at: string;
+    telemetry?: Record<string, unknown> | null;
   }>;
 }
 
@@ -160,6 +175,7 @@ export interface TimelineFocus {
   anchorDate?: string;
   itemId?: string;
   episodeContextId?: string;
+  episodeId?: string;
 }
 
 export interface TimelineEpisodeDetail {

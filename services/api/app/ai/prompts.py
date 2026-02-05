@@ -303,6 +303,34 @@ def build_lifelog_query_entities_prompt(
         return template.render(query=query.strip())
 
 
+def build_lifelog_date_range_prompt(
+    query: str,
+    now_iso: str,
+    tz_offset_minutes: int,
+    user_id: Optional[str] = None,
+) -> str:
+    """Build date range extraction prompt with optional per-user customization."""
+    manager = get_prompt_manager()
+    try:
+        return manager.render(
+            "date_range",
+            user_id=user_id,
+            query=query.strip(),
+            now_iso=now_iso,
+            tz_offset_minutes=str(tz_offset_minutes),
+        )
+    except Exception as e:
+        logger.warning(f"Failed to render date_range prompt: {e}")
+        from app.ai.prompt_templates import INLINE_DEFAULTS
+        from jinja2 import Template
+        template = Template(INLINE_DEFAULTS["date_range"])
+        return template.render(
+            query=query.strip(),
+            now_iso=now_iso,
+            tz_offset_minutes=str(tz_offset_minutes),
+        )
+
+
 def build_lifelog_session_title_prompt(
     first_message: str,
     user_id: Optional[str] = None,
@@ -411,3 +439,45 @@ def build_vector_text(
     if keywords:
         parts.append(" ".join(keywords))
     return " ".join(parts)
+
+
+def build_lifelog_query_intent_prompt(
+    query: str,
+    user_id: Optional[str] = None,
+) -> str:
+    """Build query intent classification prompt."""
+    manager = get_prompt_manager()
+    try:
+        return manager.render(
+            "query_intent",
+            user_id=user_id,
+            query=query.strip(),
+        )
+    except Exception as e:
+        logger.warning(f"Failed to render query_intent prompt: {e}")
+        from app.ai.prompt_templates import INLINE_DEFAULTS
+        from jinja2 import Template
+        template = Template(INLINE_DEFAULTS.get("query_intent", ""))
+        return template.render(query=query.strip())
+
+
+def build_lifelog_rerank_prompt(
+    query: str,
+    candidates: str,
+    user_id: Optional[str] = None,
+) -> str:
+    """Build rerank prompt for memory candidates."""
+    manager = get_prompt_manager()
+    try:
+        return manager.render(
+            "rerank",
+            user_id=user_id,
+            query=query.strip(),
+            candidates=candidates.strip(),
+        )
+    except Exception as e:
+        logger.warning(f"Failed to render rerank prompt: {e}")
+        from app.ai.prompt_templates import INLINE_DEFAULTS
+        from jinja2 import Template
+        template = Template(INLINE_DEFAULTS.get("rerank", ""))
+        return template.render(query=query.strip(), candidates=candidates.strip())

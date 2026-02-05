@@ -145,6 +145,21 @@ class Settings(BaseSettings):
     chat_context_limit: int = Field(default=12, ge=1)
     chat_history_limit: int = Field(default=6, ge=0)
     chat_entity_extraction_enabled: bool = True
+    chat_verification_enabled: bool = False
+    chat_prompt_budget_tokens: int = Field(default=6000, ge=512)
+    chat_prompt_compact_ratio: float = Field(default=0.7, ge=0.3, le=0.95)
+    chat_history_compact_target_tokens: int = Field(default=320, ge=64)
+    chat_history_compact_min_messages: int = Field(default=6, ge=4)
+
+    # RAG retrieval settings
+    rag_hybrid_enabled: bool = True
+    rag_fts_limit: int = Field(default=40, ge=5)
+    rag_rrf_k: int = Field(default=60, ge=1)
+    rag_entity_match_boost: float = Field(default=0.12, ge=0.0)
+    rag_activity_context_boost: float = Field(default=0.15, ge=0.0)
+    rag_recap_daily_boost: float = Field(default=0.25, ge=0.0)
+    rag_recap_weekly_boost: float = Field(default=0.2, ge=0.0)
+    rag_daily_penalty: float = Field(default=0.1, ge=0.0)
 
     # Agent settings
     agent_enabled: bool = True

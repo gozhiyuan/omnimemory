@@ -36,7 +36,7 @@ from ..user_settings import (
     resolve_language_label,
     resolve_ocr_language_hints,
 )
-from ..vectorstore import upsert_context_embeddings
+from ..vectorstore import delete_context_embeddings, upsert_context_embeddings
 from .media_utils import (
     MediaToolError,
     create_video_preview,
@@ -868,6 +868,30 @@ class EventTimeStep:
         if not override_time and item.captured_at:
             override_time = item.captured_at
 
+        # Respect existing manual timestamps to avoid overwriting user-corrected event times.
+        if not override_enabled and item.event_time_source == "manual" and item.event_time_utc:
+            event_time = ensure_tz_aware(item.event_time_utc)
+            source = "manual"
+            confidence = item.event_time_confidence or 0.95
+            item.event_time_utc = event_time
+            item.event_time_source = source
+            item.event_time_confidence = confidence
+
+            payload = {
+                "event_time_utc": event_time.isoformat(),
+                "event_time_source": source,
+                "event_time_confidence": confidence,
+            }
+            fingerprint = hash_parts([artifacts.get("content_hash"), source, confidence, event_time.isoformat()])
+            await artifacts.store.upsert(
+                artifact_type="event_time",
+                producer=self.name,
+                producer_version=self.version,
+                input_fingerprint=fingerprint,
+                payload=payload,
+            )
+            return
+
         exif_payload = artifacts.get("exif") or {}
         exif_time = parse_iso_datetime(exif_payload.get("event_time_utc"))
         exif_time_usable = exif_time is not None
@@ -1641,14 +1665,31 @@ class KeyframeExtractionStep:
             with tempfile.TemporaryDirectory() as tmpdir:
                 media_path = Path(tmpdir) / f"source{suffix}"
                 media_path.write_bytes(blob)
-                frames, mode, _times = extract_keyframes(
-                    str(media_path),
-                    tmpdir,
-                    mode=config.settings.video_keyframe_mode,
-                    interval_sec=config.settings.video_keyframe_interval_sec,
-                    scene_threshold=config.settings.video_scene_threshold,
-                    max_frames=config.settings.video_max_keyframes,
-                )
+                try:
+                    frames, mode, _times = extract_keyframes(
+                        str(media_path),
+                        tmpdir,
+                        mode=config.settings.video_keyframe_mode,
+                        interval_sec=config.settings.video_keyframe_interval_sec,
+                        scene_threshold=config.settings.video_scene_threshold,
+                        max_frames=config.settings.video_max_keyframes,
+                    )
+                except MediaToolError as exc:
+                    if config.settings.video_keyframe_mode != "scene":
+                        raise
+                    logger.warning(
+                        "Scene keyframe extraction failed for item {}: {}. Falling back to interval.",
+                        item.id,
+                        exc,
+                    )
+                    frames, mode, _times = extract_keyframes(
+                        str(media_path),
+                        tmpdir,
+                        mode="interval",
+                        interval_sec=config.settings.video_keyframe_interval_sec,
+                        scene_threshold=config.settings.video_scene_threshold,
+                        max_frames=max(1, min(config.settings.video_max_keyframes, 4)),
+                    )
                 if not frames and config.settings.video_keyframe_mode == "scene":
                     frames, mode, _times = extract_keyframes(
                         str(media_path),
@@ -2172,6 +2213,15 @@ class ContextPersistStep:
 
         # Delete existing non-episode contexts, but preserve user_annotation contexts
         # (user-provided annotations from OpenClaw/API should survive reprocessing)
+        delete_stmt = select(ProcessedContext.id).where(
+            ProcessedContext.user_id == item.user_id,
+            ProcessedContext.is_episode.is_(False),
+            ProcessedContext.source_item_ids.contains([item.id]),
+            ProcessedContext.context_type != "user_annotation",
+        )
+        delete_rows = await config.session.execute(delete_stmt)
+        deleted_context_ids = [str(row[0]) for row in delete_rows.fetchall()]
+
         await config.session.execute(
             delete(ProcessedContext).where(
                 ProcessedContext.user_id == item.user_id,
@@ -2180,6 +2230,11 @@ class ContextPersistStep:
                 ProcessedContext.context_type != "user_annotation",
             )
         )
+        if deleted_context_ids:
+            try:
+                delete_context_embeddings(deleted_context_ids)
+            except Exception as exc:  # pragma: no cover - external service dependency
+                logger.warning("Failed to delete embeddings for item {}: {}", item.id, exc)
 
         context_records: list[ProcessedContext] = []
         event_time = item.event_time_utc or item.captured_at or item.created_at or config.now
@@ -2233,20 +2288,34 @@ class EmbeddingStep:
     version = "v2"
     is_expensive = True
 
+    def _signature(self, model: str, context_records: list[ProcessedContext]) -> str:
+        parts: list[str] = [model]
+        for record in sorted(context_records, key=lambda entry: str(entry.id)):
+            vector_text = record.vector_text or build_vector_text(
+                record.title or "",
+                record.summary or "",
+                record.keywords or [],
+            )
+            parts.append(f"{record.id}:{vector_text}")
+        return hash_parts(parts)
+
     async def run(self, item: SourceItem, artifacts: PipelineArtifacts, config: PipelineConfig) -> None:
         context_ids = artifacts.get("context_ids") or []
         if not context_ids:
             return
         model = config.settings.embedding_model
-        fingerprint = hash_parts([model, ",".join(context_ids)])
-        existing = await artifacts.store.get("embeddings", self.name, model, fingerprint)
-        if existing:
-            return
         context_records = artifacts.get("context_records")
         if not context_records:
             stmt = select(ProcessedContext).where(ProcessedContext.id.in_([UUID(cid) for cid in context_ids]))
             result = await config.session.execute(stmt)
             context_records = result.scalars().all()
+        if not context_records:
+            return
+
+        fingerprint = self._signature(model, list(context_records))
+        existing = await artifacts.store.get("embeddings", self.name, model, fingerprint)
+        if existing:
+            return
 
         try:
             upsert_context_embeddings(context_records)

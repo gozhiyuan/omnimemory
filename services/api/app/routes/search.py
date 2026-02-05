@@ -14,6 +14,7 @@ from ..auth import get_current_user_id
 from ..db.models import ProcessedContext, SourceItem
 from ..db.session import get_session
 from ..vectorstore import search_contexts
+from ..user_settings import resolve_user_tz_offset_minutes
 
 
 router = APIRouter()
@@ -26,18 +27,32 @@ async def search_items(
     start_date: Optional[date] = Query(default=None, description="Filter start date (YYYY-MM-DD)"),
     end_date: Optional[date] = Query(default=None, description="Filter end date (YYYY-MM-DD)"),
     provider: Optional[str] = Query(default=None, description="Filter by source provider"),
+    tz_offset_minutes: Optional[int] = Query(default=None, description="Timezone offset minutes"),
     user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     filter_start: Optional[datetime] = None
     filter_end: Optional[datetime] = None
     if start_date or end_date:
-        range_end = end_date or date.today()
+        offset_now = await resolve_user_tz_offset_minutes(
+            session,
+            user_id,
+            tz_offset_minutes=tz_offset_minutes,
+        )
+        local_today = (datetime.now(timezone.utc) - timedelta(minutes=offset_now)).date()
+        range_end = end_date or local_today
         range_start = start_date or range_end
         if range_start > range_end:
             range_start, range_end = range_end, range_start
-        filter_start = datetime.combine(range_start, time.min, tzinfo=timezone.utc)
-        filter_end = datetime.combine(range_end, time.min, tzinfo=timezone.utc) + timedelta(days=1)
+        offset_minutes = await resolve_user_tz_offset_minutes(
+            session,
+            user_id,
+            tz_offset_minutes=tz_offset_minutes,
+            local_date=range_start,
+        )
+        offset = timedelta(minutes=offset_minutes)
+        filter_start = datetime.combine(range_start, time.min, tzinfo=timezone.utc) + offset
+        filter_end = datetime.combine(range_end, time.min, tzinfo=timezone.utc) + offset + timedelta(days=1)
 
     provider_filter = provider.strip() if provider else None
 

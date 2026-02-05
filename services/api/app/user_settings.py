@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from datetime import date, datetime, time, timezone
+from typing import Any, Mapping, Optional
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from zoneinfo import ZoneInfo
 
 from .db.models import UserSettings
 
@@ -50,6 +52,70 @@ def resolve_preferences(settings: Mapping[str, Any] | None) -> dict[str, Any]:
         return {}
     prefs = settings.get("preferences")
     return prefs if isinstance(prefs, dict) else {}
+
+
+def resolve_timezone_name(settings: Mapping[str, Any] | None) -> Optional[str]:
+    prefs = resolve_preferences(settings)
+    tz_name = prefs.get("timezone")
+    if isinstance(tz_name, str) and tz_name.strip():
+        return tz_name.strip()
+    return None
+
+
+def compute_timezone_offset_minutes(
+    tz_name: str,
+    *,
+    at: Optional[datetime] = None,
+    local_date: Optional[date] = None,
+) -> Optional[int]:
+    try:
+        tzinfo = ZoneInfo(tz_name)
+    except Exception:
+        return None
+
+    if local_date:
+        local_dt = datetime.combine(local_date, time.min, tzinfo=tzinfo)
+        offset = local_dt.utcoffset()
+    else:
+        dt = at or datetime.now(timezone.utc)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local_dt = dt.astimezone(tzinfo)
+        offset = local_dt.utcoffset()
+
+    if offset is None:
+        return None
+    return int(-offset.total_seconds() / 60)
+
+
+def resolve_timezone_offset_minutes(
+    settings: Mapping[str, Any] | None,
+    *,
+    at: Optional[datetime] = None,
+    local_date: Optional[date] = None,
+) -> Optional[int]:
+    tz_name = resolve_timezone_name(settings)
+    if not tz_name:
+        return None
+    return compute_timezone_offset_minutes(tz_name, at=at, local_date=local_date)
+
+
+async def resolve_user_tz_offset_minutes(
+    session: AsyncSession,
+    user_id: UUID,
+    *,
+    tz_offset_minutes: Optional[int] = None,
+    at: Optional[datetime] = None,
+    local_date: Optional[date] = None,
+) -> int:
+    if tz_offset_minutes is not None:
+        try:
+            return int(tz_offset_minutes)
+        except (TypeError, ValueError):
+            return 0
+    settings = await fetch_user_settings(session, user_id)
+    resolved = resolve_timezone_offset_minutes(settings, at=at, local_date=local_date)
+    return int(resolved) if resolved is not None else 0
 
 
 def build_preference_guidance(settings: Mapping[str, Any] | None) -> str:

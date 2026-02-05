@@ -250,10 +250,14 @@ Guidelines:
 You are a personal memory assistant. Answer the user's questions using the provided memories.
 
 Guidelines:
-- Be warm, concise, and helpful.
+- Be warm, clear, and helpful.
 - Use only the provided context. If you are unsure, say you do not have enough information.
+- If relevant memories are provided, do NOT say you lack information; answer using those memories even if coverage is partial.
+- When a resolved time range is provided, use it exactly and do not infer dates from memory recency or absence.
 - When referencing a memory, mention the date/time and the source index in brackets (e.g., [1]).
-- Prefer 2-4 sentences unless the user asks for more detail.
+- For day/week/month recap questions, provide a short summary paragraph plus 3-6 bullet points of key moments.
+- Aim for 5-8 sentences total unless the user asks for less.
+- Do not end mid-sentence; always finish your thought.
 - If the user asks multiple questions, answer each in order.
 - Use first-person perspective when referencing the user's memories.
 """,
@@ -268,6 +272,32 @@ Return JSON ONLY with this exact shape:
   "organizations": [],
   "topics": [],
   "food": []
+}
+
+Query:
+{{query}}
+""",
+
+    "date_range": """\
+You extract the intended local date range from a user query.
+
+Inputs:
+- query: the user's message
+- now_iso: current local datetime (ISO 8601) for interpreting relative terms
+- tz_offset_minutes: local offset minutes from UTC (e.g., -480, +330)
+
+Rules:
+- Interpret relative phrases (today, yesterday, day before yesterday, last week, this month, etc.) using now_iso.
+- Output a date range in local calendar dates only.
+- start_date is inclusive.
+- end_date is exclusive (the day after the last intended day).
+- For a single day, end_date must be the next day.
+- If no date range is implied, return nulls.
+
+Return JSON ONLY with this exact shape:
+{
+  "start_date": "YYYY-MM-DD" | null,
+  "end_date": "YYYY-MM-DD" | null
 }
 
 Query:
@@ -404,5 +434,39 @@ Guidelines:
 - Offer relevant follow-up suggestions
 - Be conversational but concise
 - If there are pending write actions, mention they need confirmation
+""",
+
+    "query_intent": """\
+Classify the user's query into one of these intents:
+
+**meta_question**: Question about current date/time, system stats, or capabilities. PRIORITIZE this if the query asks about date/time.
+- Examples: "what is today's date", "hi what is today's date", "what day is it"
+
+**greeting**: Simple greeting WITHOUT any question
+- Examples: "hi", "hello", "good morning"
+
+**clarification**: Follow-up about a previous response
+- Examples: "tell me more", "what do you mean"
+
+**memory_query**: User wants to recall or search their memories (DEFAULT)
+- Examples: "what did I do yesterday", "show me photos from Paris"
+
+Return JSON ONLY:
+{"intent": "memory_query" | "meta_question" | "greeting" | "clarification"}
+
+Query:
+{{query}}
+""",
+
+    "rerank": """\
+Given the user's query and candidate memories, return the indices of the most relevant memories in order of relevance.
+
+Query: {{query}}
+
+Candidates:
+{{candidates}}
+
+Return JSON array of indices (0-indexed), most relevant first:
+{"ranking": [0, 3, 1, ...]}
 """,
 }

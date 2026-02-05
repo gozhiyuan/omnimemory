@@ -28,6 +28,7 @@ from ..db.models import (
 from ..db.session import get_session
 from ..google_photos import get_valid_access_token
 from ..storage import get_storage_provider
+from ..user_settings import resolve_user_tz_offset_minutes
 
 
 router = APIRouter()
@@ -93,22 +94,39 @@ async def get_dashboard_stats(
     session: AsyncSession = Depends(get_session),
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    tz_offset_minutes: Optional[int] = None,
 ) -> DashboardStats:
     """Return aggregate counts used by the dashboard cards."""
 
     settings = get_settings()
     since = datetime.utcnow() - timedelta(days=7)
-    range_end = end_date or date.today()
+    offset_now = await resolve_user_tz_offset_minutes(
+        session,
+        user_id,
+        tz_offset_minutes=tz_offset_minutes,
+    )
+    local_today = (datetime.now(timezone.utc) - timedelta(minutes=offset_now)).date()
+    range_end = end_date or local_today
     range_start = start_date or (range_end - timedelta(days=6))
     if range_start > range_end:
         range_start, range_end = range_end, range_start
-    cache_key = f"dashboard:stats:v1:{user_id}:{range_start.isoformat()}:{range_end.isoformat()}"
+    offset_minutes = await resolve_user_tz_offset_minutes(
+        session,
+        user_id,
+        tz_offset_minutes=tz_offset_minutes,
+        local_date=range_start,
+    )
+    offset_delta = timedelta(minutes=offset_minutes)
+    cache_key = (
+        f"dashboard:stats:v1:{user_id}:{range_start.isoformat()}:{range_end.isoformat()}"
+        f":{offset_minutes}"
+    )
     if settings.dashboard_cache_ttl_seconds > 0:
         cached = await get_cache_json(cache_key)
         if cached:
             return DashboardStats.model_validate(cached)
-    range_start_dt = datetime.combine(range_start, time.min, tzinfo=timezone.utc)
-    range_end_dt = datetime.combine(range_end, time.min, tzinfo=timezone.utc) + timedelta(days=1)
+    range_start_dt = datetime.combine(range_start, time.min, tzinfo=timezone.utc) + offset_delta
+    range_end_dt = datetime.combine(range_end, time.min, tzinfo=timezone.utc) + offset_delta + timedelta(days=1)
     total_items_stmt = select(func.count(SourceItem.id)).where(
         SourceItem.user_id == user_id,
         SourceItem.processing_status == "completed",
@@ -147,7 +165,7 @@ async def get_dashboard_stats(
     )
 
     activity_stmt = (
-        select(func.date(SourceItem.created_at).label("day"), func.count(SourceItem.id))
+        select(func.date(SourceItem.created_at - offset_delta).label("day"), func.count(SourceItem.id))
         .where(
             SourceItem.user_id == user_id,
             SourceItem.processing_status == "completed",
@@ -177,7 +195,7 @@ async def get_dashboard_stats(
 
     usage_daily_stmt = (
         select(
-            func.date(AiUsageEvent.created_at).label("day"),
+            func.date(AiUsageEvent.created_at - offset_delta).label("day"),
             func.coalesce(func.sum(AiUsageEvent.total_tokens), 0).label("total_tokens"),
             func.coalesce(func.sum(AiUsageEvent.cost_usd), 0.0).label("cost_usd"),
         )

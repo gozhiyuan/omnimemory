@@ -127,48 +127,47 @@ async function promptEnvValues(existing: EnvConfig): Promise<EnvConfig> {
 
   console.log();
 
-  // Storage provider
-  console.log(chalk.bold("Storage Provider"));
+  // Model selection
+  console.log(chalk.bold("AI Model Configuration"));
   console.log();
 
-  const storage = await select({
-    message: "Choose storage provider:",
-    choices: [
-      {
-        name: "Local (RustFS) - S3-compatible, runs in Docker. Best for development.",
-        value: "s3",
-      },
-      {
-        name: "Cloud (Supabase) - Managed storage. Best for production.",
-        value: "supabase",
-      },
-    ],
-    default: values.STORAGE_PROVIDER || "s3",
+  const promptModelChoices = [
+    { name: "gemini-2.5-flash-lite (Fastest, lowest cost)", value: "gemini-2.5-flash-lite" },
+    { name: "gemini-2.5-flash (Balanced speed and quality)", value: "gemini-2.5-flash" },
+    { name: "gemini-2.5-pro (Higher quality)", value: "gemini-2.5-pro" },
+    { name: "gemini-3-pro-preview (Latest, experimental)", value: "gemini-3-pro-preview" },
+  ];
+
+  const agentPromptModel = await select({
+    message: "Agent prompt model (for chat/reasoning):",
+    choices: promptModelChoices,
+    default: values.AGENT_PROMPT_MODEL || "gemini-2.5-flash",
   });
-  values.STORAGE_PROVIDER = storage;
+  values.AGENT_PROMPT_MODEL = agentPromptModel;
 
-  if (storage === "supabase") {
-    console.log();
-    console.log(chalk.cyan.bold("Supabase Configuration"));
+  const videoUnderstandingModel = await select({
+    message: "Video understanding model (for media analysis):",
+    choices: promptModelChoices,
+    default: values.VIDEO_UNDERSTANDING_MODEL || "gemini-2.5-flash",
+  });
+  values.VIDEO_UNDERSTANDING_MODEL = videoUnderstandingModel;
 
-    values.SUPABASE_URL = await input({
-      message: "Supabase URL:",
-      default: values.SUPABASE_URL || "",
-      validate: (v) => !!v || "Supabase URL is required",
-    });
+  const imageModelChoices = [
+    { name: "gemini-2.5-flash-image (Fast image generation)", value: "gemini-2.5-flash-image" },
+    { name: "gemini-3-pro-image-preview (Latest, experimental)", value: "gemini-3-pro-image-preview" },
+  ];
 
-    const anonKey = await password({
-      message: "Supabase anon key:",
-      mask: "*",
-    });
-    values.SUPABASE_ANON_KEY = anonKey || values.SUPABASE_ANON_KEY || "";
+  const agentImageModel = await select({
+    message: "Image generation model:",
+    choices: imageModelChoices,
+    default: values.AGENT_IMAGE_MODEL || "gemini-2.5-flash-image",
+  });
+  values.AGENT_IMAGE_MODEL = agentImageModel;
 
-    const serviceKey = await password({
-      message: "Supabase service role key:",
-      mask: "*",
-    });
-    values.SUPABASE_SERVICE_ROLE_KEY = serviceKey || values.SUPABASE_SERVICE_ROLE_KEY || "";
-  }
+  console.log();
+
+  // Storage provider - always use local S3
+  values.STORAGE_PROVIDER = "s3";
 
   console.log();
 
@@ -192,32 +191,6 @@ async function promptEnvValues(existing: EnvConfig): Promise<EnvConfig> {
       mask: "*",
     });
     values.GOOGLE_PHOTOS_CLIENT_SECRET = clientSecret || values.GOOGLE_PHOTOS_CLIENT_SECRET || "";
-  }
-
-  console.log();
-
-  // Google Cloud APIs (optional)
-  const enableGoogleCloud = await confirm({
-    message: "Enable Google Cloud APIs (Vision OCR, Maps)?",
-    default: false,
-  });
-
-  if (enableGoogleCloud) {
-    console.log();
-    console.log(chalk.cyan.bold("Google Cloud APIs"));
-
-    const existingGoogleKey = values.OCR_GOOGLE_API_KEY || values.MAPS_GOOGLE_API_KEY || "";
-    if (existingGoogleKey) {
-      console.log(chalk.dim(`  Current: ${existingGoogleKey.slice(0, 10)}...`));
-    }
-
-    const googleApiKey = await password({
-      message: "Google API key:",
-      mask: "*",
-    });
-
-    values.OCR_GOOGLE_API_KEY = googleApiKey || existingGoogleKey;
-    values.MAPS_GOOGLE_API_KEY = googleApiKey || existingGoogleKey;
   }
 
   console.log();

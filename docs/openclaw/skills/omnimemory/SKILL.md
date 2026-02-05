@@ -77,6 +77,25 @@ Use OmniMemory tools when the user:
 
 ## Available Tools
 
+### Shared Toolset (Recommended)
+
+Use the provided scripts as the canonical tool interface. These scripts map cleanly to the Memory API
+and keep agent behavior consistent across OpenClaw and OmniMemory.
+
+- `./omnimemory_search.sh` → `POST /memory/search`
+- `./omnimemory_timeline.sh` → `GET /memory/timeline/{date}`
+- `./omnimemory_settings.sh` → `GET/SET /settings/*`
+- `./omnimemory_prompt.sh` → `GET/UPDATE /settings/prompts`
+
+### Memory API (v1)
+
+Stable endpoints for agent/tooling access:
+
+- `POST /memory/search`
+- `GET /memory/timeline/{date}`
+- `GET /memory/episode/{episode_id}`
+- `GET /memory/context/{context_id}`
+
 ### omnimemory_search
 
 Search memories by natural language query. Supports date ranges.

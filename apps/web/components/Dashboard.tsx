@@ -6,7 +6,7 @@ import { PageMotion } from './PageMotion';
 import { DashboardRecentItem, DashboardStatsResponse, TimelineFocus } from '../types';
 import { useSettings } from '../contexts/SettingsContext';
 import { useI18n } from '../i18n/useI18n';
-import { addDaysZoned, dateKeyToDate, formatDateKey, toZonedDate } from '../utils/time';
+import { addDaysZoned, dateKeyToDate, formatDateKey, getTimeZoneOffsetMinutes, toZonedDate } from '../utils/time';
 
 const StatCard = ({ title, value, icon, subtext }: { title: string, value: string | number, icon: React.ReactNode, subtext?: string }) => (
   <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100 flex items-start space-x-4 hover:shadow-md transition-shadow">
@@ -186,6 +186,11 @@ export const Dashboard: React.FC<DashboardProps> = ({ onOpenTimeline }) => {
         const query = new URLSearchParams();
         if (normalizedRange?.start) query.set('start_date', normalizedRange.start);
         if (normalizedRange?.end) query.set('end_date', normalizedRange.end);
+        if (normalizedRange?.start) {
+          const startDate = dateKeyToDate(normalizedRange.start, timeZone) ?? new Date();
+          const offsetMinutes = getTimeZoneOffsetMinutes(startDate, timeZone);
+          query.set('tz_offset_minutes', offsetMinutes.toString());
+        }
         const path = query.toString() ? `/dashboard/stats?${query.toString()}` : '/dashboard/stats';
         const data = await apiGet<DashboardStatsResponse>(path);
         if (mounted) {

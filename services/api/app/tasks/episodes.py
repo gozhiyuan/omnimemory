@@ -33,6 +33,7 @@ from ..user_settings import (
     fetch_user_settings,
     resolve_language_code,
     resolve_language_label,
+    resolve_timezone_offset_minutes,
 )
 from ..vectorstore import delete_context_embeddings, search_contexts, upsert_context_embeddings
 from ..integrations.openclaw_sync import get_openclaw_sync
@@ -60,6 +61,15 @@ def _coerce_event_time(value: Optional[datetime]) -> datetime:
     if value is None:
         return datetime.now(timezone.utc)
     return ensure_tz_aware(value)
+
+
+def _parse_client_offset(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _truncate_text(value: str, limit: int) -> str:
@@ -693,6 +703,16 @@ async def _update_episode_for_item(item_id: str) -> dict[str, Any]:
 
         primary = _primary_context(item_contexts)
         event_time = _coerce_event_time(item.event_time_utc or item.captured_at or item.created_at)
+        metadata_offset: Optional[int] = None
+        metadata_stmt = select(ProcessedContent.data).where(
+            ProcessedContent.item_id == item.id,
+            ProcessedContent.content_role == "metadata",
+        )
+        metadata_row = await session.execute(metadata_stmt)
+        metadata = metadata_row.scalar_one_or_none()
+        if isinstance(metadata, dict):
+            metadata_offset = _parse_client_offset(metadata.get("client_tz_offset_minutes"))
+        settings_offset = resolve_timezone_offset_minutes(user_settings, at=event_time)
 
         episode_id: Optional[str] = None
         episode_contexts: list[ProcessedContext] = []
@@ -930,6 +950,7 @@ async def _update_episode_for_item(item_id: str) -> dict[str, Any]:
         await session.flush()
         upsert_context_embeddings(episode_records)
         summary_date = start_time.date()
+        summary_date_locked = False
         summary_context: Optional[ProcessedContext] = None
         summary_tz_offset: Optional[int] = None
         summary_context_stmt = select(ProcessedContext).where(
@@ -950,6 +971,7 @@ async def _update_episode_for_item(item_id: str) -> dict[str, Any]:
                 if date_value:
                     try:
                         summary_date = date.fromisoformat(date_value)
+                        summary_date_locked = True
                     except ValueError:
                         summary_date = start_time.date()
                 offset_value = versions.get("tz_offset_minutes")
@@ -958,6 +980,10 @@ async def _update_episode_for_item(item_id: str) -> dict[str, Any]:
                         summary_tz_offset = int(offset_value)
                     except (TypeError, ValueError):
                         summary_tz_offset = None
+        if summary_tz_offset is None:
+            summary_tz_offset = metadata_offset or settings_offset
+        if summary_tz_offset is not None and not summary_date_locked:
+            summary_date = (start_time - timedelta(minutes=summary_tz_offset)).date()
 
         await _update_daily_summary(
             session,

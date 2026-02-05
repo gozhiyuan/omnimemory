@@ -7,6 +7,7 @@ These endpoints return concise, tool-friendly response formats.
 from __future__ import annotations
 
 import asyncio
+import mimetypes
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Optional
 from uuid import UUID
@@ -30,12 +31,53 @@ from ..db.session import get_session
 from ..storage import get_storage_provider
 from ..vectorstore import search_contexts
 from ..pipeline.utils import ensure_tz_aware
+from ..rag import retrieve_context_hits
 from ..ai.prompt_manager import get_prompt_manager
 from ..ai.prompt_manifest import get_prompt_names, get_api_updatable_prompts, get_prompt_spec
-from ..user_settings import fetch_user_settings, resolve_annotation_defaults
+from ..user_settings import (
+    fetch_user_settings,
+    resolve_annotation_defaults,
+    resolve_user_tz_offset_minutes,
+)
 
 
 router = APIRouter()
+
+
+_CONTENT_TYPE_OVERRIDES = {
+    "heic": "image/heic",
+    "heif": "image/heif",
+    "heic-sequence": "image/heic-sequence",
+    "heif-sequence": "image/heif-sequence",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "webp": "image/webp",
+    "gif": "image/gif",
+    "mp4": "video/mp4",
+    "mov": "video/quicktime",
+    "m4v": "video/x-m4v",
+    "mp3": "audio/mpeg",
+    "wav": "audio/wav",
+    "m4a": "audio/mp4",
+    "aac": "audio/aac",
+}
+
+
+def _infer_content_type(storage_key: Optional[str], original_filename: Optional[str]) -> Optional[str]:
+    """Infer content type from filename or storage key."""
+    candidates = [original_filename or "", storage_key or ""]
+    for value in candidates:
+        if not value or "." not in value:
+            continue
+        ext = value.rsplit(".", 1)[-1].lower()
+        override = _CONTENT_TYPE_OVERRIDES.get(ext)
+        if override:
+            return override
+        guessed, _ = mimetypes.guess_type(value)
+        if guessed:
+            return guessed
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +93,7 @@ class OpenClawSearchRequest(BaseModel):
     date_to: Optional[str] = None
     context_types: Optional[list[str]] = None
     limit: int = 10
+    tz_offset_minutes: Optional[int] = None
 
 
 class OpenClawMemoryItem(BaseModel):
@@ -60,6 +103,8 @@ class OpenClawMemoryItem(BaseModel):
     title: str
     summary: str  # Truncated to 500 chars
     date: Optional[str]
+    local_date: Optional[str] = None
+    local_time: Optional[str] = None
     type: str
     thumbnail_url: Optional[str]
     keywords: list[str]
@@ -138,6 +183,134 @@ class OpenClawConnectionTestResponse(BaseModel):
     success: bool
     message: str
     version: str = "1.0.0"
+
+
+async def _resolve_openclaw_date_filters(
+    request: OpenClawSearchRequest,
+    *,
+    session: AsyncSession,
+    user_id: UUID,
+) -> tuple[Optional[datetime], Optional[datetime], timedelta]:
+    filter_start: Optional[datetime] = None
+    filter_end: Optional[datetime] = None
+
+    local_date: Optional[date] = None
+    if request.date_from:
+        try:
+            start_date = date.fromisoformat(request.date_from)
+            local_date = start_date
+        except ValueError:
+            pass
+    if request.date_to:
+        try:
+            end_date = date.fromisoformat(request.date_to)
+            local_date = local_date or end_date
+        except ValueError:
+            pass
+
+    if local_date or request.tz_offset_minutes is not None:
+        offset_minutes = await resolve_user_tz_offset_minutes(
+            session,
+            user_id,
+            tz_offset_minutes=request.tz_offset_minutes,
+            local_date=local_date,
+        )
+    else:
+        offset_minutes = 0
+    offset = timedelta(minutes=offset_minutes)
+
+    if request.date_from:
+        try:
+            start_date = date.fromisoformat(request.date_from)
+            filter_start = datetime.combine(start_date, time.min, tzinfo=timezone.utc) + offset
+        except ValueError:
+            filter_start = None
+
+    if request.date_to:
+        try:
+            end_date = date.fromisoformat(request.date_to)
+            filter_end = datetime.combine(end_date, time.min, tzinfo=timezone.utc) + offset + timedelta(days=1)
+        except ValueError:
+            filter_end = None
+
+    return filter_start, filter_end, offset
+
+
+async def _build_openclaw_search_items(
+    *,
+    session: AsyncSession,
+    user_id: UUID,
+    results: list[dict[str, Any]],
+    offset: timedelta,
+    context_types: Optional[list[str]] = None,
+) -> OpenClawSearchResponse:
+    context_ids: list[UUID] = []
+    for result in results:
+        try:
+            context_ids.append(UUID(result["context_id"]))
+        except (KeyError, ValueError, TypeError):
+            continue
+
+    contexts_by_id: dict[UUID, ProcessedContext] = {}
+    if context_ids:
+        stmt = select(ProcessedContext).where(ProcessedContext.id.in_(context_ids))
+        db_results = await session.execute(stmt)
+        contexts_by_id = {context.id: context for context in db_results.scalars().all()}
+
+    if context_types:
+        contexts_by_id = {
+            cid: ctx
+            for cid, ctx in contexts_by_id.items()
+            if ctx.context_type in context_types
+        }
+
+    all_source_ids: set[UUID] = set()
+    for context in contexts_by_id.values():
+        all_source_ids.update(context.source_item_ids)
+
+    thumbnail_urls = await _get_thumbnail_urls(session, list(all_source_ids))
+
+    items: list[OpenClawMemoryItem] = []
+    for result in results:
+        context_id_raw = result.get("context_id")
+        try:
+            context_id = UUID(context_id_raw)
+        except (TypeError, ValueError):
+            continue
+
+        context = contexts_by_id.get(context_id)
+        if not context:
+            continue
+
+        thumbnail_url = None
+        for source_id in context.source_item_ids:
+            if source_id in thumbnail_urls:
+                thumbnail_url = thumbnail_urls[source_id]
+                break
+
+        event_time = ensure_tz_aware(context.event_time_utc) if context.event_time_utc else None
+        local_time = (event_time - offset) if event_time else None
+        score = result.get("combined_score") or result.get("score")
+        items.append(
+            OpenClawMemoryItem(
+                id=str(context.id),
+                title=context.title or "Untitled",
+                summary=(context.summary or "")[:500],
+                date=event_time.isoformat() if event_time else None,
+                local_date=local_time.date().isoformat() if local_time else None,
+                local_time=local_time.isoformat() if local_time else None,
+                type=context.context_type or "unknown",
+                thumbnail_url=thumbnail_url,
+                keywords=(context.keywords or [])[:10],
+                score=float(score) if score is not None else None,
+            )
+        )
+
+    return OpenClawSearchResponse(
+        success=True,
+        total=len(items),
+        items=items,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -253,23 +426,11 @@ async def search_for_openclaw(
 
     Returns truncated summaries and thumbnail URLs for efficient display.
     """
-    # Parse date filters
-    filter_start: Optional[datetime] = None
-    filter_end: Optional[datetime] = None
-
-    if request.date_from:
-        try:
-            start_date = date.fromisoformat(request.date_from)
-            filter_start = datetime.combine(start_date, time.min, tzinfo=timezone.utc)
-        except ValueError:
-            pass
-
-    if request.date_to:
-        try:
-            end_date = date.fromisoformat(request.date_to)
-            filter_end = datetime.combine(end_date, time.min, tzinfo=timezone.utc) + timedelta(days=1)
-        except ValueError:
-            pass
+    filter_start, filter_end, offset = await _resolve_openclaw_date_filters(
+        request,
+        session=session,
+        user_id=user_id,
+    )
 
     # Search contexts using vector search
     results = search_contexts(
@@ -303,72 +464,50 @@ async def search_for_openclaw(
             if len(results) >= request.limit:
                 break
 
-    # Fetch context details from database
-    context_ids: list[UUID] = []
-    for result in results:
-        try:
-            context_ids.append(UUID(result["context_id"]))
-        except (KeyError, ValueError, TypeError):
-            continue
+    return await _build_openclaw_search_items(
+        session=session,
+        user_id=user_id,
+        results=results,
+        offset=offset,
+        context_types=request.context_types,
+    )
 
-    contexts_by_id: dict[UUID, ProcessedContext] = {}
-    if context_ids:
-        stmt = select(ProcessedContext).where(ProcessedContext.id.in_(context_ids))
-        db_results = await session.execute(stmt)
-        contexts_by_id = {context.id: context for context in db_results.scalars().all()}
 
-    # Filter by context types if specified
-    if request.context_types:
-        contexts_by_id = {
-            cid: ctx
-            for cid, ctx in contexts_by_id.items()
-            if ctx.context_type in request.context_types
-        }
+@router.post("/search-advanced", response_model=OpenClawSearchResponse)
+async def search_for_openclaw_advanced(
+    request: OpenClawSearchRequest,
+    user_id: UUID = Depends(get_current_user_id),
+    session: AsyncSession = Depends(get_session),
+) -> OpenClawSearchResponse:
+    """Search memories using the same RAG pipeline as chat."""
+    settings = get_settings()
+    filter_start, filter_end, offset = await _resolve_openclaw_date_filters(
+        request,
+        session=session,
+        user_id=user_id,
+    )
+    date_range_override = None
+    if filter_start and filter_end:
+        date_range_override = (filter_start, filter_end)
 
-    # Get thumbnail URLs for items
-    all_source_ids: set[UUID] = set()
-    for context in contexts_by_id.values():
-        all_source_ids.update(context.source_item_ids)
+    _, _, hits = await retrieve_context_hits(
+        request.query,
+        user_id=user_id,
+        top_k=request.limit,
+        settings=settings,
+        tz_offset_minutes=request.tz_offset_minutes,
+        session=session,
+        date_range_override=date_range_override,
+        start_time_override=filter_start,
+        end_time_override=filter_end,
+    )
 
-    thumbnail_urls = await _get_thumbnail_urls(session, list(all_source_ids))
-
-    # Build response items
-    items: list[OpenClawMemoryItem] = []
-    for result in results:
-        context_id_raw = result.get("context_id")
-        try:
-            context_id = UUID(context_id_raw)
-        except (TypeError, ValueError):
-            continue
-
-        context = contexts_by_id.get(context_id)
-        if not context:
-            continue
-
-        # Get first available thumbnail from source items
-        thumbnail_url = None
-        for source_id in context.source_item_ids:
-            if source_id in thumbnail_urls:
-                thumbnail_url = thumbnail_urls[source_id]
-                break
-
-        items.append(
-            OpenClawMemoryItem(
-                id=str(context.id),
-                title=context.title or "Untitled",
-                summary=(context.summary or "")[:500],  # Truncate for tool response
-                date=context.event_time_utc.isoformat() if context.event_time_utc else None,
-                type=context.context_type or "unknown",
-                thumbnail_url=thumbnail_url,
-                keywords=(context.keywords or [])[:10],  # Limit keywords
-                score=result.get("score"),
-            )
-        )
-
-    return OpenClawSearchResponse(
-        success=True,
-        total=len(items),
-        items=items,
+    return await _build_openclaw_search_items(
+        session=session,
+        user_id=user_id,
+        results=hits,
+        offset=offset,
+        context_types=request.context_types,
     )
 
 
@@ -377,7 +516,7 @@ async def timeline_for_openclaw(
     date_str: str,
     user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
-    tz_offset_minutes: int = 0,
+    tz_offset_minutes: Optional[int] = None,
 ) -> OpenClawTimelineResponse:
     """Get day summary with episodes formatted for OpenClaw tools."""
     try:
@@ -385,7 +524,13 @@ async def timeline_for_openclaw(
     except ValueError:
         raise HTTPException(status_code=400, detail=f"Invalid date format: {date_str}")
 
-    offset = timedelta(minutes=tz_offset_minutes)
+    offset_minutes = await resolve_user_tz_offset_minutes(
+        session,
+        user_id,
+        tz_offset_minutes=tz_offset_minutes,
+        local_date=target_date,
+    )
+    offset = timedelta(minutes=offset_minutes)
     start_dt = datetime.combine(target_date, time.min, tzinfo=timezone.utc) + offset
     end_dt = start_dt + timedelta(days=1)
 
@@ -453,7 +598,9 @@ async def timeline_for_openclaw(
         for ctx in contexts:
             source_ids.update(ctx.source_item_ids)
 
-        time_range = f"{start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')}"
+        local_start = start_time - offset
+        local_end = end_time - offset
+        time_range = f"{local_start.strftime('%H:%M')} - {local_end.strftime('%H:%M')}"
 
         episodes.append(
             OpenClawEpisode(
@@ -509,6 +656,10 @@ async def ingest_from_openclaw(
         except ValueError:
             pass
 
+    content_type = (request.content_type or "").strip() or None
+    if not content_type:
+        content_type = _infer_content_type(request.storage_key, request.original_filename)
+
     # Create source item
     now = datetime.now(timezone.utc)
     item = SourceItem(
@@ -518,7 +669,7 @@ async def ingest_from_openclaw(
         provider=request.provider,
         captured_at=captured_at,
         event_time_utc=captured_at,
-        content_type=request.content_type,
+        content_type=content_type,
         original_filename=request.original_filename,
         processing_status="pending",
         created_at=now,
@@ -563,6 +714,8 @@ async def ingest_from_openclaw(
         "user_id": str(user_id),
         "storage_key": request.storage_key,
     }
+    if content_type:
+        task_payload["content_type"] = content_type
     if merged_context:
         task_payload["openclaw_context"] = merged_context
 

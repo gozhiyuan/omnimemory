@@ -212,10 +212,15 @@ const buildDateRange = (start: Date, end: Date, timeZone: string) => {
   return dates;
 };
 
-const buildMonthGrid = (anchor: Date, timeZone: string) => {
+const getMonthGridRange = (anchor: Date, timeZone: string) => {
   const gridStart = startOfWeek(startOfMonth(anchor, timeZone), timeZone);
   const gridEnd = endOfWeek(endOfMonth(anchor, timeZone), timeZone);
-  return buildDateRange(gridStart, gridEnd, timeZone);
+  return { start: gridStart, end: gridEnd };
+};
+
+const buildMonthGrid = (anchor: Date, timeZone: string) => {
+  const { start, end } = getMonthGridRange(anchor, timeZone);
+  return buildDateRange(start, end, timeZone);
 };
 
 const isSameMonth = (value: Date, anchor: Date, timeZone: string) => {
@@ -292,7 +297,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
-  const [pendingSelection, setPendingSelection] = useState<{ itemId?: string; episodeContextId?: string } | null>(null);
+  const [pendingSelection, setPendingSelection] = useState<{ itemId?: string; episodeContextId?: string; episodeId?: string; anchorDate?: string } | null>(null);
 
   const showHighlights = timelinePrefs.showHighlights;
   const showEpisodes = timelinePrefs.showEpisodes;
@@ -358,6 +363,13 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     return { start: startOfYear(anchorDate, timeZone), end: endOfYear(anchorDate, timeZone) };
   }, [viewMode, anchorDate, timeZone]);
 
+  const queryRange = useMemo(() => {
+    if (viewMode === 'month') {
+      return getMonthGridRange(anchorDate, timeZone);
+    }
+    return range;
+  }, [viewMode, anchorDate, timeZone, range]);
+
   useEffect(() => {
     if (previousTimeZone.current === timeZone) {
       return;
@@ -381,11 +393,11 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
       setLoading(true);
       setError(null);
       try {
-        const tzOffsetMinutes = getTimeZoneOffsetMinutes(range.start, timeZone);
+        const tzOffsetMinutes = getTimeZoneOffsetMinutes(queryRange.start, timeZone);
         const limit = viewMode === 'day' ? '1' : '600';
         const query = new URLSearchParams({
-          start_date: formatDateKey(range.start, timeZone),
-          end_date: formatDateKey(range.end, timeZone),
+          start_date: formatDateKey(queryRange.start, timeZone),
+          end_date: formatDateKey(queryRange.end, timeZone),
           limit,
           tz_offset_minutes: tzOffsetMinutes.toString(),
         });
@@ -407,7 +419,7 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     return () => {
       mounted = false;
     };
-  }, [range, reloadKey, viewMode, timeZone]);
+  }, [queryRange, reloadKey, viewMode, timeZone]);
 
   useEffect(() => {
     if (viewInitialized) {
@@ -438,10 +450,15 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
         setAnchorDate(toZonedDate(parsed, timeZone));
       }
     }
-    if (focus.itemId || focus.episodeContextId) {
+    if (focus.itemId || focus.episodeContextId || focus.episodeId) {
       setSelectedEpisodeId(null);
       setSelectedItemId(null);
-      setPendingSelection({ itemId: focus.itemId, episodeContextId: focus.episodeContextId });
+      setPendingSelection({
+        itemId: focus.itemId,
+        episodeContextId: focus.episodeContextId,
+        episodeId: focus.episodeId,
+        anchorDate: focus.anchorDate,
+      });
     }
     if (focus.viewMode === 'all') {
       setSelectedEpisodeId(null);
@@ -726,10 +743,13 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     [anchorDate, timeZone]
   );
 
-  const rangeTotal = useMemo(
-    () => days.reduce((sum, day) => sum + day.item_count, 0),
-    [days]
-  );
+  const rangeTotal = useMemo(() => {
+    return rangeDates.reduce((sum, date) => {
+      const key = formatDateKey(date, timeZone);
+      const day = dayLookup.get(key);
+      return sum + (day?.item_count ?? 0);
+    }, 0);
+  }, [rangeDates, dayLookup, timeZone]);
 
   const monthTotals = useMemo(() => {
     const totals = Array.from({ length: 12 }, () => 0);
@@ -953,7 +973,10 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
       setSearchLoading(true);
       setSearchError(null);
       try {
-        const data = await apiGet<SearchResponse>(`/search?q=${encodeURIComponent(trimmed)}&limit=8`);
+        const offsetMinutes = getTimeZoneOffsetMinutes(new Date(), timeZone);
+        const data = await apiGet<SearchResponse>(
+          `/search?q=${encodeURIComponent(trimmed)}&limit=8&tz_offset_minutes=${offsetMinutes}`
+        );
         if (mounted) {
           setSearchResults(data.results || []);
         }
@@ -977,8 +1000,41 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
     if (!pendingSelection) {
       return;
     }
-    if (pendingSelection.episodeContextId) {
+
+    // Priority 1: Direct episode_id match (most reliable)
+    if (pendingSelection.episodeId) {
       const match = days
+        .flatMap((day) => day.episodes ?? [])
+        .find((episode) => episode.episode_id === pendingSelection.episodeId);
+      if (match) {
+        setSelectedEpisodeId(match.episode_id);
+        setSelectedItemId(null);
+        setPendingSelection(null);
+        return;
+      }
+    }
+
+    // Priority 2: Episode context_id match, constrained by anchor date if available
+    if (pendingSelection.episodeContextId) {
+      let candidateDays = days;
+      // If we have an anchor date, search that day first to avoid wrong-day matches
+      if (pendingSelection.anchorDate) {
+        const anchorDayKey = pendingSelection.anchorDate.split('T')[0];
+        const anchorDay = days.find((d) => d.date === anchorDayKey);
+        if (anchorDay) {
+          const anchorMatch = (anchorDay.episodes ?? []).find((episode) =>
+            episode.context_ids?.includes(pendingSelection.episodeContextId ?? '')
+          );
+          if (anchorMatch) {
+            setSelectedEpisodeId(anchorMatch.episode_id);
+            setSelectedItemId(null);
+            setPendingSelection(null);
+            return;
+          }
+        }
+      }
+      // Fall back to searching all days
+      const match = candidateDays
         .flatMap((day) => day.episodes ?? [])
         .find((episode) => episode.context_ids?.includes(pendingSelection.episodeContextId ?? ''));
       if (match) {
@@ -988,6 +1044,8 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
         return;
       }
     }
+
+    // Priority 3: Item ID match
     if (pendingSelection.itemId) {
       const match = days
         .flatMap((day) => day.episodes ?? [])
@@ -1275,6 +1333,9 @@ export const Timeline: React.FC<TimelineProps> = ({ focus, onFocusHandled }) => 
       setDetail(null);
       setSelectedEpisodeId(null);
       setEpisodeDetail(null);
+      return;
+    }
+    if (pendingSelection) {
       return;
     }
     if (selectedEpisodeId && sortedDayEpisodes.some((episode) => episode.episode_id === selectedEpisodeId)) {

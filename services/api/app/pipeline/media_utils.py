@@ -89,7 +89,8 @@ def extract_keyframes(
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     output_pattern = str(Path(output_dir) / "frame_%05d.jpg")
     if mode == "scene":
-        vf = f"select='gt(scene,{scene_threshold})',showinfo"
+        # Use escaped comma for ffmpeg filter parsing (no shell quoting here).
+        vf = f"select=gt(scene\\,{scene_threshold}),showinfo"
     else:
         vf = f"fps=1/{interval_sec},showinfo"
     args = [
@@ -109,7 +110,12 @@ def extract_keyframes(
     try:
         result = _run_command(args)
     except (OSError, subprocess.CalledProcessError) as exc:
-        raise MediaToolError(f"ffmpeg keyframe extraction failed: {exc}") from exc
+        detail = ""
+        if isinstance(exc, subprocess.CalledProcessError):
+            stderr = (exc.stderr or "").strip()
+            if stderr:
+                detail = f" | stderr: {stderr[:500]}"
+        raise MediaToolError(f"ffmpeg keyframe extraction failed: {exc}{detail}") from exc
 
     times = [float(m.group(1)) for m in re.finditer(r"pts_time:([0-9.]+)", result.stderr)]
     files = sorted(Path(output_dir).glob("frame_*.jpg"))

@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import math
+import re
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..ai import analyze_image_with_vlm, generate_image_with_gemini, summarize_text_with_gemini
@@ -20,6 +23,7 @@ from ..ai.prompts import (
     build_lifelog_day_insights_agent_prompt,
     build_lifelog_image_prompt,
     build_lifelog_session_title_prompt,
+    build_lifelog_surprise_agent_prompt,
 )
 from ..auth import get_current_user_id
 from ..chat import build_query_plan_with_parsed, plan_retrieval
@@ -120,6 +124,7 @@ class ChatAttachmentResponse(BaseModel):
 class AgentImageRequest(BaseModel):
     session_id: Optional[UUID] = None
     date: Optional[str] = None
+    end_date: Optional[str] = None
     prompt: Optional[str] = None
     tz_offset_minutes: Optional[int] = None
 
@@ -139,6 +144,21 @@ class AgentImageResponse(BaseModel):
     attachments: list[ChatAttachmentOut] = []
     prompt: Optional[str] = None
     caption: Optional[str] = None
+    sources: list[ChatSource] = []
+
+
+class AgentSurpriseRequest(BaseModel):
+    session_id: Optional[UUID] = None
+    date: Optional[str] = None
+    end_date: Optional[str] = None
+    prompt: Optional[str] = None
+    tz_offset_minutes: Optional[int] = None
+
+
+class AgentTextResponse(BaseModel):
+    message: str
+    session_id: UUID
+    sources: list[ChatSource] = []
 
 
 class ChatSessionSummary(BaseModel):
@@ -163,6 +183,8 @@ class ChatSessionDetail(BaseModel):
     session_id: UUID
     title: Optional[str]
     messages: list[ChatMessageOut]
+    has_more: bool = False
+    next_before_id: Optional[str] = None
 
 
 class ChatFeedbackRequest(BaseModel):
@@ -209,13 +231,21 @@ def _format_resolved_time_range(
 
 
 DEFAULT_CARTOON_AGENT_INSTRUCTION = (
-    "Create a whimsical cartoon illustration that summarizes the day. "
-    "Highlight the main activity, mood, and setting."
+    "Create a detailed cartoon illustration that captures the most vivid moments, "
+    "mood, and setting for the day or range. Include concrete props, lighting, and background details."
 )
 
 DEFAULT_INSIGHTS_AGENT_INSTRUCTION = (
-    "Create a daily insights summary with key stats, top keywords, and a surprise moment. "
-    "Also generate an infographic image prompt."
+    "Create a detailed daily insights summary with key stats, top keywords, labels, and trends. "
+    "Also generate an infographic image prompt with clear text callouts."
+)
+
+DEFAULT_SURPRISE_AGENT_INSTRUCTION = (
+    "Find the most surprising, easy-to-miss detail in the selected time range. "
+    "Focus on small visual cues or background moments people might overlook "
+    "(clothing, signage, objects, gestures, expressions, odd pairings). "
+    "Avoid generic themes like 'outdoors' unless tied to a specific item. "
+    "Explain why it stands out and cite concrete supporting details."
 )
 
 
@@ -662,6 +692,414 @@ def _build_agent_memory_context(
     return "\n\n".join(sections)
 
 
+def _extract_location_name(location: Optional[dict]) -> Optional[str]:
+    if not isinstance(location, dict):
+        return None
+    return location.get("name") or location.get("place_name")
+
+
+def _extract_context_anchors(
+    contexts: list[ProcessedContext],
+    *,
+    max_items: int = 4,
+) -> list[str]:
+    anchors: list[str] = []
+    for context in contexts:
+        if len(anchors) >= max_items:
+            break
+        parts: list[str] = []
+        title = (context.title or "").strip()
+        summary = (context.summary or "").strip()
+        location_name = _extract_location_name(context.location)
+        if title:
+            parts.append(title)
+        if summary:
+            parts.append(summary)
+        if location_name:
+            parts.append(f"at {location_name}")
+        if parts:
+            anchors.append(" — ".join(parts))
+    return anchors
+
+
+def _extract_summary_anchors(
+    summaries: list[ProcessedContext],
+    *,
+    max_items: int = 2,
+) -> list[str]:
+    anchors: list[str] = []
+    for summary in summaries:
+        if len(anchors) >= max_items:
+            break
+        if summary.summary:
+            anchors.append(summary.summary.strip())
+    return anchors
+
+
+def _merge_anchors(*groups: list[str], max_items: int = 6) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for item in group:
+            cleaned = " ".join((item or "").split())
+            if not cleaned or cleaned in seen:
+                continue
+            merged.append(cleaned)
+            seen.add(cleaned)
+            if len(merged) >= max_items:
+                return merged
+    return merged
+
+
+def _format_surprise_evidence_cues(
+    contexts: list[ProcessedContext],
+    *,
+    tz_offset_minutes: Optional[int],
+    max_items: int = 4,
+) -> list[str]:
+    cues: list[str] = []
+    offset = timedelta(minutes=tz_offset_minutes or 0)
+    ordered_contexts = [ctx for ctx in contexts if ctx.context_type != "entity_context"] + [
+        ctx for ctx in contexts if ctx.context_type == "entity_context"
+    ]
+    for context in ordered_contexts:
+        if len(cues) >= max_items:
+            break
+        timestamp = "Unknown time"
+        if context.event_time_utc:
+            local_dt = ensure_tz_aware(context.event_time_utc) - offset
+            timestamp = local_dt.strftime("%b %d, %Y %I:%M %p")
+        title = (context.title or "").strip()
+        summary = (context.summary or "").strip()
+        label = title or summary or "Memory"
+        context_type = (context.context_type or "").strip()
+        suffix = f" ({context_type})" if context_type else ""
+        cues.append(f"- {timestamp}: {label}{suffix}")
+    return cues
+
+
+_VISUAL_DETAIL_CUES = (
+    "sweater",
+    "shirt",
+    "jacket",
+    "coat",
+    "hoodie",
+    "dress",
+    "skirt",
+    "pants",
+    "jeans",
+    "shorts",
+    "hat",
+    "cap",
+    "beanie",
+    "scarf",
+    "glove",
+    "boots",
+    "shoes",
+    "sneakers",
+    "sock",
+    "costume",
+    "mask",
+    "uniform",
+    "logo",
+    "sign",
+    "poster",
+    "billboard",
+    "banner",
+    "menu",
+    "label",
+    "sticker",
+    "neon",
+    "badge",
+    "ticket",
+    "balloon",
+    "cake",
+    "book",
+    "laptop",
+    "phone",
+    "camera",
+    "bottle",
+    "mug",
+    "cup",
+    "backpack",
+    "umbrella",
+    "bracelet",
+    "ring",
+    "necklace",
+    "earrings",
+    "watch",
+    "toy",
+    "gift",
+    "flag",
+)
+
+
+def _split_sentences(text: str) -> list[str]:
+    return [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", text) if sentence.strip()]
+
+
+def _find_visual_detail_sentence(text: str) -> Optional[str]:
+    if not text:
+        return None
+    for sentence in _split_sentences(text):
+        lowered = sentence.lower()
+        if any(cue in lowered for cue in _VISUAL_DETAIL_CUES):
+            return sentence
+        if "wearing" in lowered or "holding" in lowered or "carrying" in lowered:
+            return sentence
+    lowered_text = text.lower()
+    if any(cue in lowered_text for cue in _VISUAL_DETAIL_CUES):
+        return text.strip()
+    return None
+
+
+def _extract_visual_detail_from_contexts(
+    contexts: list[ProcessedContext],
+    summaries: list[ProcessedContext],
+) -> Optional[str]:
+    candidates: list[str] = []
+    for context in contexts:
+        if context.context_type == "entity_context":
+            continue
+        if context.summary:
+            candidates.append(context.summary)
+        if context.title:
+            candidates.append(context.title)
+    for summary in summaries:
+        if summary.summary:
+            candidates.append(summary.summary)
+    for text in candidates:
+        detail = _find_visual_detail_sentence(text)
+        if detail:
+            return detail
+    return None
+
+
+_CONTEXT_PRIORITY = {
+    "activity_context": 6,
+    "social_context": 5,
+    "food_context": 4,
+    "emotion_context": 4,
+    "knowledge_context": 3,
+    "location_context": 2,
+    "entity_context": 1,
+}
+
+
+def _context_rank_value(context: ProcessedContext) -> tuple[int, int, int]:
+    summary_len = len((context.summary or "").strip())
+    title_len = len((context.title or "").strip())
+    priority = _CONTEXT_PRIORITY.get(context.context_type, 0)
+    return (priority, summary_len, title_len)
+
+
+def _stable_hash(value: str) -> int:
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16)
+
+
+def _choose_context_for_group(group: list[ProcessedContext]) -> ProcessedContext:
+    entity_contexts = [ctx for ctx in group if ctx.context_type == "entity_context"]
+    non_entity = [ctx for ctx in group if ctx.context_type != "entity_context"]
+    if non_entity:
+        best_non_entity = max(non_entity, key=_context_rank_value)
+        best_entity = max(
+            entity_contexts, key=lambda ctx: len((ctx.summary or "").strip()), default=None
+        )
+        if best_entity:
+            if len((best_entity.summary or "").strip()) > len(
+                (best_non_entity.summary or "").strip()
+            ) + 60:
+                return best_entity
+        return best_non_entity
+    return max(group, key=_context_rank_value)
+
+
+def _dedupe_contexts_for_agents(
+    contexts: list[ProcessedContext],
+    *,
+    max_items: int = 24,
+    include_entity: bool = False,
+) -> list[ProcessedContext]:
+    grouped: dict[str, list[ProcessedContext]] = {}
+    for context in contexts:
+        if not include_entity and context.context_type == "entity_context":
+            continue
+        source_ids = context.source_item_ids or []
+        if source_ids:
+            key = ",".join(sorted(str(value) for value in source_ids))
+        else:
+            key = str(context.id)
+        grouped.setdefault(key, []).append(context)
+
+    selected: list[ProcessedContext] = []
+    for group in grouped.values():
+        selected.append(_choose_context_for_group(group))
+
+    selected.sort(
+        key=lambda ctx: ensure_tz_aware(ctx.event_time_utc)
+        if ctx.event_time_utc
+        else datetime.min.replace(tzinfo=timezone.utc)
+    )
+    return selected[:max_items]
+
+
+def _context_local_date(
+    context: ProcessedContext,
+    *,
+    tz_offset_minutes: Optional[int],
+) -> Optional[date]:
+    event_time = context.event_time_utc or context.start_time_utc or context.created_at
+    if not event_time:
+        return None
+    event_time = ensure_tz_aware(event_time)
+    if tz_offset_minutes:
+        event_time = event_time + timedelta(minutes=tz_offset_minutes)
+    return event_time.date()
+
+
+def _sample_contexts_across_days(
+    contexts: list[ProcessedContext],
+    *,
+    tz_offset_minutes: Optional[int],
+    max_items: int,
+    seed_key: Optional[str] = None,
+) -> list[ProcessedContext]:
+    if not contexts:
+        return []
+
+    grouped: dict[str, list[ProcessedContext]] = {}
+    for context in contexts:
+        local_date = _context_local_date(context, tz_offset_minutes=tz_offset_minutes)
+        key = local_date.isoformat() if local_date else "unknown"
+        grouped.setdefault(key, []).append(context)
+
+    day_keys = sorted(grouped.keys())
+    if seed_key and len(day_keys) > 1:
+        seed = _stable_hash(seed_key)
+        shift = seed % len(day_keys)
+        day_keys = day_keys[shift:] + day_keys[:shift]
+    per_day = max(1, int(math.ceil(max_items / max(len(day_keys), 1))))
+
+    for day_key in day_keys:
+        bucket = grouped[day_key]
+        bucket.sort(key=lambda ctx: _context_rank_value(ctx), reverse=True)
+        slice_size = min(len(bucket), max(per_day * 2, per_day))
+        candidates = bucket[:slice_size]
+        if seed_key and candidates:
+            seed = _stable_hash(f"{seed_key}:{day_key}")
+            shift = seed % len(candidates)
+            candidates = candidates[shift:] + candidates[:shift]
+        grouped[day_key] = candidates[:per_day]
+
+    sampled: list[ProcessedContext] = []
+    while len(sampled) < max_items:
+        added = False
+        for day_key in day_keys:
+            bucket = grouped.get(day_key) or []
+            if not bucket:
+                continue
+            sampled.append(bucket.pop(0))
+            added = True
+            if len(sampled) >= max_items:
+                break
+        if not added:
+            break
+    return sampled
+
+
+def _collect_visual_details(
+    contexts: list[ProcessedContext],
+    summaries: list[ProcessedContext],
+    *,
+    max_items: int = 3,
+) -> list[str]:
+    details: list[str] = []
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for context in contexts:
+        if context.context_type == "entity_context":
+            continue
+        if context.title:
+            candidates.append(context.title)
+        if context.summary:
+            candidates.append(context.summary)
+    for summary in summaries:
+        if summary.summary:
+            candidates.append(summary.summary)
+    for text in candidates:
+        sentence = _find_visual_detail_sentence(text)
+        if not sentence:
+            continue
+        cleaned = " ".join(sentence.split())
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        details.append(cleaned)
+        if len(details) >= max_items:
+            break
+    return details
+
+
+def _collect_available_dates(
+    contexts: list[ProcessedContext],
+    summaries: list[ProcessedContext],
+    *,
+    tz_offset_minutes: Optional[int],
+) -> list[str]:
+    dates: set[str] = set()
+    for context in contexts:
+        local_date = _context_local_date(context, tz_offset_minutes=tz_offset_minutes)
+        if local_date:
+            dates.add(local_date.isoformat())
+    for summary in summaries:
+        base_time = summary.start_time_utc or summary.event_time_utc or summary.created_at
+        if base_time:
+            base_time = ensure_tz_aware(base_time)
+            if tz_offset_minutes:
+                base_time = base_time + timedelta(minutes=tz_offset_minutes)
+            dates.add(base_time.date().isoformat())
+    return sorted(dates)
+
+
+_SURPRISE_GENERIC_TERMS = {
+    "outdoors",
+    "outdoor",
+    "indoor",
+    "mountains",
+    "street",
+    "streets",
+    "park",
+    "parks",
+    "walking",
+    "hiking",
+    "exercise",
+    "nature",
+    "city",
+    "people",
+    "person",
+    "group",
+}
+
+
+def _filter_surprise_terms(items: list[str]) -> list[str]:
+    filtered: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        cleaned = str(item or "").strip()
+        if not cleaned:
+            continue
+        lowered = cleaned.lower()
+        has_visual_detail = _find_visual_detail_sentence(cleaned) is not None
+        if any(term in lowered for term in _SURPRISE_GENERIC_TERMS) and not has_visual_detail:
+            continue
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        filtered.append(cleaned)
+    return filtered
+
+
 async def _generate_session_title(first_message: str) -> str:
     settings = get_settings()
     cleaned = " ".join(first_message.strip().split())
@@ -1065,8 +1503,13 @@ async def _build_sources(
             item_time = item.event_time_utc or item.captured_at or item.created_at
         timestamp = _format_timestamp(item_time) or _format_timestamp(context.event_time_utc)
         thumbnail_url = thumbnail_urls.get(item_id) if item_id else None
-        # Include episode_id for episodes (the context_id is the episode's context ID)
-        episode_id = str(context.id) if context.is_episode else None
+        episode_id = None
+        if context.is_episode:
+            versions = context.processor_versions or {}
+            if isinstance(versions, dict):
+                episode_id = versions.get("episode_id")
+            if not episode_id:
+                episode_id = str(context.id)
         sources.append(
             ChatSource(
                 context_id=str(context.id),
@@ -1454,20 +1897,111 @@ async def agent_cartoon_day_summary(
         tz_offset_minutes=payload.tz_offset_minutes,
         local_date=date.fromisoformat(payload.date) if payload.date else None,
     )
-    local_date = _resolve_agent_date(payload.date, tz_offset_minutes=resolved_offset)
-    summary_context, contexts = await _load_agent_day_context(
-        session,
-        user_id,
-        local_date,
+    start_date, end_date = _resolve_agent_date_range(
+        payload.date,
+        payload.end_date,
         tz_offset_minutes=resolved_offset,
     )
-    memory_context = _build_agent_memory_context(summary_context, contexts)
+    summaries: list[ProcessedContext] = []
+    summary_context: Optional[ProcessedContext] = None
+    contexts_all: list[ProcessedContext] = []
+    if start_date == end_date:
+        summary_context, contexts = await _load_agent_day_context(
+            session,
+            user_id,
+            start_date,
+            tz_offset_minutes=resolved_offset,
+        )
+        raw_contexts = contexts
+        contexts_all = _dedupe_contexts_for_agents(raw_contexts, max_items=24, include_entity=False)
+        contexts = _sample_contexts_across_days(
+            contexts_all,
+            tz_offset_minutes=resolved_offset,
+            max_items=24,
+            seed_key=f"cartoon:{start_date.isoformat()}:{uuid4().hex}",
+        )
+        memory_context = _build_agent_memory_context(summary_context, contexts)
+        if summary_context:
+            summaries = [summary_context]
+    else:
+        summaries, contexts = await _load_agent_range_context(
+            session,
+            user_id,
+            start_date,
+            end_date,
+            tz_offset_minutes=resolved_offset,
+        )
+        raw_contexts = contexts
+        contexts_all = _dedupe_contexts_for_agents(raw_contexts, max_items=32, include_entity=False)
+        if not contexts_all:
+            contexts_all = _dedupe_contexts_for_agents(
+                raw_contexts, max_items=16, include_entity=True
+            )
+        contexts = _sample_contexts_across_days(
+            contexts_all,
+            tz_offset_minutes=resolved_offset,
+            max_items=32,
+            seed_key=f"cartoon:{start_date.isoformat()}:{end_date.isoformat()}:{uuid4().hex}",
+        )
+        memory_context = _build_agent_range_memory_context(summaries, contexts)
     instruction = (payload.prompt or "").strip() or DEFAULT_CARTOON_AGENT_INSTRUCTION
+    date_label = (
+        start_date.isoformat()
+        if start_date == end_date
+        else f"{start_date.isoformat()} to {end_date.isoformat()}"
+    )
 
+    if not contexts_all and not summaries and not summary_context:
+        assistant_content = f"No memories found for {date_label}."
+        session_record = await _get_or_create_session(
+            session,
+            user_id,
+            payload.session_id,
+            f"Cartoon summary {date_label}",
+        )
+        now = datetime.now(timezone.utc)
+        session_record.updated_at = now
+        session_record.last_message_at = now
+        session.add_all(
+            [
+                ChatMessage(
+                    session_id=session_record.id,
+                    user_id=user_id,
+                    role="user",
+                    content=f"Cartoon summary for {date_label}",
+                    sources=[],
+                    created_at=now,
+                ),
+                ChatMessage(
+                    session_id=session_record.id,
+                    user_id=user_id,
+                    role="assistant",
+                    content=assistant_content,
+                    sources=[],
+                    created_at=now + timedelta(milliseconds=1),
+                ),
+            ]
+        )
+        await session.commit()
+        return AgentImageResponse(
+            message=assistant_content,
+            session_id=session_record.id,
+            attachments=[],
+            prompt=None,
+            caption=None,
+            sources=[],
+        )
+
+    available_dates = _collect_available_dates(
+        contexts_all if contexts_all else contexts,
+        summaries,
+        tz_offset_minutes=resolved_offset,
+    )
     prompt = build_lifelog_cartoon_agent_prompt(
         instruction=instruction,
         memory_context=memory_context,
-        date_label=local_date.isoformat(),
+        date_label=date_label,
+        available_dates=", ".join(available_dates) if available_dates else "None",
     )
     prompt_response = await summarize_text_with_gemini(
         prompt=prompt,
@@ -1486,8 +2020,16 @@ async def agent_cartoon_day_summary(
         image_prompt = parsed.get("image_prompt")
         caption = parsed.get("caption")
     image_prompt = (image_prompt or instruction).strip()
+    anchors = _merge_anchors(
+        _extract_summary_anchors(summaries),
+        _extract_context_anchors(contexts),
+        max_items=6,
+    )
+    if anchors:
+        anchor_text = _truncate_text("; ".join(anchors), limit=400)
+        image_prompt = f"{image_prompt}\n\nInclude these concrete memory anchors: {anchor_text}."
     if not caption:
-        caption = f"Cartoon day summary for {local_date.isoformat()}."
+        caption = f"Cartoon summary for {date_label}."
 
     model = settings.agent_image_model or "gemini-2.5-flash-image"
     image_result = await generate_image_with_gemini(
@@ -1507,7 +2049,7 @@ async def agent_cartoon_day_summary(
         session,
         user_id,
         payload.session_id,
-        f"Cartoon day summary {local_date.isoformat()}",
+        f"Cartoon summary {date_label}",
     )
     now = datetime.now(timezone.utc)
     session_record.updated_at = now
@@ -1517,7 +2059,7 @@ async def agent_cartoon_day_summary(
         session_id=session_record.id,
         user_id=user_id,
         role="user",
-        content=f"Cartoon day summary for {local_date.isoformat()}",
+        content=f"Cartoon summary for {date_label}",
         sources=[],
         created_at=now,
     )
@@ -1533,12 +2075,25 @@ async def agent_cartoon_day_summary(
     session.add_all([user_msg, assistant_msg])
     await session.flush()
 
+    source_entries = [
+        (context, {"score": max(0.01, 1.0 - idx * 0.03)})
+        for idx, context in enumerate(contexts[:12])
+    ]
+    sources = await _build_sources(session, source_entries, limit=5) if source_entries else []
+    if sources:
+        assistant_msg.sources = _serialize_sources_for_storage(sources)
+
+    file_label = (
+        start_date.isoformat()
+        if start_date == end_date
+        else f"{start_date.isoformat()}-to-{end_date.isoformat()}"
+    )
     attachment_payload = await _store_attachment_bytes(
         user_id=user_id,
         session_id=session_record.id,
         image_bytes=image.data,
         content_type=image.content_type,
-        original_filename=f"cartoon-{local_date.isoformat()}.png",
+        original_filename=f"cartoon-{file_label}.png",
     )
     attachment = ChatAttachment(
         user_id=user_id,
@@ -1572,6 +2127,7 @@ async def agent_cartoon_day_summary(
         attachments=attachments,
         prompt=image_prompt,
         caption=caption,
+        sources=sources,
     )
 
 
@@ -1603,6 +2159,18 @@ async def agent_day_insights(
         end_date,
         tz_offset_minutes=resolved_offset,
     )
+    raw_contexts = contexts
+    contexts_all = _dedupe_contexts_for_agents(raw_contexts, max_items=40, include_entity=False)
+    if not contexts_all:
+        contexts_all = _dedupe_contexts_for_agents(
+            raw_contexts, max_items=20, include_entity=True
+        )
+    contexts = _sample_contexts_across_days(
+        contexts_all,
+        tz_offset_minutes=resolved_offset,
+        max_items=40,
+        seed_key=f"insights:{start_date.isoformat()}:{end_date.isoformat()}:{uuid4().hex}",
+    )
     memory_context = _build_agent_range_memory_context(summaries, contexts)
     instruction = (payload.prompt or "").strip() or DEFAULT_INSIGHTS_AGENT_INSTRUCTION
     date_label = (
@@ -1610,6 +2178,47 @@ async def agent_day_insights(
         if start_date == end_date
         else f"{start_date.isoformat()} to {end_date.isoformat()}"
     )
+
+    if not contexts_all and not summaries:
+        assistant_content = f"No memories found for {date_label}."
+        session_record = await _get_or_create_session(
+            session,
+            user_id,
+            payload.session_id,
+            f"Day insights {date_label}",
+        )
+        now = datetime.now(timezone.utc)
+        session_record.updated_at = now
+        session_record.last_message_at = now
+        session.add_all(
+            [
+                ChatMessage(
+                    session_id=session_record.id,
+                    user_id=user_id,
+                    role="user",
+                    content=f"Day insights for {date_label}",
+                    sources=[],
+                    created_at=now,
+                ),
+                ChatMessage(
+                    session_id=session_record.id,
+                    user_id=user_id,
+                    role="assistant",
+                    content=assistant_content,
+                    sources=[],
+                    created_at=now + timedelta(milliseconds=1),
+                ),
+            ]
+        )
+        await session.commit()
+        return AgentImageResponse(
+            message=assistant_content,
+            session_id=session_record.id,
+            attachments=[],
+            prompt=None,
+            caption=None,
+            sources=[],
+        )
 
     offset = timedelta(minutes=resolved_offset)
     start = datetime.combine(start_date, time.min, tzinfo=timezone.utc) + offset
@@ -1631,7 +2240,7 @@ async def agent_day_insights(
     keyword_counts: dict[str, int] = {}
     context_type_counts: dict[str, int] = {}
     entity_names: list[str] = []
-    for context in contexts:
+    for context in contexts_all:
         context_type_counts[context.context_type] = context_type_counts.get(context.context_type, 0) + 1
         for keyword in context.keywords or []:
             key = str(keyword or "").strip().lower()
@@ -1656,11 +2265,17 @@ async def agent_day_insights(
     }
     stats_json = json.dumps(stats_payload, indent=2)
 
+    available_dates = _collect_available_dates(
+        contexts_all if contexts_all else contexts,
+        summaries,
+        tz_offset_minutes=resolved_offset,
+    )
     prompt = build_lifelog_day_insights_agent_prompt(
         instruction=instruction,
         memory_context=memory_context,
         date_range_label=date_label,
         stats_json=stats_json,
+        available_dates=", ".join(available_dates) if available_dates else "None",
     )
     prompt_response = await summarize_text_with_gemini(
         prompt=prompt,
@@ -1679,7 +2294,6 @@ async def agent_day_insights(
     summary = (parsed.get("summary") or "").strip()
     labels = parsed.get("labels") if isinstance(parsed.get("labels"), list) else []
     keywords = parsed.get("top_keywords") if isinstance(parsed.get("top_keywords"), list) else []
-    surprise = (parsed.get("surprise_moment") or "").strip()
     image_prompt = (parsed.get("image_prompt") or "").strip()
 
     if not keywords:
@@ -1691,6 +2305,22 @@ async def agent_day_insights(
             "Create a clean infographic poster summarizing the day. "
             f"Include the title '{headline}' and 3-5 stat callouts."
         )
+    callouts: list[str] = []
+    if item_counts:
+        callouts.extend([f"{key}: {value}" for key, value in item_counts.items()])
+    if keywords:
+        callouts.extend([f"keyword: {word}" for word in keywords[:3]])
+    anchors = _merge_anchors(
+        _extract_summary_anchors(summaries),
+        _extract_context_anchors(contexts),
+        max_items=6,
+    )
+    if callouts:
+        callout_text = _truncate_text(", ".join(callouts[:6]), limit=260)
+        image_prompt = f"{image_prompt}\n\nText callouts to include: {callout_text}."
+    if anchors:
+        anchor_text = _truncate_text("; ".join(anchors), limit=400)
+        image_prompt = f"{image_prompt}\n\nMemory anchors to reflect visually: {anchor_text}."
 
     lines = [headline]
     if summary:
@@ -1702,8 +2332,6 @@ async def agent_day_insights(
         lines.append(f"Top keywords: {', '.join(str(word) for word in keywords)}")
     if labels:
         lines.append(f"Labels: {', '.join(str(label) for label in labels)}")
-    if surprise:
-        lines.append(f"Surprise: {surprise}")
     assistant_content = "\n".join(lines).strip()
 
     attachments: list[ChatAttachmentOut] = []
@@ -1761,6 +2389,14 @@ async def agent_day_insights(
     session.add_all([user_msg, assistant_msg])
     await session.flush()
 
+    source_entries = [
+        (context, {"score": max(0.01, 1.0 - idx * 0.03)})
+        for idx, context in enumerate(contexts[:12])
+    ]
+    sources = await _build_sources(session, source_entries, limit=5) if source_entries else []
+    if sources:
+        assistant_msg.sources = _serialize_sources_for_storage(sources)
+
     if image_bytes:
         attachment_payload = await _store_attachment_bytes(
             user_id=user_id,
@@ -1801,6 +2437,256 @@ async def agent_day_insights(
         attachments=attachments,
         prompt=prompt_used,
         caption=caption,
+        sources=sources,
+    )
+
+
+@router.post("/agents/surprise", response_model=AgentTextResponse)
+async def agent_surprise_highlight(
+    payload: AgentSurpriseRequest,
+    user_id: UUID = Depends(get_current_user_id),
+    session: AsyncSession = Depends(get_session),
+) -> AgentTextResponse:
+    settings = get_settings()
+    if not settings.agent_enabled:
+        raise HTTPException(status_code=503, detail="Agent features are disabled")
+
+    resolved_offset = await _resolve_request_tz_offset(
+        session=session,
+        user_id=user_id,
+        tz_offset_minutes=payload.tz_offset_minutes,
+        local_date=date.fromisoformat(payload.date) if payload.date else None,
+    )
+    start_date, end_date = _resolve_agent_date_range(
+        payload.date,
+        payload.end_date,
+        tz_offset_minutes=resolved_offset,
+    )
+    summaries: list[ProcessedContext] = []
+    contexts_all: list[ProcessedContext] = []
+    summary_context: Optional[ProcessedContext] = None
+    if start_date == end_date:
+        summary_context, contexts = await _load_agent_day_context(
+            session,
+            user_id,
+            start_date,
+            tz_offset_minutes=resolved_offset,
+        )
+        if summary_context:
+            summaries = [summary_context]
+        raw_contexts = contexts
+        contexts_all = _dedupe_contexts_for_agents(raw_contexts, max_items=24, include_entity=False)
+        if not contexts_all:
+            contexts_all = _dedupe_contexts_for_agents(
+                raw_contexts, max_items=16, include_entity=True
+            )
+        contexts = _sample_contexts_across_days(
+            contexts_all,
+            tz_offset_minutes=resolved_offset,
+            max_items=24,
+            seed_key=f"surprise:{start_date.isoformat()}:{uuid4().hex}",
+        )
+        memory_context = _build_agent_memory_context(summary_context, contexts)
+    else:
+        summaries, contexts = await _load_agent_range_context(
+            session,
+            user_id,
+            start_date,
+            end_date,
+            tz_offset_minutes=resolved_offset,
+        )
+        raw_contexts = contexts
+        contexts_all = _dedupe_contexts_for_agents(raw_contexts, max_items=32, include_entity=False)
+        if not contexts_all:
+            contexts_all = _dedupe_contexts_for_agents(
+                raw_contexts, max_items=20, include_entity=True
+            )
+        contexts = _sample_contexts_across_days(
+            contexts_all,
+            tz_offset_minutes=resolved_offset,
+            max_items=32,
+            seed_key=f"surprise:{start_date.isoformat()}:{end_date.isoformat()}:{uuid4().hex}",
+        )
+        memory_context = _build_agent_range_memory_context(summaries, contexts)
+    instruction = (payload.prompt or "").strip() or DEFAULT_SURPRISE_AGENT_INSTRUCTION
+    date_label = (
+        start_date.isoformat()
+        if start_date == end_date
+        else f"{start_date.isoformat()} to {end_date.isoformat()}"
+    )
+
+    if not contexts_all and not summaries and not summary_context:
+        assistant_content = f"No memories found for {date_label}."
+        session_record = await _get_or_create_session(
+            session,
+            user_id,
+            payload.session_id,
+            f"Surprise highlight {date_label}",
+        )
+        now = datetime.now(timezone.utc)
+        session_record.updated_at = now
+        session_record.last_message_at = now
+        session.add_all(
+            [
+                ChatMessage(
+                    session_id=session_record.id,
+                    user_id=user_id,
+                    role="user",
+                    content=f"Surprise highlight for {date_label}",
+                    sources=[],
+                    created_at=now,
+                ),
+                ChatMessage(
+                    session_id=session_record.id,
+                    user_id=user_id,
+                    role="assistant",
+                    content=assistant_content,
+                    sources=[],
+                    created_at=now + timedelta(milliseconds=1),
+                ),
+            ]
+        )
+        await session.commit()
+        return AgentTextResponse(
+            message=assistant_content,
+            session_id=session_record.id,
+            sources=[],
+        )
+
+    keyword_counts: dict[str, int] = {}
+    location_names: list[str] = []
+    for context in contexts_all:
+        for keyword in context.keywords or []:
+            key = str(keyword or "").strip().lower()
+            if not key:
+                continue
+            keyword_counts[key] = keyword_counts.get(key, 0) + 1
+        location_name = _extract_location_name(context.location)
+        if location_name:
+            location_names.append(str(location_name))
+    top_keywords = sorted(keyword_counts.items(), key=lambda pair: pair[1], reverse=True)[:8]
+
+    prompt = build_lifelog_surprise_agent_prompt(
+        instruction=instruction,
+        memory_context=memory_context,
+        date_range_label=date_label,
+    )
+    prompt_response = await summarize_text_with_gemini(
+        prompt=prompt,
+        settings=settings,
+        model=settings.agent_prompt_model,
+        temperature=settings.agent_prompt_temperature,
+        max_output_tokens=512,
+        timeout_seconds=settings.chat_timeout_seconds,
+        step_name="agent_surprise_prompt",
+        user_id=user_id,
+    )
+    parsed = prompt_response.get("parsed")
+    if not isinstance(parsed, dict):
+        parsed = {}
+    headline = (parsed.get("headline") or f"Surprise highlight for {date_label}").strip()
+    surprise = (parsed.get("surprise") or "").strip()
+    details = parsed.get("supporting_details") if isinstance(parsed.get("supporting_details"), list) else []
+    image_prompt = (parsed.get("image_prompt") or "").strip()
+    non_entity_contexts = [ctx for ctx in contexts if ctx.context_type != "entity_context"]
+    visual_detail = _extract_visual_detail_from_contexts(non_entity_contexts, summaries)
+    visual_details = _collect_visual_details(non_entity_contexts, summaries, max_items=3)
+
+    if not surprise:
+        filtered_keywords = _filter_surprise_terms([word for word, _ in top_keywords])
+        if filtered_keywords:
+            surprise = (
+                f"An easy-to-miss detail was '{filtered_keywords[0]}', "
+                "popping up in the range."
+            )
+        elif summaries:
+            summary_text = (summaries[0].summary or "").strip()
+            surprise = f"One standout moment was: {summary_text}" if summary_text else ""
+        if not surprise:
+            surprise = "A subtle pattern emerged across the range, but the details were sparse."
+
+    if not details:
+        detail_items: list[str] = []
+        for word in _filter_surprise_terms([word for word, _ in top_keywords[:6]]):
+            detail_items.append(word)
+        for location in list(dict.fromkeys(location_names))[:3]:
+            detail_items.append(location)
+        detail_items.extend(_extract_context_anchors(contexts, max_items=3))
+        details = detail_items[:6]
+
+    if visual_details:
+        primary = visual_details[0]
+        surprise = (
+            f"Notable detail: {primary}. This kind of small visual cue is easy to overlook."
+        )
+        details = visual_details + _filter_surprise_terms(details if isinstance(details, list) else [])
+        details = details[:6]
+    elif visual_detail:
+        surprise = (
+            f"Notable detail: {visual_detail}. This kind of small visual cue is easy to overlook."
+        )
+        if isinstance(details, list) and visual_detail not in details:
+            details = [visual_detail] + _filter_surprise_terms(details)
+            details = details[:6]
+
+    lines = [headline]
+    if surprise:
+        lines.append(f"Surprise: {surprise}")
+    if details:
+        lines.append(f"Details: {', '.join(str(detail) for detail in details)}")
+    if image_prompt:
+        lines.append(f"Image prompt: {image_prompt}")
+    evidence_cues = _format_surprise_evidence_cues(
+        contexts,
+        tz_offset_minutes=resolved_offset,
+        max_items=4,
+    )
+    if evidence_cues:
+        lines.append("Evidence cues:")
+        lines.extend(evidence_cues)
+    assistant_content = "\n".join(lines).strip()
+
+    session_record = await _get_or_create_session(
+        session,
+        user_id,
+        payload.session_id,
+        f"Surprise highlight {date_label}",
+    )
+    now = datetime.now(timezone.utc)
+    session_record.updated_at = now
+    session_record.last_message_at = now
+
+    user_msg = ChatMessage(
+        session_id=session_record.id,
+        user_id=user_id,
+        role="user",
+        content=f"Surprise highlight for {date_label}",
+        sources=[],
+        created_at=now,
+    )
+    assistant_msg = ChatMessage(
+        session_id=session_record.id,
+        user_id=user_id,
+        role="assistant",
+        content=assistant_content,
+        sources=[],
+        created_at=now + timedelta(milliseconds=1),
+    )
+    session.add_all([user_msg, assistant_msg])
+
+    source_entries = [
+        (context, {"score": max(0.01, 1.0 - idx * 0.03)})
+        for idx, context in enumerate(contexts[:12])
+    ]
+    sources = await _build_sources(session, source_entries, limit=5) if source_entries else []
+    if sources:
+        assistant_msg.sources = _serialize_sources_for_storage(sources)
+    await session.commit()
+
+    return AgentTextResponse(
+        message=assistant_content,
+        session_id=session_record.id,
+        sources=sources,
     )
 
 
@@ -1851,6 +2737,8 @@ async def upload_chat_attachment(
 async def list_sessions(
     user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
+    limit: int = Query(30, ge=1, le=200),
+    offset: int = Query(0, ge=0),
 ) -> list[ChatSessionSummary]:
     stmt = (
         select(ChatSession, func.count(ChatMessage.id))
@@ -1858,6 +2746,8 @@ async def list_sessions(
         .where(ChatSession.user_id == user_id)
         .group_by(ChatSession.id)
         .order_by(ChatSession.last_message_at.desc())
+        .limit(limit)
+        .offset(offset)
     )
     rows = await session.execute(stmt)
     summaries: list[ChatSessionSummary] = []
@@ -1880,17 +2770,32 @@ async def get_session(
     user_id: UUID = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_session),
     debug: bool = False,
+    limit: int = Query(50, ge=1, le=200),
+    before_id: Optional[UUID] = Query(None),
 ) -> ChatSessionDetail:
     chat_session = await session.get(ChatSession, session_id)
     if not chat_session or chat_session.user_id != user_id:
         raise HTTPException(status_code=404, detail="Session not found")
-    msg_stmt = (
-        select(ChatMessage)
-        .where(ChatMessage.session_id == session_id)
-        .order_by(ChatMessage.created_at.asc())
-    )
+    msg_stmt = select(ChatMessage).where(ChatMessage.session_id == session_id)
+    if before_id:
+        before_msg = await session.get(ChatMessage, before_id)
+        if before_msg and before_msg.session_id == session_id:
+            msg_stmt = msg_stmt.where(
+                or_(
+                    ChatMessage.created_at < before_msg.created_at,
+                    and_(
+                        ChatMessage.created_at == before_msg.created_at,
+                        ChatMessage.id < before_id,
+                    ),
+                )
+            )
+    msg_stmt = msg_stmt.order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc()).limit(limit + 1)
     rows = await session.execute(msg_stmt)
     message_records = list(rows.scalars().all())
+    has_more = len(message_records) > limit
+    if has_more:
+        message_records = message_records[:limit]
+    message_records = list(reversed(message_records))
     message_ids = [msg.id for msg in message_records]
     attachments_by_message = await _load_message_attachments(session, message_ids)
     messages = []
@@ -1915,6 +2820,8 @@ async def get_session(
         session_id=chat_session.id,
         title=chat_session.title,
         messages=messages,
+        has_more=has_more,
+        next_before_id=str(message_records[0].id) if message_records else None,
     )
 
 

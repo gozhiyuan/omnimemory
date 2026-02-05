@@ -94,7 +94,7 @@ def _normalize_context_entry(
         "keywords": keywords,
         "entities": entities,
         "location": location,
-        "vector_text": build_vector_text(title, summary, keywords),
+        "vector_text": build_vector_text(title, summary, keywords, context_type=context_type),
         "processor_versions": provider_versions,
     }
 
@@ -196,6 +196,7 @@ def _merge_contexts(
                     target.get("title") or "Memory context",
                     target.get("summary") or "",
                     target.get("keywords") or [],
+                    context_type=target.get("context_type"),
                 )
                 inserted = True
                 break
@@ -1202,7 +1203,7 @@ class VlmStep:
                     "keywords": keywords,
                     "entities": entities,
                     "location": location,
-                    "vector_text": build_vector_text(title, summary, keywords),
+                    "vector_text": build_vector_text(title, summary, keywords, context_type=context_type),
                     "processor_versions": {
                         "vlm_prompt": self.version,
                         "vlm_provider": provider,
@@ -1224,7 +1225,9 @@ class VlmStep:
                     "keywords": keywords,
                     "entities": [],
                     "location": {},
-                    "vector_text": build_vector_text(title, summary, keywords),
+                    "vector_text": build_vector_text(
+                        title, summary, keywords, context_type="activity_context"
+                    ),
                     "processor_versions": {
                         "vlm_prompt": self.version,
                         "vlm_provider": provider,
@@ -1909,7 +1912,9 @@ class MediaSummaryContextStep:
             "keywords": keywords,
             "entities": [],
             "location": {},
-            "vector_text": build_vector_text(title, summary, keywords),
+            "vector_text": build_vector_text(
+                title, summary, keywords, context_type="activity_context"
+            ),
             "processor_versions": {"media_summary": self.version},
         }
         contexts = [summary_context] + list(contexts)
@@ -1944,7 +1949,7 @@ class GenericContextStep:
             "keywords": keywords,
             "entities": [],
             "location": {},
-            "vector_text": build_vector_text(title, caption, keywords),
+            "vector_text": build_vector_text(title, caption, keywords, context_type=context_type),
             "processor_versions": {"generic": self.version},
         }
         artifacts.set("contexts", [context])
@@ -1977,6 +1982,7 @@ class TranscriptContextStep:
             title,
             _truncate_text(transcript_text, 2000),
             keywords,
+            context_type=self._context_type(item),
         )
         provider = (
             config.settings.video_understanding_provider
@@ -2077,7 +2083,7 @@ class UserAnnotationStep:
         summary = description or ""
 
         # Build vector text for embeddings
-        vector_text = build_vector_text(title, summary, tags)
+        vector_text = build_vector_text(title, summary, tags, context_type="user_annotation")
 
         # Build processor_versions
         processor_versions = {
@@ -2157,7 +2163,9 @@ class ContextPersistStep:
                     "keywords": keywords,
                     "entities": [],
                     "location": geo_info,
-                    "vector_text": build_vector_text(title, summary, keywords),
+                    "vector_text": build_vector_text(
+                        title, summary, keywords, context_type="location_context"
+                    ),
                     "processor_versions": {"geocode": GeoLocationStep.version},
                 }
             )
@@ -2295,6 +2303,7 @@ class EmbeddingStep:
                 record.title or "",
                 record.summary or "",
                 record.keywords or [],
+                context_type=record.context_type,
             )
             parts.append(f"{record.id}:{vector_text}")
         return hash_parts(parts)

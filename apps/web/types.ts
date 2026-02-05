@@ -63,6 +63,13 @@ export interface AgentImageResponse {
   attachments: ChatAttachment[];
   prompt?: string | null;
   caption?: string | null;
+  sources?: ChatSource[];
+}
+
+export interface AgentTextResponse {
+  message: string;
+  session_id: string;
+  sources?: ChatSource[];
 }
 
 export interface ChatSessionSummary {
@@ -85,6 +92,8 @@ export interface ChatSessionDetail {
     created_at: string;
     telemetry?: Record<string, unknown> | null;
   }>;
+  has_more?: boolean;
+  next_before_id?: string | null;
 }
 
 export interface UserStats {

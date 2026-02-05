@@ -131,6 +131,14 @@ PROMPT_MANIFEST: dict[str, PromptSpec] = {
         "description": "Generate daily insights summary",
         "updatable_via_api": False,
     },
+    "surprise_agent": {
+        "required_vars": ["instruction", "memory_context", "date_range_label"],
+        "optional_vars": [],
+        "max_size_bytes": DEFAULT_MAX_SIZE_BYTES,
+        "output_format": "json",
+        "description": "Generate surprise highlight summary",
+        "updatable_via_api": False,
+    },
     # Agent prompts (for Memory Agent mode)
     "agent_system": {
         "required_vars": ["session_state"],

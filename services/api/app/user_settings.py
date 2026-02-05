@@ -143,8 +143,3 @@ def build_preference_guidance(settings: Mapping[str, Any] | None) -> str:
 
     return "\n\nUser focus preferences:\n" + "\n".join(lines) + "\n"
 
-
-def resolve_annotation_defaults(settings: Mapping[str, Any] | None) -> dict[str, Any]:
-    prefs = resolve_preferences(settings)
-    defaults = prefs.get("annotation_defaults")
-    return defaults if isinstance(defaults, dict) else {}

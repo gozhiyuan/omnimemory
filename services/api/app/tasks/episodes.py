@@ -383,6 +383,7 @@ def _build_episode_context_records(
             merged_payload["title"],
             merged_payload["summary"],
             merged_payload["keywords"],
+            context_type=record.context_type,
         )
         records.append(record)
     return records
@@ -642,7 +643,9 @@ async def _update_daily_summary(
     summary_context.start_time_utc = start
     summary_context.end_time_utc = end
     summary_context.processor_versions = processor_versions
-    summary_context.vector_text = build_vector_text(title, summary, keywords)
+    summary_context.vector_text = build_vector_text(
+        title, summary, keywords, context_type=summary_context.context_type
+    )
 
     await session.flush()
     upsert_context_embeddings([summary_context])

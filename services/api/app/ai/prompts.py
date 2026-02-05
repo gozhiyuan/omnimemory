@@ -228,6 +228,7 @@ def build_lifelog_cartoon_agent_prompt(
     instruction: str,
     memory_context: str,
     date_label: str,
+    available_dates: str,
     user_id: Optional[str] = None,
 ) -> str:
     """Build cartoon agent prompt with optional per-user customization."""
@@ -239,6 +240,7 @@ def build_lifelog_cartoon_agent_prompt(
             instruction=instruction.strip(),
             memory_context=memory_context.strip() or "None",
             date_label=date_label,
+            available_dates=available_dates,
         )
     except Exception as e:
         logger.warning(f"Failed to render cartoon_agent prompt: {e}")
@@ -249,6 +251,7 @@ def build_lifelog_cartoon_agent_prompt(
             instruction=instruction.strip(),
             memory_context=memory_context.strip() or "None",
             date_label=date_label,
+            available_dates=available_dates,
         )
 
 
@@ -257,6 +260,7 @@ def build_lifelog_day_insights_agent_prompt(
     memory_context: str,
     date_range_label: str,
     stats_json: str,
+    available_dates: str,
     user_id: Optional[str] = None,
 ) -> str:
     """Build day insights agent prompt with optional per-user customization."""
@@ -269,6 +273,7 @@ def build_lifelog_day_insights_agent_prompt(
             memory_context=memory_context.strip() or "None",
             date_range_label=date_range_label,
             stats_json=stats_json.strip() or "{}",
+            available_dates=available_dates,
         )
     except Exception as e:
         logger.warning(f"Failed to render day_insights_agent prompt: {e}")
@@ -280,6 +285,35 @@ def build_lifelog_day_insights_agent_prompt(
             memory_context=memory_context.strip() or "None",
             date_range_label=date_range_label,
             stats_json=stats_json.strip() or "{}",
+            available_dates=available_dates,
+        )
+
+
+def build_lifelog_surprise_agent_prompt(
+    instruction: str,
+    memory_context: str,
+    date_range_label: str,
+    user_id: Optional[str] = None,
+) -> str:
+    """Build surprise highlight prompt with optional per-user customization."""
+    manager = get_prompt_manager()
+    try:
+        return manager.render(
+            "surprise_agent",
+            user_id=user_id,
+            instruction=instruction.strip(),
+            memory_context=memory_context.strip() or "None",
+            date_range_label=date_range_label,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to render surprise_agent prompt: {e}")
+        from app.ai.prompt_templates import INLINE_DEFAULTS
+        from jinja2 import Template
+        template = Template(INLINE_DEFAULTS["surprise_agent"])
+        return template.render(
+            instruction=instruction.strip(),
+            memory_context=memory_context.strip() or "None",
+            date_range_label=date_range_label,
         )
 
 
@@ -425,10 +459,56 @@ def build_agent_response_prompt(
         )
 
 
+_KEYWORD_STOPWORDS = {
+    "outdoors",
+    "outdoor",
+    "indoor",
+    "people",
+    "person",
+    "photo",
+    "photos",
+    "video",
+    "videos",
+    "image",
+    "images",
+    "scene",
+    "view",
+    "background",
+    "group",
+    "selfie",
+    "portrait",
+    "thing",
+    "stuff",
+}
+
+_KEYWORD_SKIP_CONTEXTS = {"entity_context"}
+
+
+def _filter_keywords(keywords: list[str], context_type: str | None) -> list[str]:
+    if context_type in _KEYWORD_SKIP_CONTEXTS:
+        return []
+    filtered: list[str] = []
+    seen: set[str] = set()
+    for word in keywords or []:
+        cleaned = str(word or "").strip()
+        if not cleaned:
+            continue
+        lowered = cleaned.lower()
+        if lowered in _KEYWORD_STOPWORDS or lowered in seen:
+            continue
+        seen.add(lowered)
+        filtered.append(lowered)
+        if len(filtered) >= 8:
+            break
+    return filtered
+
+
 def build_vector_text(
     title: str,
     summary: str,
     keywords: list[str],
+    *,
+    context_type: str | None = None,
 ) -> str:
     """Build vector text for embedding from context fields."""
     parts = []
@@ -436,8 +516,9 @@ def build_vector_text(
         parts.append(title)
     if summary:
         parts.append(summary)
-    if keywords:
-        parts.append(" ".join(keywords))
+    filtered = _filter_keywords(keywords, context_type)
+    if filtered:
+        parts.append(" ".join(filtered))
     return " ".join(parts)
 
 

@@ -32,6 +32,9 @@ Related tables used by chat:
 - `daily_summaries`: recent daily summaries for prompt grounding.
 - `chat_sessions`, `chat_messages`, `chat_attachments`: persisted chat history and images.
 
+User preferences that influence ingestion:
+- **Analysis focus** settings (focus tags/people/places/topics) are injected into VLM/audio/video prompts to bias what the model extracts during ingestion. This does not change retrieval ranking directly; it changes what is stored in contexts going forward.
+
 ## Retrieval flow
 
 1) **Intent classification** (heuristic + LLM):
@@ -128,6 +131,46 @@ Common settings that affect RAG behavior:
 - `chat_verification_enabled`: toggle grounding verification.
 - `embedding_provider` / `embedding_model`: used to embed context and query.
 - `qdrant_collection`: collection name for context vectors.
+
+## Reprocessing and backfill
+
+Prompt updates (VLM/audio/video) only affect **new** ingests. Existing items keep their stored contexts unless you reprocess them.
+
+### When to re-run VLM
+
+Re-run if you want historical items to reflect updated VLM prompts or updated Analysis Focus preferences.
+
+Important: the VLM step caches results using a fingerprint that includes content hash, OCR text, provider, model, and **step version**. If you want to invalidate cache for existing items, bump the version:
+
+- `services/api/app/pipeline/steps.py` → `VlmStep.version = "lifelog_image_analysis_v3"` (or next number)
+- If you changed video/audio prompts, bump the corresponding step versions too.
+
+### Backfill pipeline (reprocess existing items)
+
+Use the maintenance task to enqueue items for reprocessing:
+
+```bash
+docker exec -it lifelog-celery-worker uv run celery -A app.celery_app.celery_app \
+  call maintenance.backfill_pipeline --args='[null, 200, 0, "photo", null, ["completed"], null, null, null, true]'
+```
+
+Notes:
+- `user_id`: use `null` to default to the test user, or pass a UUID string.
+- `limit`/`offset`: page through items.
+- `item_type`: `"photo"` / `"video"` / `"audio"`.
+- `since`/`until`: optional ISO timestamps to limit the date range.
+- `reprocess_duplicates=true` forces expensive steps to re-run even for duplicates.
+
+### Re-embed contexts after vector_text changes
+
+If you change how `vector_text` is built (e.g., keywords filtering), re-embed existing contexts:
+
+```bash
+docker exec -it lifelog-celery-worker uv run celery -A app.celery_app.celery_app \
+  call maintenance.reembed_contexts
+```
+
+Optional args: `[user_id, context_type, batch_size, offset, max_batches]`.
 
 ## Memory API (for shared toolset + agents)
 

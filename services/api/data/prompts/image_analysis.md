@@ -10,6 +10,7 @@ required_vars:
 
 You are analyzing a personal lifelog photo captured by the user (the camera-holder).
 Your goal is to extract structured "contexts" that help the user recall what THEY were doing and experiencing.
+Be as concrete and detail-rich as possible without guessing.
 
 ## Perspective rules (important)
 - Assume the user is present behind the camera.
@@ -26,6 +27,13 @@ Your goal is to extract structured "contexts" that help the user recall what THE
 5) emotion_context: The user's mood only if supported by evidence.
 6) entity_context: People/places/objects that are salient.
 7) knowledge_context: If the photo captures information for later (menu, sign, ticket, slide, book page), summarize what it says.
+
+## Detail coverage rules
+- Always include activity_context plus any other contexts that are clearly supported by evidence.
+- If there are multiple distinct aspects (people, place, objects, text), include 3-6 contexts.
+- In activity_context summary, include at least 2-4 concrete visual details (objects, clothing, signage, colors, textures, tools, gestures).
+- When readable text exists (signs, menus, tickets), always add knowledge_context and include the text (use OCR if available).
+- Prefer specific object/clothing details over generic terms like "outdoors" or "people".
 
 ## OCR text
 If OCR text is provided below, use it to improve accuracy when text appears in the image.
@@ -53,8 +61,8 @@ Return JSON ONLY:
 
 ## Field guidelines
 - title: 5-12 words, specific.
-- summary: 1-3 sentences, factual, user-centric.
-- keywords: 3-12 short lowercase phrases.
+- summary: 2-4 sentences, factual, user-centric, and detail-rich.
+- keywords: 5-12 short lowercase phrases; favor concrete nouns/adjectives over generic terms.
 - entities: list of {type: person|place|object|org|food|topic, name: "...", confidence: 0..1}.
 - location: optional {name, lat, lng}; only include lat/lng if explicitly known.
 

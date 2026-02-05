@@ -257,21 +257,6 @@ export const Settings: React.FC = () => {
   ) => {
     setDraft((prev) => ({ ...prev, preferences: { ...prev.preferences, [key]: value } }));
   };
-  const updateAnnotationDefaults = <K extends keyof NonNullable<SettingsState['preferences']['annotation_defaults']>>(
-    key: K,
-    value: NonNullable<SettingsState['preferences']['annotation_defaults']>[K]
-  ) => {
-    setDraft((prev) => ({
-      ...prev,
-      preferences: {
-        ...prev.preferences,
-        annotation_defaults: {
-          ...(prev.preferences.annotation_defaults ?? {}),
-          [key]: value,
-        },
-      },
-    }));
-  };
 
   const parseCommaList = (value: string) =>
     value
@@ -689,44 +674,6 @@ export const Settings: React.FC = () => {
                 }
                 className={inputClass}
                 placeholder={t('meetings, meals')}
-              />
-            </label>
-          </div>
-          <div className="mt-4 grid gap-3 rounded-xl border border-slate-100 bg-white/70 p-4 shadow-sm dark:border-slate-800 dark:bg-slate-950/40">
-            <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-              {t('Annotation defaults')}
-            </p>
-            <label className="text-xs text-slate-500 dark:text-slate-400">
-              {t('Default tags (comma-separated)')}
-              <input
-                value={(draft.preferences.annotation_defaults?.tags ?? []).join(', ')}
-                onChange={(event) =>
-                  updateAnnotationDefaults('tags', parseCommaList(event.target.value))
-                }
-                className={inputClass}
-                placeholder={t('food, coffee')}
-              />
-            </label>
-            <label className="text-xs text-slate-500 dark:text-slate-400">
-              {t('Default people (comma-separated)')}
-              <input
-                value={(draft.preferences.annotation_defaults?.people ?? []).join(', ')}
-                onChange={(event) =>
-                  updateAnnotationDefaults('people', parseCommaList(event.target.value))
-                }
-                className={inputClass}
-                placeholder={t('Alice')}
-              />
-            </label>
-            <label className="text-xs text-slate-500 dark:text-slate-400">
-              {t('Default description prefix')}
-              <input
-                value={draft.preferences.annotation_defaults?.description_prefix ?? ''}
-                onChange={(event) =>
-                  updateAnnotationDefaults('description_prefix', event.target.value)
-                }
-                className={inputClass}
-                placeholder={t('Focus on meals and people')}
               />
             </label>
           </div>

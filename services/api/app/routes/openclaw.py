@@ -35,8 +35,6 @@ from ..rag import retrieve_context_hits
 from ..ai.prompt_manager import get_prompt_manager
 from ..ai.prompt_manifest import get_prompt_names, get_api_updatable_prompts, get_prompt_spec
 from ..user_settings import (
-    fetch_user_settings,
-    resolve_annotation_defaults,
     resolve_user_tz_offset_minutes,
 )
 
@@ -679,18 +677,9 @@ async def ingest_from_openclaw(
     await session.commit()
     await session.refresh(item)
 
-    # Load user defaults (preferences)
-    user_settings = await fetch_user_settings(session, user_id)
-    defaults = resolve_annotation_defaults(user_settings)
-    default_tags = defaults.get("tags") if isinstance(defaults.get("tags"), list) else None
-    default_people = defaults.get("people") if isinstance(defaults.get("people"), list) else None
-    default_desc = defaults.get("description") if isinstance(defaults.get("description"), str) else None
-    if not default_desc:
-        default_desc = defaults.get("description_prefix") if isinstance(defaults.get("description_prefix"), str) else None
-
-    description = request.description if request.description is not None else default_desc
-    tags = request.tags if request.tags is not None else default_tags
-    people = request.people if request.people is not None else default_people
+    description = request.description
+    tags = request.tags
+    people = request.people
 
     # Build merged openclaw_context (explicit fields override openclaw_context keys)
     merged_context: Optional[dict] = None

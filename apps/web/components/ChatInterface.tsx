@@ -14,7 +14,7 @@ import { apiGet, apiPost, apiPostForm } from '../services/api';
 import { PageMotion } from './PageMotion';
 import { useSettings } from '../contexts/SettingsContext';
 import { useI18n } from '../i18n/useI18n';
-import { formatDateKey, getTimeZoneOffsetMinutes } from '../utils/time';
+import { addDaysZoned, formatDateKey, getTimeZoneOffsetMinutes } from '../utils/time';
 import {
   ChatMessage,
   ChatResponse,
@@ -24,6 +24,7 @@ import {
   TimelineItemDetail,
   AgentChatResponse,
   AgentImageResponse,
+  AgentTextResponse,
 } from '../types';
 import { toast } from '../services/toast';
 
@@ -43,13 +44,64 @@ type AgentSpec = {
   disabledLabel?: string;
 };
 
+type AgentDateMode = 'single' | 'range' | 'last7' | 'last30' | 'last365';
+
+type AgentDateRange = {
+  startDate: string;
+  endDate: string;
+  label: string;
+  mode: AgentDateMode;
+};
+
+const buildAgentDateRange = ({
+  mode,
+  singleDate,
+  rangeStart,
+  rangeEnd,
+  timeZone,
+}: {
+  mode: AgentDateMode;
+  singleDate: string;
+  rangeStart: string;
+  rangeEnd: string;
+  timeZone: string;
+}): AgentDateRange => {
+  const today = new Date();
+  const todayKey = formatDateKey(today, timeZone);
+  let startDate = singleDate;
+  let endDate = singleDate;
+
+  if (mode === 'range') {
+    startDate = rangeStart || singleDate;
+    endDate = rangeEnd || rangeStart || singleDate;
+  } else if (mode === 'last7') {
+    endDate = todayKey;
+    startDate = formatDateKey(addDaysZoned(today, -6, timeZone), timeZone);
+  } else if (mode === 'last30') {
+    endDate = todayKey;
+    startDate = formatDateKey(addDaysZoned(today, -29, timeZone), timeZone);
+  } else if (mode === 'last365') {
+    endDate = todayKey;
+    startDate = formatDateKey(addDaysZoned(today, -364, timeZone), timeZone);
+  }
+
+  if (endDate < startDate) {
+    const temp = startDate;
+    startDate = endDate;
+    endDate = temp;
+  }
+
+  const label = startDate === endDate ? startDate : `${startDate} to ${endDate}`;
+  return { startDate, endDate, label, mode };
+};
+
 const AGENT_DEFINITIONS: AgentSpec[] = [
   {
     id: 'daily_cartoon',
     name: 'Cartoon Day Summary',
-    description: 'Generate a playful cartoon scene prompt that captures the day.',
+    description: 'Generate a playful cartoon scene prompt that captures the selected range.',
     defaultPrompt:
-      'Create a whimsical cartoon illustration that summarizes my day on {date}. Highlight the main activities, mood, and setting. Return a concise image prompt and a one-line caption.',
+      'Create a detailed cartoon illustration for {date_range}. Highlight the 2-3 most vivid moments, mood, and setting. Include concrete props, lighting, palette, and background details. Return a rich image prompt and a punchy caption.',
     outputLabel: 'Image prompt',
     icon: ImageIcon,
   },
@@ -67,10 +119,19 @@ const AGENT_DEFINITIONS: AgentSpec[] = [
   {
     id: 'daily_insights',
     name: 'Day Insights Infographic',
-    description: 'Summarize the day with stats, themes, and a surprise moment.',
+    description: 'Summarize the selected range with stats, themes, and highlights.',
     defaultPrompt:
-      'Create a daily insights report for {date}. Include key stats, top keywords, labels, and a surprise detail. Return an infographic image prompt.',
+      'Create a detailed daily insights report for {date_range}. Include key stats, top keywords, labels, and trends. Return an infographic image prompt with clear text callouts.',
     outputLabel: 'Infographic',
+    icon: Sparkles,
+  },
+  {
+    id: 'daily_surprise',
+    name: 'Surprise Me',
+    description: 'Surface an unexpected moment or pattern from the selected range.',
+    defaultPrompt:
+      'Find the most surprising, easy-to-miss detail from {date_range}. Focus on subtle visual cues or background moments people might overlook (clothing, signage, objects, gestures). Avoid generic themes unless anchored to a specific detail. Explain why it stands out, cite concrete details, and include a short list of supporting memory clues.',
+    outputLabel: 'Surprise highlight',
     icon: Sparkles,
   },
 ];
@@ -125,6 +186,9 @@ export const ChatInterface: React.FC = () => {
 
   const [messages, setMessages] = useState<ChatMessage[]>(() => [buildWelcomeMessage()]);
   const [sessions, setSessions] = useState<ChatSessionSummary[]>([]);
+  const [sessionOffset, setSessionOffset] = useState(0);
+  const [sessionHasMore, setSessionHasMore] = useState(true);
+  const [loadingSessions, setLoadingSessions] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
@@ -144,6 +208,11 @@ export const ChatInterface: React.FC = () => {
   const [selectedImage, setSelectedImage] = useState<File | null>(null);
   const [selectedImagePreview, setSelectedImagePreview] = useState<string | null>(null);
   const [agentDate, setAgentDate] = useState(() => formatDateKey(new Date(), timeZone));
+  const [agentDateMode, setAgentDateMode] = useState<AgentDateMode>('single');
+  const [agentRangeStart, setAgentRangeStart] = useState(() =>
+    formatDateKey(new Date(), timeZone)
+  );
+  const [agentRangeEnd, setAgentRangeEnd] = useState(() => formatDateKey(new Date(), timeZone));
   const [agentPromptOverrides, setAgentPromptOverrides] = useState<Record<string, string>>(() => {
     if (typeof window === 'undefined') return {};
     try {
@@ -161,11 +230,27 @@ export const ChatInterface: React.FC = () => {
     name: string;
   } | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const objectUrlsRef = useRef<string[]>([]);
+  const prependGuardRef = useRef(false);
+  const [historyHasMore, setHistoryHasMore] = useState(false);
+  const [historyCursorId, setHistoryCursorId] = useState<string | null>(null);
+  const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
 
   const activeSession = sessions.find((session) => session.session_id === sessionId) || null;
+  const agentRange = useMemo(
+    () =>
+      buildAgentDateRange({
+        mode: agentDateMode,
+        singleDate: agentDate,
+        rangeStart: agentRangeStart,
+        rangeEnd: agentRangeEnd,
+        timeZone,
+      }),
+    [agentDate, agentDateMode, agentRangeEnd, agentRangeStart, timeZone]
+  );
 
   const formatDateLabel = (value: string | Date | null | undefined) => {
     if (!value) return t('Unknown date');
@@ -209,17 +294,27 @@ export const ChatInterface: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    if (prependGuardRef.current) {
+      prependGuardRef.current = false;
+      return;
+    }
     scrollToBottom();
   }, [messages, scrollToBottom]);
 
   // eslint-disable-next-line react-hooks/exhaustive-deps -- initial hydration only
   useEffect(() => {
     let mounted = true;
+    const sessionPageSize = 20;
     const loadSessions = async () => {
+      setLoadingSessions(true);
       try {
-        const data = await apiGet<ChatSessionSummary[]>('/chat/sessions');
+        const data = await apiGet<ChatSessionSummary[]>(
+          `/chat/sessions?limit=${sessionPageSize}&offset=0`
+        );
         if (!mounted) return;
         setSessions(data);
+        setSessionOffset(data.length);
+        setSessionHasMore(data.length === sessionPageSize);
         if (data.length === 0) {
           setMessages([buildWelcomeMessage()]);
           return;
@@ -233,6 +328,10 @@ export const ChatInterface: React.FC = () => {
         }
       } catch (err) {
         console.error(err);
+      } finally {
+        if (mounted) {
+          setLoadingSessions(false);
+        }
       }
     };
     loadSessions();
@@ -269,9 +368,16 @@ export const ChatInterface: React.FC = () => {
 
   const loadSession = useCallback(async (targetId: string) => {
     setLoadingHistory(true);
+    setHistoryHasMore(false);
+    setHistoryCursorId(null);
     try {
+      const params = new URLSearchParams();
+      params.set('limit', '50');
+      if (debugMode) {
+        params.set('debug', 'true');
+      }
       const detail = await apiGet<ChatSessionDetail>(
-        `/chat/sessions/${targetId}${debugMode ? '?debug=true' : ''}`
+        `/chat/sessions/${targetId}?${params.toString()}`
       );
       const loaded = detail.messages
         .filter((msg) => msg.role !== 'system')
@@ -286,6 +392,8 @@ export const ChatInterface: React.FC = () => {
         }));
       setMessages(loaded.length ? loaded : [buildWelcomeMessage()]);
       setSessionId(detail.session_id);
+      setHistoryHasMore(Boolean(detail.has_more));
+      setHistoryCursorId(detail.next_before_id ?? null);
       localStorage.setItem(CHAT_SESSION_KEY, detail.session_id);
     } catch (err) {
       console.error(err);
@@ -294,14 +402,98 @@ export const ChatInterface: React.FC = () => {
     }
   }, [buildWelcomeMessage, debugMode]);
 
+  const loadOlderMessages = useCallback(async () => {
+    if (!sessionId || historyLoadingMore || !historyHasMore || !historyCursorId) {
+      return;
+    }
+    const container = messagesContainerRef.current;
+    const prevHeight = container?.scrollHeight ?? 0;
+    const prevScrollTop = container?.scrollTop ?? 0;
+    setHistoryLoadingMore(true);
+    try {
+      const params = new URLSearchParams();
+      params.set('limit', '50');
+      params.set('before_id', historyCursorId);
+      if (debugMode) {
+        params.set('debug', 'true');
+      }
+      const detail = await apiGet<ChatSessionDetail>(
+        `/chat/sessions/${sessionId}?${params.toString()}`
+      );
+      const older = detail.messages
+        .filter((msg) => msg.role !== 'system')
+        .map((msg) => ({
+          id: msg.id,
+          role: msg.role,
+          content: msg.content,
+          timestamp: new Date(msg.created_at),
+          sources: msg.sources,
+          attachments: msg.attachments,
+          telemetry: msg.telemetry,
+        }));
+      if (older.length > 0) {
+        prependGuardRef.current = true;
+        setMessages((prev) => [...older, ...prev]);
+      }
+      setHistoryHasMore(Boolean(detail.has_more));
+      setHistoryCursorId(detail.next_before_id ?? null);
+      if (container && older.length > 0) {
+        requestAnimationFrame(() => {
+          const nextHeight = container.scrollHeight;
+          container.scrollTop = nextHeight - prevHeight + prevScrollTop;
+        });
+      }
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setHistoryLoadingMore(false);
+    }
+  }, [debugMode, historyCursorId, historyHasMore, historyLoadingMore, sessionId]);
+
+  const handleMessagesScroll = useCallback(() => {
+    if (loadingHistory || historyLoadingMore || !historyHasMore) {
+      return;
+    }
+    const container = messagesContainerRef.current;
+    if (!container) {
+      return;
+    }
+    if (container.scrollTop <= 120) {
+      void loadOlderMessages();
+    }
+  }, [historyHasMore, historyLoadingMore, loadOlderMessages, loadingHistory]);
+
   const refreshSessions = useCallback(async () => {
     try {
-      const data = await apiGet<ChatSessionSummary[]>('/chat/sessions');
+      const sessionPageSize = 20;
+      const data = await apiGet<ChatSessionSummary[]>(
+        `/chat/sessions?limit=${sessionPageSize}&offset=0`
+      );
       setSessions(data);
+      setSessionOffset(data.length);
+      setSessionHasMore(data.length === sessionPageSize);
     } catch (err) {
       console.error(err);
     }
   }, []);
+
+  const loadMoreSessions = useCallback(async () => {
+    if (loadingSessions || !sessionHasMore) return;
+    setLoadingSessions(true);
+    try {
+      const sessionPageSize = 20;
+      const data = await apiGet<ChatSessionSummary[]>(
+        `/chat/sessions?limit=${sessionPageSize}&offset=${sessionOffset}`
+      );
+      setSessions((prev) => [...prev, ...data]);
+      setSessionOffset((prev) => prev + data.length);
+      setSessionHasMore(data.length === sessionPageSize);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoadingSessions(false);
+    }
+  }, [loadingSessions, sessionHasMore, sessionOffset]);
 
   const handleNewChat = () => {
     setSessionId(null);
@@ -492,6 +684,10 @@ export const ChatInterface: React.FC = () => {
           setAgentSessionId(agentResponse.session_id);
           localStorage.setItem(CHAT_AGENT_SESSION_KEY, agentResponse.session_id);
         }
+        if (!sessionId || sessionId !== agentResponse.session_id) {
+          setSessionId(agentResponse.session_id);
+          localStorage.setItem(CHAT_SESSION_KEY, agentResponse.session_id);
+        }
         const aiMsg: ChatMessage = {
           id: (Date.now() + 1).toString(),
           role: 'assistant',
@@ -501,6 +697,7 @@ export const ChatInterface: React.FC = () => {
           telemetry: agentResponse.debug ?? undefined,
         };
         setMessages((prev) => [...prev, aiMsg]);
+        await refreshSessions();
         setLoading(false);
         return;
       } else {
@@ -588,16 +785,21 @@ export const ChatInterface: React.FC = () => {
       return;
     }
     const rawPrompt = resolveAgentPrompt(agentId);
-    const resolvedPrompt = rawPrompt.replace(/\{date\}/g, agentDate);
-    const finalPrompt = resolvedPrompt.includes(agentDate)
+    const { startDate, endDate, label } = agentRange;
+    let resolvedPrompt = rawPrompt;
+    resolvedPrompt = resolvedPrompt.replace(/\{date\}/g, label);
+    resolvedPrompt = resolvedPrompt.replace(/\{start_date\}/g, startDate);
+    resolvedPrompt = resolvedPrompt.replace(/\{end_date\}/g, endDate);
+    resolvedPrompt = resolvedPrompt.replace(/\{date_range\}/g, label);
+    const finalPrompt = resolvedPrompt.includes(label)
       ? resolvedPrompt
-      : `${resolvedPrompt}\n\nUse memories from ${agentDate} only.`;
+      : `${resolvedPrompt}\n\nUse memories from ${label} only.`;
 
     if (agent.id === 'daily_cartoon') {
       const userMsg: ChatMessage = {
         id: Date.now().toString(),
         role: 'user',
-        content: t('Run agent: {name} ({date})', { name: agent.name, date: agentDate }),
+        content: t('Run agent: {name} ({date})', { name: agent.name, date: label }),
         timestamp: new Date(),
       };
       setMessages((prev) => [...prev, userMsg]);
@@ -605,7 +807,8 @@ export const ChatInterface: React.FC = () => {
       try {
         const response = await apiPost<AgentImageResponse>('/chat/agents/cartoon', {
           prompt: finalPrompt,
-          date: agentDate,
+          date: startDate,
+          end_date: startDate !== endDate ? endDate : undefined,
           session_id: sessionId || undefined,
           tz_offset_minutes: getTimeZoneOffsetMinutes(new Date(), timeZone),
         });
@@ -619,6 +822,7 @@ export const ChatInterface: React.FC = () => {
           content: response.message,
           timestamp: new Date(),
           attachments: response.attachments,
+          sources: response.sources,
         };
         setMessages((prev) => [...prev, aiMsg]);
         await refreshSessions();
@@ -641,7 +845,7 @@ export const ChatInterface: React.FC = () => {
       const userMsg: ChatMessage = {
         id: Date.now().toString(),
         role: 'user',
-        content: t('Run agent: {name} ({date})', { name: agent.name, date: agentDate }),
+        content: t('Run agent: {name} ({date})', { name: agent.name, date: label }),
         timestamp: new Date(),
       };
       setMessages((prev) => [...prev, userMsg]);
@@ -649,7 +853,8 @@ export const ChatInterface: React.FC = () => {
       try {
         const response = await apiPost<AgentImageResponse>('/chat/agents/insights', {
           prompt: finalPrompt,
-          date: agentDate,
+          date: startDate,
+          end_date: startDate !== endDate ? endDate : undefined,
           session_id: sessionId || undefined,
           tz_offset_minutes: getTimeZoneOffsetMinutes(new Date(), timeZone),
           include_image: true,
@@ -664,6 +869,7 @@ export const ChatInterface: React.FC = () => {
           content: response.message,
           timestamp: new Date(),
           attachments: response.attachments,
+          sources: response.sources,
         };
         setMessages((prev) => [...prev, aiMsg]);
         await refreshSessions();
@@ -673,6 +879,51 @@ export const ChatInterface: React.FC = () => {
           id: (Date.now() + 1).toString(),
           role: 'assistant',
           content: t("I'm having trouble generating that insight right now."),
+          timestamp: new Date(),
+        };
+        setMessages((prev) => [...prev, errorMsg]);
+      } finally {
+        setLoading(false);
+      }
+      return;
+    }
+
+    if (agent.id === 'daily_surprise') {
+      const userMsg: ChatMessage = {
+        id: Date.now().toString(),
+        role: 'user',
+        content: t('Run agent: {name} ({date})', { name: agent.name, date: label }),
+        timestamp: new Date(),
+      };
+      setMessages((prev) => [...prev, userMsg]);
+      setLoading(true);
+      try {
+        const response = await apiPost<AgentTextResponse>('/chat/agents/surprise', {
+          prompt: finalPrompt,
+          date: startDate,
+          end_date: startDate !== endDate ? endDate : undefined,
+          session_id: sessionId || undefined,
+          tz_offset_minutes: getTimeZoneOffsetMinutes(new Date(), timeZone),
+        });
+        if (!sessionId || sessionId !== response.session_id) {
+          setSessionId(response.session_id);
+          localStorage.setItem(CHAT_SESSION_KEY, response.session_id);
+        }
+        const aiMsg: ChatMessage = {
+          id: (Date.now() + 1).toString(),
+          role: 'assistant',
+          content: response.message,
+          timestamp: new Date(),
+          sources: response.sources,
+        };
+        setMessages((prev) => [...prev, aiMsg]);
+        await refreshSessions();
+      } catch (err) {
+        console.error(err);
+        const errorMsg: ChatMessage = {
+          id: (Date.now() + 1).toString(),
+          role: 'assistant',
+          content: t("I'm having trouble generating that surprise right now."),
           timestamp: new Date(),
         };
         setMessages((prev) => [...prev, errorMsg]);
@@ -748,6 +999,16 @@ export const ChatInterface: React.FC = () => {
               </button>
             );
           })}
+          {sessionHasMore && (
+            <button
+              type="button"
+              onClick={loadMoreSessions}
+              className="w-full rounded-lg border border-slate-200 px-3 py-2 text-[11px] font-semibold text-slate-600 hover:border-slate-300 hover:text-slate-800"
+              disabled={loadingSessions}
+            >
+              {loadingSessions ? t('Loading...') : t('Load more')}
+            </button>
+          )}
         </div>
       </aside>
 
@@ -772,7 +1033,14 @@ export const ChatInterface: React.FC = () => {
         </div>
 
         {/* Messages */}
-        <div className="flex-1 overflow-y-auto p-4 space-y-6">
+        <div
+          ref={messagesContainerRef}
+          onScroll={handleMessagesScroll}
+          className="flex-1 overflow-y-auto p-4 space-y-6"
+        >
+          {historyLoadingMore && (
+            <p className="text-center text-xs text-slate-400">{t('Loading older messages...')}</p>
+          )}
           {loadingHistory && (
             <p className="text-center text-xs text-slate-400">{t('Loading chat history...')}</p>
           )}
@@ -842,48 +1110,52 @@ export const ChatInterface: React.FC = () => {
               </div>
               
               {/* Sources (assistant only) */}
-              {msg.role === 'assistant' && orderedSources.length > 0 && (
+              {msg.role === 'assistant' && msg.sources !== undefined && (
                 <div className="mt-3 ml-1">
-                   <p className="text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">
-                     {t('Relevant Memories')}
-                   </p>
-                   <div className="flex space-x-3 overflow-x-auto pb-2 no-scrollbar max-w-full">
-                     {orderedSources.map((src) => (
-                       <div
-                         key={src.context_id}
-                         onClick={() => handleSourceClick(src)}
-                         className={`flex-shrink-0 w-32 bg-white rounded-lg border border-slate-200 overflow-hidden shadow-sm transition-all ${
-                           src.source_item_id ? 'hover:shadow-md cursor-pointer' : 'cursor-default'
-                         }`}
-                       >
-                         <div className="relative h-20 w-full overflow-hidden bg-slate-100 flex items-center justify-center">
-                           {src.thumbnail_url ? (
-                             <img
-                               src={src.thumbnail_url}
-                               alt={t('Source')}
-                               className="w-full h-full object-cover"
-                               loading="lazy"
-                             />
-                           ) : (
-                             <ImageIcon size={16} className="text-slate-400" />
-                           )}
-                           {src.source_index != null && (
-                             <span className="absolute top-1 left-1 rounded-full bg-slate-900/80 text-white text-[10px] px-1.5 py-0.5">
-                               #{src.source_index}
-                             </span>
-                           )}
-                         </div>
-                         <div className="p-2 bg-slate-50">
+                  <p className="text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">
+                    {t('Relevant Memories')}
+                  </p>
+                  {orderedSources.length > 0 ? (
+                    <div className="flex space-x-3 overflow-x-auto pb-2 no-scrollbar max-w-full">
+                      {orderedSources.map((src) => (
+                        <div
+                          key={src.context_id}
+                          onClick={() => handleSourceClick(src)}
+                          className={`flex-shrink-0 w-32 bg-white rounded-lg border border-slate-200 overflow-hidden shadow-sm transition-all ${
+                            src.source_item_id ? 'hover:shadow-md cursor-pointer' : 'cursor-default'
+                          }`}
+                        >
+                          <div className="relative h-20 w-full overflow-hidden bg-slate-100 flex items-center justify-center">
+                            {src.thumbnail_url ? (
+                              <img
+                                src={src.thumbnail_url}
+                                alt={t('Source')}
+                                className="w-full h-full object-cover"
+                                loading="lazy"
+                              />
+                            ) : (
+                              <ImageIcon size={16} className="text-slate-400" />
+                            )}
+                            {src.source_index != null && (
+                              <span className="absolute top-1 left-1 rounded-full bg-slate-900/80 text-white text-[10px] px-1.5 py-0.5">
+                                #{src.source_index}
+                              </span>
+                            )}
+                          </div>
+                          <div className="p-2 bg-slate-50">
                             <p className="text-[10px] text-slate-500 font-medium truncate">
                               {formatDateTimeLabel(src.timestamp)}
                             </p>
                             <p className="text-[10px] text-slate-800 truncate">
                               {src.title || src.snippet || t('Memory')}
                             </p>
-                         </div>
-                       </div>
-                     ))}
-                   </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-[11px] text-slate-400">{t('No relevant memories found.')}</p>
+                  )}
                 </div>
               )}
 
@@ -1063,15 +1335,68 @@ export const ChatInterface: React.FC = () => {
           <p className="text-sm font-semibold text-slate-800">{t('Downstream agents')}</p>
           <div className="mt-3">
             <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-              {t('Target day')}
+              {t('Target range')}
             </label>
-            <input
-              type="date"
-              value={agentDate}
-              onChange={(event) => setAgentDate(event.target.value)}
+            <select
+              value={agentDateMode}
+              onChange={(event) => {
+                const nextMode = event.target.value as AgentDateMode;
+                setAgentDateMode(nextMode);
+                if (nextMode === 'range') {
+                  setAgentRangeStart((prev) => prev || agentDate);
+                  setAgentRangeEnd((prev) => prev || agentDate);
+                }
+              }}
               className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700 focus:border-primary-400 focus:outline-none focus:ring-2 focus:ring-primary-100"
-            />
-            <p className="mt-1 text-[10px] text-slate-400">{t('Prompts support {date}.')}</p>
+            >
+              <option value="single">{t('Single day')}</option>
+              <option value="range">{t('Date range')}</option>
+              <option value="last7">{t('Past 7 days')}</option>
+              <option value="last30">{t('Past month')}</option>
+              <option value="last365">{t('Past year')}</option>
+            </select>
+            {agentDateMode === 'single' && (
+              <input
+                type="date"
+                value={agentDate}
+                onChange={(event) => setAgentDate(event.target.value)}
+                className="mt-2 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700 focus:border-primary-400 focus:outline-none focus:ring-2 focus:ring-primary-100"
+              />
+            )}
+            {agentDateMode === 'range' && (
+              <div className="mt-2 grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-[10px] uppercase tracking-wide text-slate-400">
+                    {t('Start')}
+                  </label>
+                  <input
+                    type="date"
+                    value={agentRangeStart}
+                    onChange={(event) => setAgentRangeStart(event.target.value)}
+                    className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700 focus:border-primary-400 focus:outline-none focus:ring-2 focus:ring-primary-100"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[10px] uppercase tracking-wide text-slate-400">
+                    {t('End')}
+                  </label>
+                  <input
+                    type="date"
+                    value={agentRangeEnd}
+                    onChange={(event) => setAgentRangeEnd(event.target.value)}
+                    className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700 focus:border-primary-400 focus:outline-none focus:ring-2 focus:ring-primary-100"
+                  />
+                </div>
+              </div>
+            )}
+            {agentDateMode !== 'single' && agentDateMode !== 'range' && (
+              <p className="mt-2 text-[11px] text-slate-500">
+                {t('Using')} {agentRange.label}
+              </p>
+            )}
+            <p className="mt-1 text-[10px] text-slate-400">
+              {t('Prompts support {date}, {start_date}, {end_date}, {date_range}.')}
+            </p>
           </div>
         </div>
         <div className="flex-1 overflow-y-auto p-4 space-y-3">
@@ -1164,7 +1489,9 @@ export const ChatInterface: React.FC = () => {
                 className="w-full rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700 focus:border-primary-400 focus:outline-none focus:ring-2 focus:ring-primary-100"
               />
               <p className="text-[11px] text-slate-400">
-                {t('Use {date} to inject the target day. Prompts are saved per browser.')}
+                {t(
+                  'Use {date}, {start_date}, {end_date}, or {date_range} to inject the target range. Prompts are saved per browser.'
+                )}
               </p>
             </div>
             <div className="flex items-center justify-between border-t border-slate-200 px-5 py-4">

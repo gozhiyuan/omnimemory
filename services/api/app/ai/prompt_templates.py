@@ -14,6 +14,7 @@ INLINE_DEFAULTS: dict[str, str] = {
     "image_analysis": """\
 You are analyzing a personal lifelog photo captured by the user (the camera-holder).
 Your goal is to extract structured "contexts" that help the user recall what THEY were doing and experiencing.
+Be as concrete and detail-rich as possible without guessing.
 
 ## Perspective rules (important)
 - Assume the user is present behind the camera.
@@ -30,6 +31,13 @@ Your goal is to extract structured "contexts" that help the user recall what THE
 5) emotion_context: The user's mood only if supported by evidence.
 6) entity_context: People/places/objects that are salient.
 7) knowledge_context: If the photo captures information for later (menu, sign, ticket, slide, book page), summarize what it says.
+
+## Detail coverage rules
+- Always include activity_context plus any other contexts that are clearly supported by evidence.
+- If there are multiple distinct aspects (people, place, objects, text), include 3-6 contexts.
+- In activity_context summary, include at least 2-4 concrete visual details (objects, clothing, signage, colors, textures, tools, gestures).
+- When readable text exists (signs, menus, tickets), always add knowledge_context and include the text (use OCR if available).
+- Prefer specific object/clothing details over generic terms like "outdoors" or "people".
 
 ## OCR text
 If OCR text is provided below, use it to improve accuracy when text appears in the image.
@@ -57,8 +65,8 @@ Return JSON ONLY:
 
 ## Field guidelines
 - title: 5-12 words, specific.
-- summary: 1-3 sentences, factual, user-centric.
-- keywords: 3-12 short lowercase phrases.
+- summary: 2-4 sentences, factual, user-centric, and detail-rich.
+- keywords: 5-12 short lowercase phrases; favor concrete nouns/adjectives over generic terms.
 - entities: list of {type: person|place|object|org|food|topic, name: "...", confidence: 0..1}.
 - location: optional {name, lat, lng}; only include lat/lng if explicitly known.
 
@@ -323,12 +331,18 @@ Return JSON ONLY with this exact shape:
 }
 
 Guidelines:
-- image_prompt should be vivid, concrete, and mention "cartoon illustration".
-- caption should be 8-16 words.
-- Use the memory context to pick the main scene, mood, and setting.
-- If details are missing, keep the scene generic and cozy.
+- image_prompt should be 80-140 words, vivid, concrete, and mention "cartoon illustration".
+- Describe the setting, time of day, main characters (no names), 3-6 key actions/props, mood, lighting, color palette, and camera/composition.
+- If the date label is a range, blend 2-3 highlights into one cohesive scene (not a collage).
+- caption should be 12-20 words and read like a playful title card.
+- Use at least 5 concrete details from Memory context; copy short phrases when possible.
+- Only use details present in Memory context. Do not invent events, props, or signage.
+- Never add date labels, day panels, or calendar text unless it explicitly appears in Memory context.
+- If you include any date text, it must be from Available memory dates below.
+- If details are missing, keep the scene warm and generic without inventing specifics.
 
 Date: {{date_label}}
+Available memory dates: {{available_dates}}
 
 User instruction:
 {{instruction}}
@@ -345,26 +359,58 @@ Return JSON ONLY with this exact shape:
   "summary": "",
   "top_keywords": [],
   "labels": [],
-  "surprise_moment": "",
   "image_prompt": ""
 }
 
 Guidelines:
 - headline: 6-12 words that name the day or range.
-- summary: 2-4 sentences, user-centric and factual.
-- top_keywords: 5-10 lowercase keywords.
-- labels: 3-6 short labels describing dominant themes.
-- surprise_moment: 1-2 sentences about an unexpected detail.
-- image_prompt: create a clean infographic poster; include the headline and 3-5 stat callouts.
+- summary: 3-5 sentences, user-centric and factual; mention 2-3 concrete moments and 2-3 stats from Stats JSON.
+- top_keywords: 8-12 lowercase keywords.
+- labels: 4-7 short labels describing dominant themes.
+- image_prompt: create a clean infographic poster; include the headline and 4-6 stat callouts with numbers and short text blocks.
+- Use at least 4 concrete details from Memory context in summary or labels.
+- Only use details present in Memory context. Do not invent events, props, or signage.
+- If you include any date text, it must be from Available memory dates below.
 - If details are missing, keep things generic and avoid guessing.
 
 Date range: {{date_range_label}}
+Available memory dates: {{available_dates}}
 
 User instruction:
 {{instruction}}
 
 Stats JSON:
 {{stats_json}}
+
+Memory context:
+{{memory_context}}
+""",
+
+    "surprise_agent": """\
+You are highlighting an unexpected memory insight.
+Return JSON ONLY with this exact shape:
+{
+  "headline": "",
+  "surprise": "",
+  "supporting_details": [],
+  "image_prompt": ""
+}
+
+Guidelines:
+- headline: 6-12 words naming the day or range.
+- surprise: 2-4 sentences, grounded in the memory context. Highlight a subtle or overlooked visual detail and why it is easy to miss.
+- supporting_details: 3-6 short fragments with evidence cues (time, place, object/clothing, action, signage, color, or quote).
+- image_prompt: optional; if included, describe a highlight card with title and 2-3 annotated callouts.
+- Use at least 3 concrete details from Memory context when available.
+- Avoid generic themes (e.g., "outdoors", "work") unless anchored to a specific visual detail.
+- Prefer details drawn from Daily summaries; use Memories as supporting evidence.
+- Must mention at least one concrete object/clothing/signage detail from a non-entity memory context.
+- If details are missing, keep the surprise light and generic without guessing.
+
+Date range: {{date_range_label}}
+
+User instruction:
+{{instruction}}
 
 Memory context:
 {{memory_context}}

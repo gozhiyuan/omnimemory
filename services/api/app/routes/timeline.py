@@ -318,7 +318,12 @@ async def _persist_daily_summary_update(
         context.start_time_utc = start
         context.end_time_utc = end
 
-    context.vector_text = build_vector_text(context.title, context.summary, context.keywords or [])
+    context.vector_text = build_vector_text(
+        context.title,
+        context.summary,
+        context.keywords or [],
+        context_type=context.context_type,
+    )
     if isinstance(processor_versions, dict):
         is_user_edit = mark_edited or existing_edited
         if is_user_edit:
@@ -1675,7 +1680,12 @@ async def update_episode_detail(
         context.summary = payload.summary
     if payload.keywords is not None:
         context.keywords = payload.keywords
-    context.vector_text = build_vector_text(context.title, context.summary, context.keywords or [])
+    context.vector_text = build_vector_text(
+        context.title,
+        context.summary,
+        context.keywords or [],
+        context_type=context.context_type,
+    )
     processor_versions = context.processor_versions or {}
     if isinstance(processor_versions, dict):
         processor_versions["edited_by_user"] = True

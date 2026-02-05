@@ -135,6 +135,8 @@ export const TRANSLATIONS: Record<Language, TranslationTable> = {
     'Font size scaling is coming soon.': '字体缩放即将上线。',
     'These settings will apply in a future update.': '这些设置将在后续版本生效。',
     'Generate a playful cartoon scene prompt that captures the day.': '生成一段有趣的卡通场景提示词，捕捉当天的经历。',
+    'Generate a playful cartoon scene prompt that captures the selected range.':
+      '生成一段有趣的卡通场景提示词，捕捉所选时间范围。',
     'Get notified when new memories are processed.': '在新记忆处理完成时通知我。',
     'Google Photos': 'Google 照片',
     'Google Photos access removed.': '已移除 Google 照片授权。',
@@ -166,6 +168,7 @@ export const TRANSLATIONS: Record<Language, TranslationTable> = {
     'Load more': '加载更多',
     'Load more memories': '加载更多记忆',
     'Loading chat history...': '正在加载聊天记录...',
+    'Loading older messages...': '正在加载更早的消息...',
     'Loading episode details...': '正在加载片段详情...',
     'Loading memories...': '正在加载记忆...',
     'Loading memory details...': '正在加载记忆详情...',
@@ -234,6 +237,7 @@ export const TRANSLATIONS: Record<Language, TranslationTable> = {
     'Refresh': '刷新',
     'Refreshing...': '正在刷新...',
     'Relevant Memories': '相关记忆',
+    'No relevant memories found.': '未找到相关记忆。',
     'Reload': '重新加载',
     'Remove': '移除',
     'Remove photo': '移除照片',
@@ -416,5 +420,32 @@ export const TRANSLATIONS: Record<Language, TranslationTable> = {
     '{month} preview': '{month} 预览',
     '{type} upload': '{type} 上传',
     '{value} GB': '{value} GB',
+    'Create a detailed cartoon illustration for {date_range}. Highlight the 2-3 most vivid moments, mood, and setting. Include concrete props, lighting, palette, and background details. Return a rich image prompt and a punchy caption.':
+      '为 {date_range} 创建更细致的卡通插画，突出 2-3 个最鲜活的瞬间、情绪与场景，包含具体道具、光影、配色与背景细节。返回丰富的图像提示词和有力的标题。',
+    'Create a detailed daily insights report for {date_range}. Include key stats, top keywords, labels, and trends. Return an infographic image prompt with clear text callouts.':
+      '为 {date_range} 生成更细致的每日洞察报告，包含关键统计、关键词、标签与趋势，并输出带清晰文字标注的信息图图像提示词。',
+    'Date range': '日期范围',
+    "I'm having trouble generating that surprise right now.": '生成惊喜亮点时出现问题，请稍后再试。',
+    'Past 7 days': '过去 7 天',
+    'Past month': '过去一个月',
+    'Past year': '过去一年',
+    'Prompts support {date}, {start_date}, {end_date}, {date_range}.':
+      '提示词支持 {date}、{start_date}、{end_date}、{date_range}。',
+    'Single day': '单日',
+    'Summarize the day with stats, themes, and highlights.': '用统计、主题与亮点总结当天。',
+    'Summarize the selected range with stats, themes, and highlights.': '用统计、主题与亮点总结所选时间范围。',
+    'Surprise Me': '惊喜一下',
+    'Surprise highlight': '惊喜亮点',
+    'Find the most surprising moment or pattern from {date_range}. Explain why it stands out, cite concrete details, and include a short list of supporting memory clues.':
+      '从 {date_range} 中找出最令人惊讶的瞬间或规律，解释其突出之处，引用具体细节，并给出简短的支撑线索列表。',
+    'Find the most surprising, easy-to-miss detail from {date_range}. Focus on subtle visual cues or background moments people might overlook (clothing, signage, objects, gestures). Explain why it stands out, cite concrete details, and include a short list of supporting memory clues.':
+      '从 {date_range} 中找出最容易被忽略但令人惊讶的细节，聚焦容易错过的视觉线索或背景瞬间（服装、标识、物件、手势等）。解释为何突出，引用具体细节，并给出简短的支撑线索列表。',
+    'Find the most surprising, easy-to-miss detail from {date_range}. Focus on subtle visual cues or background moments people might overlook (clothing, signage, objects, gestures). Avoid generic themes unless anchored to a specific detail. Explain why it stands out, cite concrete details, and include a short list of supporting memory clues.':
+      '从 {date_range} 中找出最容易被忽略但令人惊讶的细节，聚焦容易错过的视觉线索或背景瞬间（服装、标识、物件、手势等）。避免泛泛主题，除非锚定到具体细节。解释为何突出，引用具体细节，并给出简短的支撑线索列表。',
+    'Surface an unexpected moment or pattern from the selected range.': '从所选范围中提取一个意外瞬间或规律。',
+    'Target range': '目标范围',
+    'Using': '当前使用',
+    'Use {date}, {start_date}, {end_date}, or {date_range} to inject the target range. Prompts are saved per browser.':
+      '使用 {date}、{start_date}、{end_date} 或 {date_range} 注入目标范围。提示词将保存在浏览器中。',
   },
 };

@@ -112,7 +112,9 @@ async def _generate_weekly_recap(
                 is_episode=True,
                 source_item_ids=summary_source_items,
                 merged_from_context_ids=[],
-                vector_text=build_vector_text(title, summary, keywords),
+                vector_text=build_vector_text(
+                    title, summary, keywords, context_type="weekly_summary"
+                ),
                 processor_versions=processor_versions,
             )
             session.add(summary_context)
@@ -124,7 +126,9 @@ async def _generate_weekly_recap(
             summary_context.event_time_utc = window.start_utc
             summary_context.start_time_utc = window.start_utc
             summary_context.end_time_utc = window.end_utc
-            summary_context.vector_text = build_vector_text(title, summary, keywords)
+            summary_context.vector_text = build_vector_text(
+                title, summary, keywords, context_type=summary_context.context_type
+            )
             summary_context.processor_versions = processor_versions
 
         await session.commit()

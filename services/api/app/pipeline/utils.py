@@ -87,8 +87,59 @@ def extract_keywords(text: str, limit: int = 8) -> list[str]:
     return seen
 
 
-def build_vector_text(title: str, summary: str, keywords: list[str]) -> str:
+_KEYWORD_STOPWORDS = {
+    "outdoors",
+    "outdoor",
+    "indoor",
+    "people",
+    "person",
+    "photo",
+    "photos",
+    "video",
+    "videos",
+    "image",
+    "images",
+    "scene",
+    "view",
+    "background",
+    "group",
+    "selfie",
+    "portrait",
+    "thing",
+    "stuff",
+}
+
+_KEYWORD_SKIP_CONTEXTS = {"entity_context"}
+
+
+def _filter_keywords(keywords: list[str], context_type: str | None) -> list[str]:
+    if context_type in _KEYWORD_SKIP_CONTEXTS:
+        return []
+    filtered: list[str] = []
+    seen: set[str] = set()
+    for word in keywords or []:
+        cleaned = str(word or "").strip()
+        if not cleaned:
+            continue
+        lowered = cleaned.lower()
+        if lowered in _KEYWORD_STOPWORDS or lowered in seen:
+            continue
+        seen.add(lowered)
+        filtered.append(lowered)
+        if len(filtered) >= 8:
+            break
+    return filtered
+
+
+def build_vector_text(
+    title: str,
+    summary: str,
+    keywords: list[str],
+    *,
+    context_type: str | None = None,
+) -> str:
     parts = [title.strip(), summary.strip()]
-    if keywords:
-        parts.append("Keywords: " + ", ".join(keywords))
+    filtered = _filter_keywords(keywords, context_type)
+    if filtered:
+        parts.append("Keywords: " + ", ".join(filtered))
     return "\n".join(part for part in parts if part)

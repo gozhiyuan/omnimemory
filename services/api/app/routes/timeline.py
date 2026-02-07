@@ -31,6 +31,7 @@ from ..db.models import (
 from ..db.session import get_session
 from ..google_photos import get_valid_access_token
 from ..storage import get_storage_provider
+from ..integrations.openclaw_sync import get_openclaw_sync
 from ..tasks.episodes import _update_daily_summary as refresh_daily_summary
 from ..user_settings import (
     fetch_user_settings,
@@ -383,6 +384,13 @@ async def _persist_daily_summary_update(
             )
         )
     await session.commit()
+    await _sync_openclaw_summary_after_update(
+        session=session,
+        user_id=user_id,
+        summary_date=summary_date,
+        summary=context.summary or "",
+        tz_offset_minutes=resolved_offset,
+    )
 
     return TimelineDailySummary(
         context_id=str(context.id),
@@ -391,6 +399,53 @@ async def _persist_daily_summary_update(
         summary=context.summary,
         keywords=context.keywords or [],
     )
+
+
+async def _sync_openclaw_summary_after_update(
+    *,
+    session: AsyncSession,
+    user_id: UUID,
+    summary_date: date,
+    summary: str,
+    tz_offset_minutes: int,
+) -> None:
+    try:
+        user_settings = await fetch_user_settings(session, user_id)
+        openclaw_sync = get_openclaw_sync(user_settings)
+        if not openclaw_sync.enabled:
+            return
+
+        start, end = _summary_window(summary_date, tz_offset_minutes)
+        episode_stmt = select(ProcessedContext).where(
+            ProcessedContext.user_id == user_id,
+            ProcessedContext.is_episode.is_(True),
+            ProcessedContext.context_type == "activity_context",
+            ProcessedContext.start_time_utc.is_not(None),
+            ProcessedContext.start_time_utc >= start,
+            ProcessedContext.start_time_utc < end,
+        )
+        episode_rows = await session.execute(episode_stmt)
+        episodes = list(episode_rows.scalars().all())
+        episode_dicts = [
+            {
+                "title": ep.title,
+                "summary": ep.summary,
+                "start_time": ep.start_time_utc.isoformat() if ep.start_time_utc else None,
+                "end_time": ep.end_time_utc.isoformat() if ep.end_time_utc else None,
+            }
+            for ep in episodes
+        ]
+        highlights = [ep.title for ep in episodes if ep.title][:5]
+        await asyncio.to_thread(
+            openclaw_sync.sync_daily_summary,
+            user_id=str(user_id),
+            summary_date=summary_date,
+            summary=summary,
+            episodes=episode_dicts,
+            highlights=highlights,
+        )
+    except Exception as exc:
+        logger.warning("OpenClaw sync after summary update failed: {}", exc)
 
 
 WEB_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}

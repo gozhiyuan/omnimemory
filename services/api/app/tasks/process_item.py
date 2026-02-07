@@ -8,13 +8,50 @@ from typing import Any, Dict
 from uuid import UUID
 
 from loguru import logger
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..celery_app import celery_app
-from ..db.models import SourceItem
+from ..db.models import ProcessedContext, SourceItem
 from ..db.session import isolated_session
+from ..integrations.openclaw_sync import get_openclaw_sync
 from ..pipeline import run_pipeline
 from ..pipeline.utils import parse_iso_datetime
+from ..user_settings import fetch_user_settings
+
+
+async def _sync_openclaw_contexts_for_item(session: AsyncSession, item: SourceItem) -> None:
+    """Sync non-episode memory contexts for an item to OpenClaw local memory files."""
+    try:
+        user_settings = await fetch_user_settings(session, item.user_id)
+        openclaw_sync = get_openclaw_sync(user_settings)
+        if not openclaw_sync.enabled:
+            return
+
+        stmt = select(ProcessedContext).where(
+            ProcessedContext.user_id == item.user_id,
+            ProcessedContext.is_episode.is_(False),
+            ProcessedContext.source_item_ids.contains([item.id]),
+        )
+        rows = await session.execute(stmt)
+        contexts = list(rows.scalars().all())
+        synced = 0
+        for context in contexts:
+            payload = {
+                "id": str(context.id),
+                "title": context.title,
+                "summary": context.summary,
+                "keywords": context.keywords or [],
+                "context_type": context.context_type,
+                "event_time_utc": context.event_time_utc or context.start_time_utc,
+            }
+            if openclaw_sync.sync_memory_entry(user_id=str(item.user_id), context=payload):
+                synced += 1
+        if synced:
+            logger.info("Synced {} memory context(s) for item {} to OpenClaw", synced, item.id)
+    except Exception as exc:
+        logger.warning("OpenClaw per-memory sync failed for item {}: {}", item.id, exc)
 
 
 async def _process_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -46,6 +83,7 @@ async def _process_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         try:
             await run_pipeline(session, item, payload)
+            await _sync_openclaw_contexts_for_item(session, item)
             item.processing_status = "completed"
             item.processed_at = datetime.utcnow()
             await session.commit()

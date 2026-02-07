@@ -29,6 +29,8 @@ class OpenClawMemorySync:
     # Separator to distinguish OmniMemory content
     SEPARATOR = "\n---\n\n"
     MARKER = "<!-- omnimemory-sync -->"
+    ENTRY_START_PREFIX = "<!-- omnimemory-entry:"
+    ENTRY_END = "<!-- /omnimemory-entry -->"
 
     def __init__(
         self,
@@ -237,17 +239,45 @@ class OpenClawMemorySync:
             memory_path = self.memory_dir / f"{target_date.isoformat()}.md"
 
             entry = self._format_memory_entry(context)
+            context_id = str(context.get("id") or "").strip()
 
             # Append to existing file or create new
             self.memory_dir.mkdir(parents=True, exist_ok=True)
 
+            existing = ""
             if memory_path.exists():
                 existing = memory_path.read_text(encoding="utf-8")
-                content = existing + "\n\n" + entry
-            else:
-                content = entry
 
-            memory_path.write_text(content, encoding="utf-8")
+            if context_id:
+                start_marker = f"{self.ENTRY_START_PREFIX}{context_id} -->"
+                replacement = f"{start_marker}\n{entry}\n{self.ENTRY_END}"
+                if start_marker in existing:
+                    start_idx = existing.find(start_marker)
+                    end_idx = existing.find(self.ENTRY_END, start_idx)
+                    if start_idx >= 0 and end_idx >= 0:
+                        end_idx += len(self.ENTRY_END)
+                        content = existing[:start_idx].rstrip()
+                        if content:
+                            content += "\n\n"
+                        content += replacement
+                        trailing = existing[end_idx:].strip()
+                        if trailing:
+                            content += "\n\n" + trailing
+                    else:
+                        logger.warning(
+                            "Malformed OpenClaw entry for context {} in {}; missing end marker. Appending replacement block.",
+                            context_id,
+                            memory_path,
+                        )
+                        content = (existing.rstrip() + "\n\n" if existing.strip() else "") + replacement
+                else:
+                    content = (existing.rstrip() + "\n\n" if existing.strip() else "") + replacement
+            else:
+                content = (existing.rstrip() + "\n\n" if existing.strip() else "") + entry
+
+            tmp_path = memory_path.with_suffix(".md.tmp")
+            tmp_path.write_text(content, encoding="utf-8")
+            tmp_path.rename(memory_path)
             return True
 
         except Exception as e:
@@ -356,8 +386,9 @@ class OpenClawMemorySync:
 def get_openclaw_sync(user_settings: dict[str, Any]) -> OpenClawMemorySync:
     """Create an OpenClawMemorySync instance from user settings.
 
-    Checks both user settings and environment variables. User settings take
-    precedence, but env var OPENCLAW_SYNC_MEMORY can enable sync globally.
+    Checks user settings, app defaults, and environment variables.
+    Precedence is: env var OPENCLAW_SYNC_MEMORY > user setting openclaw.syncMemory
+    > app default settings.openclaw_sync_memory.
 
     Args:
         user_settings: User settings dict containing openclaw config
@@ -370,10 +401,15 @@ def get_openclaw_sync(user_settings: dict[str, Any]) -> OpenClawMemorySync:
     openclaw_config = user_settings.get("openclaw", {})
     settings = get_settings()
 
-    # Check both user settings and env var
-    sync_enabled = openclaw_config.get("syncMemory", False)
-    if not sync_enabled:
-        sync_enabled = os.getenv("OPENCLAW_SYNC_MEMORY", "").lower() == "true"
+    # Precedence: explicit env var -> explicit user setting -> app default.
+    if isinstance(openclaw_config, dict) and "syncMemory" in openclaw_config:
+        sync_enabled = bool(openclaw_config.get("syncMemory"))
+    else:
+        sync_enabled = bool(settings.openclaw_sync_memory)
+
+    env_override = os.getenv("OPENCLAW_SYNC_MEMORY")
+    if env_override is not None and env_override.strip():
+        sync_enabled = env_override.strip().lower() == "true"
 
     workspace = openclaw_config.get("workspace") if isinstance(openclaw_config, dict) else None
     return OpenClawMemorySync(

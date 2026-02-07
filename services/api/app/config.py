@@ -220,7 +220,7 @@ class Settings(BaseSettings):
     # OpenClaw integration
     openclaw_enabled: bool = False
     openclaw_gateway_url: Optional[str] = None
-    openclaw_sync_memory: bool = False
+    openclaw_sync_memory: bool = True
     openclaw_workspace: str = "~/.openclaw"
 
     # Prompt management

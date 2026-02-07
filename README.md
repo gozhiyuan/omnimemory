@@ -43,37 +43,69 @@ capture life. OmniMemory is built to organize those daily captures.
 
 - 2025-02: OpenClaw integration released for agent workflows and memory sync. OmniMemory extends OpenClaw by syncing daily image, video, and audio memories.
 
+![feature.gif](demo_media/demo-openclaw.gif)
+
 ## Key Features
 
-- Local-first and self-hosted by default.
-- Full-stack with containers and a production-ready backend with authentication (OIDC), background workers, and observability.
-- Google Photos Picker API integration.
-- Multimodal understanding for images, audio, and video with Gemini models.
-- Vector search with Qdrant plus RAG retrieval.
-- Memory API endpoints for tool/agent access (`/memory/*`).
-- Daily summaries, timelines, and chat over your memory graph.
-- OpenClaw agent integration for memory sync.
-- Optional agent mode (Google ADK) for multi-step memory retrieval via tools.
-- Easy setup with a guided CLI.
+**Multimodal AI Processing**
+- Gemini VLM analyzes photos, videos, and audio — extracting captions, keywords, entities, locations, and structured context from every upload.
+- Automatic transcription for audio and video files with segment-level timestamps.
+- Google Photos Picker API for bulk photo library sync.
+- HEIF/HEIC support for native iPhone photo imports.
+
+**Agentic Memory Retrieval (Google ADK)**
+- Multi-step agent chat built on Google ADK — goes beyond single-query RAG by building query plans, retrieving evidence across time ranges, and reasoning over results.
+- Specialized agent tasks: Cartoon Day Summary (illustrated recaps), Day Insights (pattern discovery), and Surprise Highlight (standout moment selection) — all with Gemini image generation.
+- Verifier step cross-checks agent responses against retrieved evidence to reduce hallucination.
+
+**Timeline, Episodes, and Summaries**
+- Day-by-day visual timeline with items automatically grouped into episodes (activity clusters).
+- AI-generated daily summaries with voice editing support — speak your corrections and they're transcribed and saved.
+- Scheduled weekly recaps that surface patterns and themes via Celery beat.
+
+**Vector Search and RAG**
+- Qdrant-powered vector similarity search across all processed contexts.
+- RAG retrieval pipeline with date filtering, provider filtering, and timezone-aware windowing.
+- Memory API endpoints (`/memory/*`) for external tool and agent access.
+
+**Integrations and Agent Ecosystem**
+- OpenClaw integration: syncs daily summaries and per-item contexts to local memory files, enabling agents to reference your life context without API calls.
+- Extensible skill system — OmniMemory ships as an OpenClaw skill for agent workflows.
+
+**Production-Ready Infrastructure**
+- Full-stack with FastAPI, Celery workers, and React 19 SPA.
+- OIDC authentication via Authentik with JWT validation.
+- Monitoring stack: Prometheus metrics, Grafana dashboards, and Flower for Celery task visibility.
+- Guided CLI (`omni setup` / `omni start`) for one-command local deployment.
+
+**Local-First and Self-Hosted**
+- All data stays on your machine — Postgres, Redis, Qdrant, and S3-compatible storage (RustFS) run locally in Docker.
+- Optional Supabase cloud storage as an alternative.
 
 ## Tech Stack
 
-- Backend: FastAPI, Celery, Python 3.11+
+- Backend: FastAPI, Celery, SQLAlchemy (asyncpg), Pydantic, Python 3.11+
+- AI: Gemini (via google-genai), Google ADK (agent framework)
 - Storage: Postgres, Redis, Qdrant, S3 (RustFS) or Supabase
-- Frontend: React 19, Vite
+- Frontend: React 19, Vite, Framer Motion, Recharts, Lucide React
+- Monitoring: Flower, Prometheus, Grafana
+- Media: FFmpeg, Pillow (HEIF support)
 - Hardware: ESP32 firmware (PlatformIO)
+- Integrations: OpenClaw (agent memory sync)
 - Auth: Authentik OIDC (optional)
+- Testing: Pytest, Playwright
 
 ## Use Cases
 
-- Manual ingest from the app. (GIF placeholder)
-- Search and context recall: "When did I last visit that cafe?" and get photos and context instantly. (GIF placeholder)
-- Daily summaries: auto-generate a concise recap of your day, with optional voice edits.
-- Weekly recaps: see patterns and themes across a week.
-- Generate summary images. (GIF placeholder)
-- Agent workflows: let OpenClaw query and summarize your memory stream. (GIF placeholder)
-- Agent mode chat (Recommended Always On): multi-step retrieval and tool orchestration. (GIF placeholder)
-- Advanced settings. (GIF placeholder)
+- **Ingest memories**: Upload photos, videos, and audio directly from the app, or sync your Google Photos library via the Picker API. Gemini automatically analyzes each file and extracts context, keywords, and summaries.
+- **Timeline and episodes**: Browse a day-by-day visual timeline grouped into episodes. Each episode clusters related items (e.g., "Morning walk in the park", "Dinner at the Italian place") with AI-generated titles and summaries.
+- **Search and recall**: Vector search across all your memories. Ask "When did I last visit that cafe?" or "Show me sunsets from last month" and get relevant photos and context instantly.
+- **Daily summaries**: Auto-generated recaps of your day including highlights and episode breakdowns. Edit summaries with text or voice — voice input is transcribed and saved automatically.
+- **Weekly recaps**: Scheduled weekly digests that surface patterns and themes across your week, generated by Celery beat in the background.
+- **Chat with your memories**: Conversational RAG-powered chat over your entire memory graph. The agent mode (Google ADK) goes beyond simple retrieval — it builds a query plan, retrieves evidence from multiple time ranges, and reasons step-by-step to give precise answers like "You visited that cafe three times in January, here are the photos."
+- **AI-generated art**: Agent tasks like Cartoon Day Summary generate illustrated recaps of your day, Day Insights surfaces unexpected patterns, and Surprise Highlight picks a standout moment — all powered by Gemini image generation.
+- **Agent workflows with OpenClaw**: OpenClaw can query your memory stream via the `/memory/*` API. Daily summaries and per-item contexts sync to OpenClaw's local memory files so agents can reference your life context without extra API calls.
+- **Dashboard and observability**: At-a-glance dashboard with activity charts, recent items, and processing stats. Backend monitoring via Prometheus, Grafana, and Flower for Celery task visibility.
 
 ## Hardware Capture and Integrations (Ongoing)
 
@@ -93,8 +125,6 @@ those photos manually. Below is a comparison based on research; please verify sp
 | DJI Osmo Action 4 | Prosumer action cam | Yes (timelapse photo, 0.5-40s) | Timelapse video or photo | MicroSD or USB Mass Storage | 1/1.3-inch sensor; 1770mAh battery; JPG/DNG | ~299 |
 | Omi OpenGlass Dev Kit | Open-source wearable | Yes (programmable) | Yes (programmable) | Full firmware control; direct POST to endpoint | Seeed XIAO ESP32-S3 Sense; battery pack claim 6x150mAh + 1x250mAh | ~299 |
 | XIAO ESP32-S3 Sense (DIY) | MCU build | Yes (custom firmware) | Yes (custom firmware) | Full firmware control; direct POST to endpoint | Dual-core 240MHz; 8MB PSRAM; OV2640; deep sleep ~10uA; Wi-Fi ~260mA | ~20-30 |
-
-
 
 
 ---
